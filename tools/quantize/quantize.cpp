@@ -8261,6 +8261,8 @@ int llama_quantize(int argc, char ** argv) {
     nvfp4_selector_kld_subset selector_kld;
     std::unique_ptr<nvfp4_selector_kld_subset> selector_kld_holdout;
     selector_rank_config selector_rank_cfg;
+    bool selector_applied_exact_overrides = false;
+    size_t selector_applied_exact_override_count = 0;
 
     const bool selector_enabled =
         !selector_bootstrap &&
@@ -8485,6 +8487,8 @@ int llama_quantize(int argc, char ** argv) {
                     (double) selector_cfg.cap_m6,
                     (double) selector_cfg.cap_m4);
                 if (!selector_overrides.empty()) {
+                    selector_applied_exact_overrides = true;
+                    selector_applied_exact_override_count = selector_overrides.size();
                     tensor_type_opts = tensor_type_opts_cli;
                     tensor_type_opts.insert(tensor_type_opts.end(), selector_overrides.begin(), selector_overrides.end());
 	                    params.tensor_types = &tensor_type_opts;
@@ -8585,7 +8589,12 @@ int llama_quantize(int argc, char ** argv) {
         t_quantize_us = llama_time_us() - t_start_us;
     }
 
-    if (selector_auto_rescue && selector_inputs_ready) {
+    if (selector_auto_rescue && selector_inputs_ready && selector_applied_exact_overrides) {
+        fprintf(stderr,
+            "%s: selector rescue already applied %zu exact override(s) during final quantization; skipping post-write rescue analysis\n",
+            __func__,
+            selector_applied_exact_override_count);
+    } else if (selector_auto_rescue && selector_inputs_ready) {
         nvfp4_cuda_runtime_cfg rescue_cfg = selector_cfg;
         std::string rescue_policy_name;
         std::vector<tensor_type_option> rescue_overrides;
