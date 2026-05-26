@@ -464,6 +464,13 @@ static bool selector_looks_like_full_quality(const bq::Recipe & recipe) {
 }
 
 static void apply_selector_kld_evidence_defaults(bq::Recipe & recipe) {
+    const bool auto_search = string_is_auto(recipe.selector.chunks);
+    const bool auto_holdout = string_is_auto(recipe.selector.holdout_chunks);
+    const bool auto_eval = string_is_auto(recipe.selector.eval_chunks);
+    if (!auto_search && !auto_holdout && !auto_eval) {
+        return;
+    }
+
     const std::string kld = !recipe.selector.kld.empty() ? recipe.selector.kld : recipe.evaluation.kld_base;
     if (kld.empty() || !selector_looks_like_full_quality(recipe)) {
         return;
@@ -476,21 +483,14 @@ static void apply_selector_kld_evidence_defaults(bq::Recipe & recipe) {
 
     const int total = info.available_chunks;
 
-    const bool old_quality_default =
-        recipe.selector.chunks == "64" &&
-        recipe.selector.holdout_chunks == "16" &&
-        (recipe.selector.eval_chunks.empty() || recipe.selector.eval_chunks == "64");
-    const bool auto_search = string_is_auto(recipe.selector.chunks) || old_quality_default;
-    const bool auto_holdout = string_is_auto(recipe.selector.holdout_chunks) || old_quality_default;
-    const bool auto_eval = string_is_auto(recipe.selector.eval_chunks) || recipe.selector.eval_chunks == "64" || old_quality_default;
-
     if (auto_search && auto_holdout) {
-        int search_chunks = total;
+        const int covered_chunks = std::min(total, 128);
+        int search_chunks = covered_chunks;
         int holdout_chunks = 0;
-        if (total > 96) {
-            holdout_chunks = std::max(16, total / 3);
-            holdout_chunks = std::min(holdout_chunks, total - 1);
-            search_chunks = total - holdout_chunks;
+        if (covered_chunks > 8) {
+            holdout_chunks = std::min(32, std::max(8, covered_chunks / 4));
+            holdout_chunks = std::min(holdout_chunks, covered_chunks - 1);
+            search_chunks = covered_chunks - holdout_chunks;
         }
         recipe.selector.chunk_start = string_is_auto(recipe.selector.chunk_start) ? "0" : recipe.selector.chunk_start;
         recipe.selector.chunks = std::to_string(search_chunks);

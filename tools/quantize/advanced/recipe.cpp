@@ -1072,21 +1072,21 @@ void apply_master_autotune(Recipe & r) {
     }
 
     const bool balanced = r.autotune.mode == "balanced";
-    assign_if_empty(r.selector.chunks, balanced ? "32" : "64");
-    assign_if_empty(r.selector.holdout_chunks, balanced ? "8" : "16");
+    assign_if_empty(r.selector.chunks, balanced ? "32" : "96");
+    assign_if_empty(r.selector.holdout_chunks, balanced ? "8" : "32");
     assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "8192" : "16384");
     assign_if_empty(r.selector.stagea_max_policies, "0");
-    assign_if_empty(r.selector.refine_top, balanced ? "32" : "48");
-    assign_if_empty(r.selector.refine_budget, balanced ? "384" : "768");
-    assign_if_empty(r.selector.survey_top, balanced ? "256" : "512");
-    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "16384" : "32768");
+    assign_if_empty(r.selector.refine_top, balanced ? "24" : "32");
+    assign_if_empty(r.selector.refine_budget, balanced ? "256" : "384");
+    assign_if_empty(r.selector.survey_top, balanced ? "128" : "256");
+    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "8192" : "16384");
     assign_if_empty(r.selector.max_tensors, "0");
-    assign_if_empty(r.selector.eval_top, balanced ? "16" : "32");
-    assign_if_empty(r.selector.eval_chunks, balanced ? "32" : "64");
+    assign_if_empty(r.selector.eval_top, balanced ? "8" : "12");
+    assign_if_empty(r.selector.eval_chunks, balanced ? "32" : "96");
     assign_if_empty(r.selector.n_seq, "4");
 
     if (uses_nvfp4) {
-        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "32768" : "65536");
+        assign_if_empty(r.nvfp4.autotune.max_blocks, "32768");
         assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
         assign_if_empty(r.nvfp4.four_six.refit_iters, "16");
         assign_if_empty(r.nvfp4.four_six.compand, "1");
