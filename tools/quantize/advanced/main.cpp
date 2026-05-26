@@ -273,6 +273,34 @@ static RunKey build_run_key(
     return fp;
 }
 
+static bool run_key_has_top_level_string(
+        const std::string & json,
+        const std::string & key,
+        const std::string & value) {
+    const std::string needle = "\"" + key + "\": \"" + json_escape(value) + "\"";
+    return json.find(needle) != std::string::npos;
+}
+
+static bool run_key_has_file_key(
+        const std::string & json,
+        const std::string & key,
+        const FileKey & fp) {
+    std::ostringstream out;
+    append_json_file_key(out, key, fp, "");
+    std::string needle = out.str();
+    if (!needle.empty() && needle.back() == '\n') {
+        needle.pop_back();
+    }
+    return json.find(needle) != std::string::npos;
+}
+
+static bool run_key_matches_checkpoint_material(const std::string & old, const RunKey & fp) {
+    return run_key_has_top_level_string(old, "recipe_hash64", fp.recipe_hash64) &&
+        run_key_has_file_key(old, "source_model", fp.source) &&
+        run_key_has_file_key(old, "imatrix", fp.imatrix) &&
+        run_key_has_file_key(old, "kld_base", fp.kld_base);
+}
+
 static void write_or_check_run_key(const std::filesystem::path & run_dir, const RunKey & fp) {
     const std::filesystem::path path = run_dir / "checkpoint-key.json";
     if (std::filesystem::exists(path)) {
@@ -280,10 +308,16 @@ static void write_or_check_run_key(const std::filesystem::path & run_dir, const 
         std::stringstream old;
         old << in.rdbuf();
         if (old.str() != fp.json) {
-            write_text_file(run_dir / "checkpoint-key.mismatch.json", fp.json);
-            throw std::runtime_error(
-                "run checkpoint key mismatch in " + run_dir.string() +
-                "; use a new artifacts.run_dir or remove stale checkpoint/cache files");
+            if (!run_key_matches_checkpoint_material(old.str(), fp)) {
+                write_text_file(run_dir / "checkpoint-key.mismatch.json", fp.json);
+                throw std::runtime_error(
+                    "run checkpoint key mismatch in " + run_dir.string() +
+                    "; use a new artifacts.run_dir or remove stale checkpoint/cache files");
+            }
+            write_text_file(run_dir / "checkpoint-key.previous.json", old.str());
+            fprintf(stderr,
+                "%s: run checkpoint key changed in code/selector command only; reusing checkpoint because source, imatrix, KLD base, and recipe hash match\n",
+                __func__);
         }
     }
     write_text_file(path, fp.json);
