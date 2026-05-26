@@ -4068,6 +4068,7 @@ static bool nvfp4_selector_choose_policy(
     const std::string & recipe_policy_name,
     int32_t nvfp4_input_scale_policy,
     int32_t selector_eval_batch_override,
+    int32_t nvfp4_autotune_threads,
     nvfp4_cuda_runtime_cfg & out_cfg,
     std::string & out_name,
         bool * out_kept_seed,
@@ -5293,17 +5294,23 @@ static bool nvfp4_selector_choose_policy(
             // will read.
             const bool stageb_direct_patch = true;
             std::vector<stageb_patch_result> patch_results(eval_binding_indices.size());
-            const int stageb_patch_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
+            const int requested_stageb_patch_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
                 (int64_t) eval_binding_indices.size(),
                 quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS",
                     std::max<int>(1, nthread))));
+            const int stageb_autotune_threads = nvfp4_autotune_threads > 0 ?
+                std::min<int>(4, std::max<int>(1, nvfp4_autotune_threads)) : 4;
+            const int stageb_patch_threads = std::max<int>(1, std::min<int>(
+                requested_stageb_patch_threads,
+                std::max<int>(1, nthread / stageb_autotune_threads)));
             const int stageb_binding_nthread = std::max(1, nthread / std::max(1, stageb_patch_threads));
             if (stageb_patch_threads > 1) {
                 fprintf(stderr,
-                    "selector stage-b patch policy=%s threads=%d tensor_threads=%d tensors=%zu\n",
+                    "selector stage-b patch policy=%s threads=%d tensor_threads=%d autotune_threads=%d tensors=%zu\n",
                     policy.name.c_str(),
                     stageb_patch_threads,
                     stageb_binding_nthread,
+                    stageb_autotune_threads,
                     eval_binding_indices.size());
             }
             const size_t no_failed_patch = std::numeric_limits<size_t>::max();
@@ -7823,6 +7830,7 @@ int llama_quantize(int argc, char ** argv) {
             cli_nvfp4_policy_name,
             params.nvfp4_input_scale_policy,
 	            selector_eval_batch_override,
+                cli_nvfp4_autotune_threads,
 	            out_cfg,
 	            out_policy_name,
                 out_kept_seed,

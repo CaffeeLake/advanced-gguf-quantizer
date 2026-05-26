@@ -106,6 +106,21 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
 
+static void ggml_cuda_cleanup_warn(const char * stmt, const char * func, cudaError_t err) {
+    if (err == cudaSuccess) {
+        return;
+    }
+    GGML_LOG_WARN("%s: cleanup %s failed: %s\n", func, stmt, cudaGetErrorString(err));
+    cudaGetLastError();
+}
+
+static void ggml_cuda_cleanup_warn_cublas(const char * stmt, const char * func, cublasStatus_t err) {
+    if (err == CUBLAS_STATUS_SUCCESS) {
+        return;
+    }
+    GGML_LOG_WARN("%s: cleanup %s failed: %s\n", func, stmt, cublas_get_error_str(err));
+}
+
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
 void ggml_cuda_set_device(int device) {
@@ -608,16 +623,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
     if (copy_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(copy_event));
+        ggml_cuda_cleanup_warn("cudaEventDestroy(copy_event)", __func__, cudaEventDestroy(copy_event));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
-                CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
+                ggml_cuda_cleanup_warn("cudaStreamDestroy(streams[i][j])", __func__, cudaStreamDestroy(streams[i][j]));
             }
         }
         if (cublas_handles[i] != nullptr) {
-            CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+            ggml_cuda_cleanup_warn_cublas("cublasDestroy(cublas_handles[i])", __func__, cublasDestroy(cublas_handles[i]));
         }
     }
 }
@@ -636,7 +651,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        ggml_cuda_cleanup_warn("cudaFree(dev_ptr)", __func__, cudaFree(dev_ptr));
     }
 };
 
@@ -1202,11 +1217,11 @@ struct ggml_backend_cuda_split_buffer_context {
             for (int id = 0; id < GGML_CUDA_MAX_DEVICES; ++id) {
                 for (int64_t is = 0; is < GGML_CUDA_MAX_STREAMS; ++is) {
                     if (extra->events[id][is] != nullptr) {
-                        CUDA_CHECK(cudaEventDestroy(extra->events[id][is]));
+                        ggml_cuda_cleanup_warn("cudaEventDestroy(extra->events[id][is])", __func__, cudaEventDestroy(extra->events[id][is]));
                     }
                 }
                 if (extra->data_device[id] != nullptr) {
-                    CUDA_CHECK(cudaFree(extra->data_device[id]));
+                    ggml_cuda_cleanup_warn("cudaFree(extra->data_device[id])", __func__, cudaFree(extra->data_device[id]));
                 }
             }
             delete extra;
@@ -1990,7 +2005,7 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    CUDA_CHECK(cudaFreeHost(buffer->context));
+    ggml_cuda_cleanup_warn("cudaFreeHost(buffer->context)", __func__, cudaFreeHost(buffer->context));
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {

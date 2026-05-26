@@ -2363,6 +2363,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
     const bool sample_x_device = ggml_cuda_nvfp4_device_pointer(sample_x);
     const bool sample_qw_device = sample_qw != nullptr && ggml_cuda_nvfp4_device_pointer(sample_qw);
     std::atomic<int> next_request { 0 };
+    std::atomic<bool> cuda_failed { false };
 
     auto eval_worker = [&](bool private_stream) {
         auto & tls = g_nvfp4_cuda_autotune_tls;
@@ -2379,6 +2380,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
             !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_eval_cfg_buf, &tls.d_eval_cfg_cap, bytes_cfg, "autotune cudaMalloc(cfg)") ||
             !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_eval_xscale_buf, &tls.d_eval_xscale_cap, bytes_xscale, "autotune cudaMalloc(xscale)") ||
             (bytes_qw != 0 && !sample_qw_device && !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_qw_sample_buf, &tls.d_qw_sample_cap, bytes_qw, "autotune cudaMalloc(qw)"))) {
+            cuda_failed.store(true, std::memory_order_release);
             return;
         }
 
@@ -2406,6 +2408,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
                     tls.loaded_x = nullptr;
                     tls.loaded_qw = nullptr;
                     tls.loaded_nb = 0;
+                    cuda_failed.store(true, std::memory_order_release);
                     return false;
                 }
             }
@@ -2418,6 +2421,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
                     tls.loaded_x = nullptr;
                     tls.loaded_qw = nullptr;
                     tls.loaded_nb = 0;
+                    cuda_failed.store(true, std::memory_order_release);
                     return false;
                 }
             }
@@ -2429,6 +2433,9 @@ static bool nvfp4_cuda_eval_requests_parallel(
         };
 
         while (true) {
+            if (cuda_failed.load(std::memory_order_acquire)) {
+                break;
+            }
             const int req_idx = next_request.fetch_add(max_batch, std::memory_order_relaxed);
             if (req_idx >= n_requests) {
                 break;
@@ -2454,6 +2461,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
                 tls.loaded_x = nullptr;
                 tls.loaded_qw = nullptr;
                 tls.loaded_nb = 0;
+                cuda_failed.store(true, std::memory_order_release);
                 continue;
             }
             err = cudaMemcpyAsync(tls.d_eval_xscale_buf, xscale_batch,
@@ -2464,6 +2472,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
                 tls.loaded_x = nullptr;
                 tls.loaded_qw = nullptr;
                 tls.loaded_nb = 0;
+                cuda_failed.store(true, std::memory_order_release);
                 continue;
             }
 
@@ -2473,6 +2482,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
                 tls.loaded_x = nullptr;
                 tls.loaded_qw = nullptr;
                 tls.loaded_nb = 0;
+                cuda_failed.store(true, std::memory_order_release);
                 continue;
             }
 
@@ -2482,6 +2492,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
                 tls.loaded_x = nullptr;
                 tls.loaded_qw = nullptr;
                 tls.loaded_nb = 0;
+                cuda_failed.store(true, std::memory_order_release);
                 continue;
             }
 
@@ -2515,7 +2526,7 @@ static bool nvfp4_cuda_eval_requests_parallel(
         }
     }
 
-    return true;
+    return !cuda_failed.load(std::memory_order_acquire);
 }
 
 static __device__ __forceinline__ uint8_t nvfp4_cuda_code_at(const block_nvfp4 & block, int elem) {
