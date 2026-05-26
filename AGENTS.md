@@ -178,6 +178,24 @@ For KLD-based quality decisions, use the intended full KLD evidence for the
 recipe and clearly record provenance. Keep p99 and p999 gates visible in quality
 mode reports.
 
+
+## Evidence Standard
+
+A useful model report should keep:
+
+- source GGUF and locked recipe;
+- calibration corpus and imatrix;
+- evaluation corpus and KLD base;
+- code commit and CUDA device;
+- PPL, mean KLD, p95/p99/p999 KLD, KLD tail mean, max KLD, RMS probability
+  delta, same-top rate, top-flip weight, entropy drift, and non-finite counts;
+- output size, BPW, tensor mix, MTP status, and scale tensor counts;
+- at least one `llama-completion` smoke test.
+
+Do not compare models using a proxy score, one first chunk, a tiny diagnostic
+KLD sample, or mismatched calibration/evaluation provenance.
+
+
 ## Mixed NVFP4/MXFP6 Policy
 
 Keep fused tensor decisions coherent. Treat related tensors as grouped decisions
@@ -195,7 +213,7 @@ when recipe policy or repair/edit workflows require them.
 
 ## Performance And Resource Discipline
 
-- Avoid running overlapping GPU benchmarks.
+- Never run overlapping GPU benchmarks.
 - Serialize benchmark comparisons on a quiet GPU.
 - Leave CPU headroom during large selector/KLD runs.
 - Prefer checkpoints and resume over restarting broad searches.
