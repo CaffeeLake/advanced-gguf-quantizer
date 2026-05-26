@@ -244,10 +244,30 @@ static bool nvfp4_cuda_trace_enabled() {
 }
 
 static void nvfp4_cuda_log_failure(const char * stage, cudaError_t err) {
-    if (!nvfp4_cuda_trace_enabled()) {
-        return;
+    if (nvfp4_cuda_trace_enabled() || err != cudaSuccess) {
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        const cudaError_t mem_err = cudaMemGetInfo(&free_mem, &total_mem);
+        if (mem_err == cudaSuccess) {
+            GGML_LOG_WARN(
+                "%s: stage=%s failed: %s (%d), cuda_mem_free=%.2f GiB cuda_mem_total=%.2f GiB\n",
+                __func__,
+                stage,
+                cudaGetErrorString(err),
+                (int) err,
+                (double) free_mem / (1024.0 * 1024.0 * 1024.0),
+                (double) total_mem / (1024.0 * 1024.0 * 1024.0));
+        } else {
+            GGML_LOG_WARN(
+                "%s: stage=%s failed: %s (%d), cudaMemGetInfo failed: %s (%d)\n",
+                __func__,
+                stage,
+                cudaGetErrorString(err),
+                (int) err,
+                cudaGetErrorString(mem_err),
+                (int) mem_err);
+        }
     }
-    GGML_LOG_WARN("%s: stage=%s failed: %s\n", __func__, stage, cudaGetErrorString(err));
 }
 
 static inline void nvfp4_cuda_resolve_cfg(
@@ -3961,6 +3981,7 @@ static bool ggml_cuda_nvfp4_quantize_impl(
         nvfp4_cuda_log_failure(label, status);
         (void) cudaStreamSynchronize(st);
         cudaGetLastError();
+        tls.reset();
         return false;
     };
     cudaError_t err = cudaSuccess;
@@ -4509,6 +4530,7 @@ static bool ggml_cuda_mxfp6_e2m3_quantize_eval_impl(
         nvfp4_cuda_log_failure(label, status);
         (void) cudaStreamSynchronize(st);
         cudaGetLastError();
+        tls.reset();
         return false;
     };
 

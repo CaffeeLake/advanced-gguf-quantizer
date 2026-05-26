@@ -2373,8 +2373,15 @@ static bool quantize_tensor_copy_in(ggml_tensor * tensor, const void * src, size
     if (tensor == nullptr || src == nullptr) {
         return false;
     }
+    if (ggml_cuda_tensor_set_host(tensor, src, nbytes, nullptr)) {
+        return true;
+    }
     if (tensor->buffer != nullptr) {
         if (ggml_backend_buffer_is_host(tensor->buffer)) {
+            return false;
+        }
+        const char * buffer_name = ggml_backend_buffer_name(tensor->buffer);
+        if (buffer_name != nullptr && std::strstr(buffer_name, "CUDA") != nullptr) {
             return false;
         }
         ggml_backend_tensor_set(tensor, const_cast<void *>(src), 0, nbytes);
@@ -5233,11 +5240,15 @@ static bool nvfp4_selector_choose_policy(
                 }
             } else {
                 std::atomic<size_t> next_patch { 0 };
+                std::atomic<bool> patch_failed { false };
                 std::vector<std::thread> workers;
                 workers.reserve((size_t) stageb_patch_threads);
                 for (int ti = 0; ti < stageb_patch_threads; ++ti) {
                     workers.emplace_back([&]() {
                         while (true) {
+                            if (patch_failed.load(std::memory_order_acquire)) {
+                                break;
+                            }
                             const size_t pos = next_patch.fetch_add(1, std::memory_order_relaxed);
                             if (pos >= eval_binding_indices.size()) {
                                 break;
@@ -5253,6 +5264,7 @@ static bool nvfp4_selector_choose_policy(
                             if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
                                     r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
                                 r.ok = false;
+                                patch_failed.store(true, std::memory_order_release);
                             }
                         }
                     });
