@@ -69,6 +69,15 @@ static std::shared_ptr<nvfp4_selector_kld_subset::mmap_file> nvfp4_selector_try_
 }
 
 bool nvfp4_selector_load_kld_subset(const std::string & path, int32_t chunk_start, int32_t n_chunks, nvfp4_selector_kld_subset & out) {
+    out.source_path = path;
+    std::error_code file_ec;
+    out.source_size = std::filesystem::file_size(path, file_ec);
+    if (file_ec) {
+        out.source_size = 0;
+    }
+    const auto write_time = std::filesystem::last_write_time(path, file_ec);
+    out.source_mtime = file_ec ? 0 : write_time.time_since_epoch().count();
+
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         fprintf(stderr, "%s: failed to open selector kld file: %s\n", __func__, path.c_str());

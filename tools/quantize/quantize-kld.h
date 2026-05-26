@@ -27,6 +27,9 @@ struct nvfp4_selector_kld_subset {
     int32_t first = 0;
     int32_t n_score = 0;
     int32_t nv = 0;
+    std::string source_path;
+    uintmax_t source_size = 0;
+    int64_t source_mtime = 0;
     std::vector<llama_token> tokens;
     std::vector<uint16_t> log_probs_u16;
     std::shared_ptr<mmap_file> log_probs_mapping;

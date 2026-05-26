@@ -13,6 +13,7 @@
 #include "../../src/llama-quant.h"
 #include "../../ggml/src/ggml-quants.h"
 #include "gguf.h"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1413,6 +1414,318 @@ static void nvfp4_selector_write_delta_metric_json_fields(
     write_delta("delta_top_prob_rmse", after.top_prob_rmse - before.top_prob_rmse);
     write_delta("delta_top_flip_weight", after.top_flip_weight - before.top_flip_weight);
 }
+
+struct nvfp4_selector_stageb_digest {
+    uint64_t value = 1469598103934665603ull;
+
+    void add_bytes(const void * data, size_t size) {
+        const auto * bytes = static_cast<const uint8_t *>(data);
+        for (size_t i = 0; i < size; ++i) {
+            value ^= (uint64_t) bytes[i];
+            value *= 1099511628211ull;
+        }
+    }
+
+    void add_string(const std::string & text) {
+        add_bytes(text.data(), text.size());
+        const uint8_t nul = 0;
+        add_bytes(&nul, sizeof(nul));
+    }
+
+    std::string hex() const {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%016" PRIx64, value);
+        return buf;
+    }
+};
+
+static nlohmann::ordered_json nvfp4_selector_stageb_metric_json(const nvfp4_selector_derived_metrics & dm) {
+    nlohmann::ordered_json out = nlohmann::ordered_json::object();
+    out["ok"] = dm.ok;
+    out["ppl_q"] = dm.ppl_q;
+    out["ppl_base"] = dm.ppl_base;
+    out["ln_ratio"] = dm.ln_ratio;
+    out["ln_ratio_unc"] = dm.ln_ratio_unc;
+    out["mean_kld"] = dm.mean_kld;
+    out["mean_kld_unc"] = dm.mean_kld_unc;
+    out["kld_p95"] = dm.kld_p95;
+    out["kld_p99"] = dm.kld_p99;
+    out["kld_p999"] = dm.kld_p999;
+    out["kld_tail_mean"] = dm.kld_tail_mean;
+    out["max_kld"] = dm.max_kld;
+    out["rms_dp"] = dm.rms_dp;
+    out["rms_dp_unc"] = dm.rms_dp_unc;
+    out["same_top"] = dm.same_top;
+    out["same_top_unc"] = dm.same_top_unc;
+    out["entropy_rmse"] = dm.entropy_rmse;
+    out["top_prob_rmse"] = dm.top_prob_rmse;
+    out["top_flip_weight"] = dm.top_flip_weight;
+    return out;
+}
+
+static bool nvfp4_selector_stageb_metric_from_json(
+        const nlohmann::ordered_json & in,
+        nvfp4_selector_derived_metrics & dm) {
+    if (!in.is_object()) {
+        return false;
+    }
+    dm.ok = in.value("ok", false);
+    dm.ppl_q = in.value("ppl_q", 0.0);
+    dm.ppl_base = in.value("ppl_base", 0.0);
+    dm.ln_ratio = in.value("ln_ratio", 0.0);
+    dm.ln_ratio_unc = in.value("ln_ratio_unc", 0.0);
+    dm.mean_kld = in.value("mean_kld", 0.0);
+    dm.mean_kld_unc = in.value("mean_kld_unc", 0.0);
+    dm.kld_p95 = in.value("kld_p95", 0.0);
+    dm.kld_p99 = in.value("kld_p99", 0.0);
+    dm.kld_p999 = in.value("kld_p999", 0.0);
+    dm.kld_tail_mean = in.value("kld_tail_mean", 0.0);
+    dm.max_kld = in.value("max_kld", 0.0);
+    dm.rms_dp = in.value("rms_dp", 0.0);
+    dm.rms_dp_unc = in.value("rms_dp_unc", 0.0);
+    dm.same_top = in.value("same_top", 0.0);
+    dm.same_top_unc = in.value("same_top_unc", 0.0);
+    dm.entropy_rmse = in.value("entropy_rmse", 0.0);
+    dm.top_prob_rmse = in.value("top_prob_rmse", 0.0);
+    dm.top_flip_weight = in.value("top_flip_weight", 0.0);
+    return dm.ok;
+}
+
+static nlohmann::ordered_json nvfp4_selector_stageb_cfg_json(const nvfp4_cuda_runtime_cfg & cfg) {
+    nlohmann::ordered_json out = nlohmann::ordered_json::object();
+    out["choose46"] = cfg.choose46_mode;
+    out["refit"] = cfg.refit_iters;
+    out["compand"] = cfg.use_compand_sat;
+    out["reserved"] = cfg.reserved_i32;
+    out["cap6"] = cfg.cap_m6;
+    out["cap4"] = cfg.cap_m4;
+    return out;
+}
+
+static nlohmann::ordered_json nvfp4_selector_stageb_rank_json(const selector_rank_config & cfg) {
+    nlohmann::ordered_json out = nlohmann::ordered_json::object();
+    out["kld_threshold"] = cfg.kld_threshold;
+    out["p99_threshold"] = cfg.p99_threshold;
+    out["p999_threshold"] = cfg.p999_threshold;
+    out["max_kld_threshold"] = cfg.max_kld_threshold;
+    out["kld_penalty"] = cfg.kld_penalty;
+    out["p99_penalty"] = cfg.p99_penalty;
+    out["p999_penalty"] = cfg.p999_penalty;
+    out["max_kld_penalty"] = cfg.max_kld_penalty;
+    out["holdout_weight"] = cfg.holdout_weight;
+    out["kld_hard_gate"] = cfg.kld_hard_gate;
+    out["p99_hard_gate"] = cfg.p99_hard_gate;
+    out["p999_hard_gate"] = cfg.p999_hard_gate;
+    out["max_kld_hard_gate"] = cfg.max_kld_hard_gate;
+    out["ppl_sigma"] = cfg.ppl_sigma;
+    out["kld_sigma"] = cfg.kld_sigma;
+    out["rms_dp_sigma"] = cfg.rms_dp_sigma;
+    out["same_top_sigma"] = cfg.same_top_sigma;
+    out["ln_ratio_abs_floor"] = cfg.ln_ratio_abs_floor;
+    out["mean_kld_abs_floor"] = cfg.mean_kld_abs_floor;
+    out["rms_dp_abs_floor"] = cfg.rms_dp_abs_floor;
+    out["same_top_abs_floor"] = cfg.same_top_abs_floor;
+    out["entropy_rmse_abs_floor"] = cfg.entropy_rmse_abs_floor;
+    out["top_prob_rmse_abs_floor"] = cfg.top_prob_rmse_abs_floor;
+    out["top_flip_weight_abs_floor"] = cfg.top_flip_weight_abs_floor;
+    out["p99_abs_margin"] = cfg.p99_abs_margin;
+    out["p99_rel_margin"] = cfg.p99_rel_margin;
+    out["p999_abs_margin"] = cfg.p999_abs_margin;
+    out["p999_rel_margin"] = cfg.p999_rel_margin;
+    out["max_kld_abs_margin"] = cfg.max_kld_abs_margin;
+    out["max_kld_rel_margin"] = cfg.max_kld_rel_margin;
+    out["mxfp6_ppl_abs_tol"] = cfg.mxfp6.ppl_abs_tol;
+    out["mxfp6_ppl_rel_tol"] = cfg.mxfp6.ppl_rel_tol;
+    out["mxfp6_mean_kld_abs_tol"] = cfg.mxfp6.mean_kld_abs_tol;
+    out["mxfp6_mean_kld_rel_tol"] = cfg.mxfp6.mean_kld_rel_tol;
+    return out;
+}
+
+static nlohmann::ordered_json nvfp4_selector_stageb_file_json(const std::string & path) {
+    nlohmann::ordered_json out = nlohmann::ordered_json::object();
+    std::error_code ec;
+    const auto canonical = std::filesystem::weakly_canonical(path, ec);
+    out["path"] = ec ? path : canonical.string();
+    const uintmax_t size = std::filesystem::file_size(path, ec);
+    out["size"] = ec ? 0 : size;
+    const auto write_time = std::filesystem::last_write_time(path, ec);
+    out["mtime"] = ec ? 0 : write_time.time_since_epoch().count();
+    return out;
+}
+
+static nlohmann::ordered_json nvfp4_selector_stageb_kld_json(const nvfp4_selector_kld_subset & kld) {
+    nlohmann::ordered_json out = nlohmann::ordered_json::object();
+    out["path"] = kld.source_path;
+    out["size"] = kld.source_size;
+    out["mtime"] = kld.source_mtime;
+    out["ctx"] = kld.n_ctx;
+    out["vocab"] = kld.n_vocab;
+    out["chunk_total"] = kld.n_chunk_total;
+    out["chunk_start"] = kld.chunk_start;
+    out["chunk_count"] = kld.n_chunk;
+    out["first"] = kld.first;
+    out["score_tokens"] = kld.n_score;
+    out["nv"] = kld.nv;
+    return out;
+}
+
+struct nvfp4_selector_stageb_cache_entry {
+    std::string event;
+    std::string policy;
+    nvfp4_selector_derived_metrics search;
+    nvfp4_selector_derived_metrics validation;
+    bool has_validation = false;
+    bool pass = false;
+    double score = std::numeric_limits<double>::infinity();
+};
+
+struct nvfp4_selector_stageb_cache {
+    static constexpr const char * schema = "advanced-gguf-selector-stageb-result-v1";
+    static constexpr const char * legacy_schema = "blackwell-selector-stageb-result-v1";
+
+    std::string path;
+    std::unordered_map<std::string, nvfp4_selector_stageb_cache_entry> entries;
+    std::unordered_set<std::string> policies;
+    std::unordered_set<std::string> mismatch_logged;
+
+    void load(const std::string & cache_path) {
+        path = cache_path;
+        if (path.empty()) {
+            return;
+        }
+        std::ifstream in(path);
+        if (!in) {
+            return;
+        }
+
+        std::string line;
+        size_t ignored = 0;
+        while (std::getline(in, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            try {
+                const auto record = nlohmann::ordered_json::parse(line);
+                const std::string record_schema = record.value("schema", std::string());
+                if (!record.is_object() || (record_schema != schema && record_schema != legacy_schema)) {
+                    ++ignored;
+                    continue;
+                }
+                const auto key_it = record.find("key");
+                const auto search_it = record.find("search");
+                if (key_it == record.end() || search_it == record.end()) {
+                    ++ignored;
+                    continue;
+                }
+
+                nvfp4_selector_stageb_cache_entry entry;
+                entry.event = record.value("event", std::string());
+                entry.policy = record.value("policy", std::string());
+                entry.pass = record.value("pass", false);
+                entry.score = record.value("score", std::numeric_limits<double>::infinity());
+                entry.has_validation = record.value("has_validation", false);
+                if (entry.policy.empty() ||
+                        !nvfp4_selector_stageb_metric_from_json(*search_it, entry.search)) {
+                    ++ignored;
+                    continue;
+                }
+                if (entry.has_validation) {
+                    const auto validation_it = record.find("validation");
+                    if (validation_it == record.end() ||
+                            !nvfp4_selector_stageb_metric_from_json(*validation_it, entry.validation)) {
+                        ++ignored;
+                        continue;
+                    }
+                }
+                entries[key_it->dump()] = entry;
+                policies.insert(entry.policy);
+            } catch (const std::exception &) {
+                ++ignored;
+            }
+        }
+
+        fprintf(stderr,
+            "%s: selector stage-b result cache loaded entries=%zu ignored=%zu path=%s\n",
+            __func__, entries.size(), ignored, path.c_str());
+    }
+
+    bool find(
+            const nlohmann::ordered_json & key,
+            const std::string & policy,
+            nvfp4_selector_stageb_cache_entry & out) {
+        const auto it = entries.find(key.dump());
+        if (it != entries.end()) {
+            out = it->second;
+            fprintf(stderr,
+                "%s: selector stage-b cache accepted policy=%s event=%s\n",
+                __func__, policy.c_str(), out.event.c_str());
+            return true;
+        }
+        if (policies.find(policy) != policies.end() && mismatch_logged.insert(policy).second) {
+            fprintf(stderr,
+                "%s: selector stage-b cache ignored policy=%s due to key mismatch\n",
+                __func__, policy.c_str());
+        }
+        return false;
+    }
+
+    void append(
+            const char * event,
+            const nlohmann::ordered_json & key,
+            const std::string & policy,
+            const nvfp4_selector_derived_metrics & search,
+            const nvfp4_selector_derived_metrics * validation,
+            bool pass,
+            double score) {
+        if (path.empty() || !search.ok) {
+            return;
+        }
+
+        std::filesystem::path cache_path(path);
+        std::error_code ec;
+        if (cache_path.has_parent_path()) {
+            std::filesystem::create_directories(cache_path.parent_path(), ec);
+            if (ec) {
+                fprintf(stderr, "%s: selector stage-b cache directory unavailable %s: %s\n",
+                    __func__, cache_path.parent_path().string().c_str(), ec.message().c_str());
+                return;
+            }
+        }
+
+        nlohmann::ordered_json record = nlohmann::ordered_json::object();
+        record["schema"] = schema;
+        record["event"] = event;
+        record["policy"] = policy;
+        record["key"] = key;
+        record["search"] = nvfp4_selector_stageb_metric_json(search);
+        record["has_validation"] = validation != nullptr && validation->ok;
+        if (validation != nullptr && validation->ok) {
+            record["validation"] = nvfp4_selector_stageb_metric_json(*validation);
+        }
+        record["pass"] = pass;
+        record["score"] = score;
+
+        std::ofstream out(path, std::ios::app);
+        if (!out) {
+            fprintf(stderr, "%s: selector stage-b cache append failed path=%s\n", __func__, path.c_str());
+            return;
+        }
+        out << record.dump() << '\n';
+
+        nvfp4_selector_stageb_cache_entry entry;
+        entry.event = event;
+        entry.policy = policy;
+        entry.search = search;
+        if (validation != nullptr) {
+            entry.validation = *validation;
+        }
+        entry.has_validation = validation != nullptr && validation->ok;
+        entry.pass = pass;
+        entry.score = score;
+        entries[key.dump()] = entry;
+        policies.insert(policy);
+    }
+};
 
 static double nvfp4_selector_combined_unc(double ua, double ub) {
     return std::sqrt(std::max(0.0, ua * ua + ub * ub));
@@ -4127,10 +4440,30 @@ static bool nvfp4_selector_choose_policy(
     };
     update_full_quant_eta("selector-setup", true);
 
-	    const int eval_top = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_TOP", 6));
+    const int eval_top = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_TOP", 6));
     const bool want_measured_eval_requested = eval_top > 0;
     const bool want_measured_eval = want_measured_eval_requested && quantize_control_i64("LLAMA_NVFP4_SELECTOR_ENABLE_EVAL", 0) != 0;
     const bool require_runtime_cache = quantize_control_i64("LLAMA_NVFP4_SELECTOR_REQUIRE_RUNTIME_CACHE", 0) != 0;
+    nvfp4_selector_stageb_digest imatrix_digest;
+    std::vector<std::string> imatrix_keys;
+    imatrix_keys.reserve(imatrix_data.size());
+    for (const auto & kv : imatrix_data) {
+        imatrix_keys.push_back(kv.first);
+    }
+    std::sort(imatrix_keys.begin(), imatrix_keys.end());
+    for (const std::string & name : imatrix_keys) {
+        const auto it = imatrix_data.find(name);
+        if (it == imatrix_data.end()) {
+            continue;
+        }
+        imatrix_digest.add_string(name);
+        const uint64_t row_size = (uint64_t) it->second.size();
+        imatrix_digest.add_bytes(&row_size, sizeof(row_size));
+        if (!it->second.empty()) {
+            imatrix_digest.add_bytes(it->second.data(), it->second.size() * sizeof(float));
+        }
+    }
+    const std::string imatrix_hash = imatrix_digest.hex();
 
     std::vector<std::string> src_splits;
     llama_model_loader src_ml(
@@ -4948,10 +5281,12 @@ static bool nvfp4_selector_choose_policy(
         stageb_policy_active = false;
         update_full_quant_eta(skip_remaining_tuning ? "selector-skipping-to-final-materialization" : "selector-proxy-only", true);
     }
-    const nvfp4_selector_kld_subset kld_budget = nvfp4_selector_make_kld_budget_subset(kld, (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", 4));
+    const int32_t stageb_eval_chunk_budget =
+        (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", 4);
+    const nvfp4_selector_kld_subset kld_budget = nvfp4_selector_make_kld_budget_subset(kld, stageb_eval_chunk_budget);
     const std::unique_ptr<nvfp4_selector_kld_subset> holdout_budget =
         (kld_holdout != nullptr)
-        ? std::make_unique<nvfp4_selector_kld_subset>(nvfp4_selector_make_kld_budget_subset(*kld_holdout, (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", 4)))
+        ? std::make_unique<nvfp4_selector_kld_subset>(nvfp4_selector_make_kld_budget_subset(*kld_holdout, stageb_eval_chunk_budget))
         : nullptr;
     int selector_n_seq = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_N_SEQ", 4));
     const nvfp4_selector_logits_budget logits_budget = nvfp4_selector_default_logits_budget();
@@ -5019,6 +5354,82 @@ static bool nvfp4_selector_choose_policy(
         return true;
     };
     params.load_progress_callback_user_data = load_heartbeat.get();
+
+    auto stageb_binding_hash = [&](const std::vector<size_t> & indices) {
+        nvfp4_selector_stageb_digest digest;
+        for (size_t idx : indices) {
+            if (idx < all_bindings.size()) {
+                digest.add_string(all_bindings[idx].name);
+            }
+        }
+        return digest.hex();
+    };
+    nvfp4_selector_stageb_digest mxfp6_binding_digest;
+    for (const auto & b : mxfp6_bindings) {
+        mxfp6_binding_digest.add_string(b.name);
+    }
+    const std::string all_binding_hash = stageb_binding_hash(all_binding_indices);
+    const std::string stress_binding_hash = stageb_binding_hash(stress_binding_indices);
+    const std::string mxfp6_binding_hash = mxfp6_binding_digest.hex();
+    auto make_stageb_base_key = [&]() {
+        nlohmann::ordered_json key = nlohmann::ordered_json::object();
+        key["cache_version"] = 1;
+        key["source_model"] = nvfp4_selector_stageb_file_json(source_model_path);
+        key["checkpoint_model"] = nvfp4_selector_stageb_file_json(checkpoint_model_path);
+        key["imatrix"] = {
+            {"entries", imatrix_data.size()},
+            {"hash", imatrix_hash},
+        };
+        key["search_kld"] = nvfp4_selector_stageb_kld_json(kld_budget);
+        key["validation_kld"] = holdout_budget ? nvfp4_selector_stageb_kld_json(*holdout_budget) : nlohmann::ordered_json(nullptr);
+        key["eval"] = {
+            {"requested_chunks", stageb_eval_chunk_budget},
+            {"n_seq", selector_n_seq},
+            {"n_ctx", params.n_ctx},
+            {"n_batch", params.n_batch},
+            {"n_ubatch", params.n_ubatch},
+            {"n_gpu_layers", params.n_gpu_layers},
+            {"input_scale_policy", nvfp4_input_scale_policy},
+        };
+        key["rank"] = nvfp4_selector_stageb_rank_json(rank_cfg);
+        key["bindings"] = {
+            {"nvfp4_count", all_bindings.size()},
+            {"nvfp4_all_hash", all_binding_hash},
+            {"nvfp4_stress_hash", stress_binding_hash},
+            {"mxfp6_count", mxfp6_bindings.size()},
+            {"mxfp6_hash", mxfp6_binding_hash},
+        };
+        return key;
+    };
+    auto make_stageb_policy_key = [&](const nvfp4_selector_policy & policy, const std::vector<size_t> & binding_indices) {
+        nlohmann::ordered_json key = make_stageb_base_key();
+        key["kind"] = "policy";
+        key["policy"] = {
+            {"name", policy.name},
+            {"cfg", nvfp4_selector_stageb_cfg_json(policy.cfg)},
+            {"binding_mode", covers_all_nvfp4_bindings(binding_indices) ? "all" : "partial"},
+            {"tensor_count", binding_indices.size()},
+            {"tensor_hash", stageb_binding_hash(binding_indices)},
+            {"has_survey", policy.has_survey},
+        };
+        return key;
+    };
+    auto make_stageb_baseline_key = [&]() {
+        nlohmann::ordered_json key = make_stageb_base_key();
+        key["kind"] = "baseline";
+        key["policy"] = {
+            {"name", "seed_keep"},
+            {"cfg", baseline_it != policies.end() ? nvfp4_selector_stageb_cfg_json(baseline_it->cfg) : nlohmann::ordered_json(nullptr)},
+            {"binding_mode", "runtime_checkpoint"},
+            {"tensor_count", all_bindings.size()},
+            {"tensor_hash", all_binding_hash},
+        };
+        return key;
+    };
+    nvfp4_selector_stageb_cache stageb_result_cache;
+    if (run_stageb_eval) {
+        stageb_result_cache.load(checkpoint_model_path + ".stageb-results.jsonl");
+    }
 
     common_init_result_ptr init_res;
     llama_context * lctx = nullptr;
@@ -5219,21 +5630,44 @@ static bool nvfp4_selector_choose_policy(
             kld_metric_threads);
         full_quant_eta_done = 1;
         update_full_quant_eta("selector-stage-b-baseline-kld", true);
-        nvfp4_selector_kld_metrics baseline_km;
-        if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, baseline_km, true)) {
-            restore_all();
-            return false;
-        }
-        baseline_eval = nvfp4_selector_derive_metrics(baseline_km);
-
-        if (holdout_budget && holdout_budget->n_chunk > 0) {
-            nvfp4_selector_kld_metrics baseline_holdout_km;
-            if (!nvfp4_selector_eval_kld_subset(lctx, *holdout_budget, params.n_batch, baseline_holdout_km, true)) {
+        const nlohmann::ordered_json baseline_cache_key = make_stageb_baseline_key();
+        nvfp4_selector_stageb_cache_entry cached_baseline;
+        if (stageb_result_cache.find(baseline_cache_key, "seed_keep", cached_baseline)) {
+            baseline_eval = cached_baseline.search;
+            baseline_holdout_eval = cached_baseline.validation;
+            has_holdout_eval = cached_baseline.has_validation && baseline_holdout_eval.ok;
+        } else {
+            nvfp4_selector_kld_metrics baseline_km;
+            if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, baseline_km, true)) {
                 restore_all();
                 return false;
             }
-            baseline_holdout_eval = nvfp4_selector_derive_metrics(baseline_holdout_km);
-            has_holdout_eval = baseline_holdout_eval.ok;
+            baseline_eval = nvfp4_selector_derive_metrics(baseline_km);
+
+            if (holdout_budget && holdout_budget->n_chunk > 0) {
+                nvfp4_selector_kld_metrics baseline_holdout_km;
+                if (!nvfp4_selector_eval_kld_subset(lctx, *holdout_budget, params.n_batch, baseline_holdout_km, true)) {
+                    restore_all();
+                    return false;
+                }
+                baseline_holdout_eval = nvfp4_selector_derive_metrics(baseline_holdout_km);
+                has_holdout_eval = baseline_holdout_eval.ok;
+            }
+            const nvfp4_selector_metric_rank baseline_rank =
+                nvfp4_selector_rank_policy_metrics(
+                    baseline_eval,
+                    has_holdout_eval ? &baseline_holdout_eval : nullptr,
+                    baseline_eval,
+                    has_holdout_eval ? &baseline_holdout_eval : nullptr,
+                    rank_cfg);
+            stageb_result_cache.append(
+                "baseline",
+                baseline_cache_key,
+                "seed_keep",
+                baseline_eval,
+                has_holdout_eval ? &baseline_holdout_eval : nullptr,
+                baseline_rank.pass,
+                baseline_rank.score);
         }
 
         const std::string baseline_main_summary =
@@ -5266,6 +5700,48 @@ static bool nvfp4_selector_choose_policy(
                 kld_budget.n_chunk,
                 holdout_budget ? holdout_budget->n_chunk : 0);
             const std::vector<size_t> & eval_binding_indices = policy.has_survey ? all_binding_indices : stress_binding_indices;
+            const nlohmann::ordered_json policy_cache_key = make_stageb_policy_key(policy, eval_binding_indices);
+            nvfp4_selector_stageb_cache_entry cached_policy;
+            if (stageb_result_cache.find(policy_cache_key, policy.name, cached_policy)) {
+                policy.measured = cached_policy.search;
+                policy.measured_holdout = cached_policy.validation;
+                policy.has_holdout = cached_policy.has_validation && policy.measured_holdout.ok;
+                const nvfp4_selector_metric_rank policy_rank =
+                    nvfp4_selector_rank_policy_metrics(
+                        policy.measured,
+                        policy.has_holdout ? &policy.measured_holdout : nullptr,
+                        baseline_eval,
+                        has_holdout_eval ? &baseline_holdout_eval : nullptr,
+                        rank_cfg);
+                policy.measured_pass = policy_rank.pass;
+                policy.measured_score = policy_rank.score;
+                fprintf(stderr,
+                    "selector stage-b cache hit policy=%s search_chunks=%d validation_chunks=%d\n",
+                    policy.name.c_str(),
+                    kld_budget.n_chunk,
+                    policy.has_holdout ? (holdout_budget ? holdout_budget->n_chunk : 0) : 0);
+                const std::string policy_main_summary =
+                    nvfp4_selector_format_metrics("search", policy.measured);
+                fprintf(stderr,
+                    "selector stage-b policy=%s measured_score=%.6f pass=%s %s\n",
+                    policy.name.c_str(),
+                    policy.measured_score,
+                    policy.measured_pass ? "yes" : "no",
+                    policy_main_summary.c_str());
+                if (policy.has_holdout) {
+                    const std::string policy_holdout_summary =
+                        nvfp4_selector_format_metrics("validation", policy.measured_holdout);
+                    fprintf(stderr,
+                        "selector stage-b policy=%s %s\n",
+                        policy.name.c_str(),
+                        policy_holdout_summary.c_str());
+                }
+                finish_stageb_policy_unit("selector-stage-b-policy-cached", true);
+                if (note_skip_remaining("stage-b")) {
+                    break;
+                }
+                continue;
+            }
             if (!covers_all_nvfp4_bindings(eval_binding_indices)) {
                 restore_all();
             }
@@ -5592,6 +6068,14 @@ static bool nvfp4_selector_choose_policy(
                     policy.name.c_str(),
                     policy_holdout_summary.c_str());
             }
+            stageb_result_cache.append(
+                "policy_result",
+                policy_cache_key,
+                policy.name,
+                policy.measured,
+                policy.has_holdout ? &policy.measured_holdout : nullptr,
+                policy.measured_pass,
+                policy.measured_score);
             finish_stageb_policy_unit("selector-stage-b-policy-complete", true);
             if (note_skip_remaining("stage-b")) {
                 break;
