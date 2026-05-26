@@ -1,0 +1,19 @@
+name: Feature or recipe request
+description: Request a quantization feature, policy, recipe, backend, or documentation improvement.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What workflow or model outcome should this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Include target models, quant types, quality metrics, size/runtime constraints, and any prior attempts.
+    validations:
+      required: true

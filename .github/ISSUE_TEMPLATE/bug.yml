@@ -1,0 +1,35 @@
+name: Quantizer bug
+description: Report a build, quantization, resume, edit, or evaluation problem.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or recipe
+      description: Include the exact command, recipe snippet, or project step.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: artifact
+    attributes:
+      label: Model and evidence
+      description: Source GGUF, target quant type, imatrix/KLD files if used, GPU/backend, and relevant log lines.
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Build info
+      description: Commit SHA, CMake flags, CUDA toolkit/driver, and GPU model.
+      render: text
+    validations:
+      required: true

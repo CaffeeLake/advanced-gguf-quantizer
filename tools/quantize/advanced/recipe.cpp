@@ -1,0 +1,1460 @@
+#include "recipe.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <stdexcept>
+
+namespace bq {
+namespace {
+
+static std::string trim(std::string value) {
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+static std::string strip_comment(const std::string & line) {
+    bool in_string = false;
+    bool escape = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (c == '\\' && in_string) {
+            escape = true;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (c == '#' && !in_string) {
+            return line.substr(0, i);
+        }
+    }
+    return line;
+}
+
+static std::string unquote(std::string value) {
+    value = trim(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        std::string out;
+        out.reserve(value.size() - 2);
+        bool escape = false;
+        for (size_t i = 1; i + 1 < value.size(); ++i) {
+            const char c = value[i];
+            if (escape) {
+                switch (c) {
+                    case 'n': out.push_back('\n'); break;
+                    case 't': out.push_back('\t'); break;
+                    default:  out.push_back(c);    break;
+                }
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+    return value;
+}
+
+static bool parse_bool_value(const std::string & value) {
+    const std::string v = trim(value);
+    if (v == "true" || v == "on" || v == "1" || v == "yes") {
+        return true;
+    }
+    if (v == "false" || v == "off" || v == "0" || v == "no") {
+        return false;
+    }
+    throw std::runtime_error("invalid boolean value: " + value);
+}
+
+static double parse_double_value(const std::string & value) {
+    size_t pos = 0;
+    const std::string v = trim(value);
+    const double out = std::stod(v, &pos);
+    if (pos != v.size()) {
+        throw std::runtime_error("invalid floating point value: " + value);
+    }
+    return out;
+}
+
+static int parse_int_value(const std::string & value) {
+    size_t pos = 0;
+    const int out = std::stoi(trim(value), &pos);
+    if (pos != trim(value).size()) {
+        throw std::runtime_error("invalid integer value: " + value);
+    }
+    return out;
+}
+
+static std::string canonical_mixed_policy(std::string value);
+
+struct QuantTypeProfile {
+    const char * type;
+    const char * profile;
+};
+
+static constexpr std::array<QuantTypeProfile, 3> QUANT_TYPE_PROFILES = {{
+    { "NVFP4", "nvfp4" },
+    { "MXFP6", "mxfp6" },
+    { "NVFP4_MXFP6", "nvfp4_mxfp6" },
+}};
+
+static std::vector<std::string> parse_string_list(std::string value) {
+    value = trim(value);
+    if (value.empty()) {
+        return {};
+    }
+    if (value.front() != '[' || value.back() != ']') {
+        return { unquote(value) };
+    }
+    value = value.substr(1, value.size() - 2);
+    std::vector<std::string> out;
+    bool in_string = false;
+    bool escape = false;
+    size_t start = 0;
+    for (size_t i = 0; i <= value.size(); ++i) {
+        const char c = i < value.size() ? value[i] : ',';
+        if (escape) {
+            escape = false;
+        } else if (c == '\\' && in_string) {
+            escape = true;
+        } else if (c == '"') {
+            in_string = !in_string;
+        } else if (c == ',' && !in_string) {
+            const std::string item = trim(value.substr(start, i - start));
+            if (!item.empty()) {
+                out.push_back(unquote(item));
+            }
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+static void set_value(LoadedRecipe & loaded, const std::string & path, const std::string & raw_value) {
+    Recipe & r = loaded.recipe;
+    const std::string value = unquote(raw_value);
+    loaded.raw_values[path] = value;
+
+    if (path == "version") { return; }
+
+    if (path == "target.precision_mode") { r.target.precision_mode = canonical_quant_type(value); return; }
+    if (path == "target.model_params_b") { r.target.model_params_b = parse_double_value(value); return; }
+    if (path == "target.vram_gb") { r.target.vram_gb = parse_int_value(value); return; }
+    if (path == "target.ram_gb") { r.target.ram_gb = parse_int_value(value); return; }
+    if (path == "target.target_bpw") { r.target.target_bpw = parse_double_value(value); return; }
+    if (path == "target.weight_budget_gib") { r.target.weight_budget_gib = parse_double_value(value); return; }
+    if (path == "target.kv_cache_gib") { r.target.kv_cache_gib = parse_double_value(value); return; }
+    if (path == "target.activation_headroom_gib") { r.target.activation_headroom_gib = parse_double_value(value); return; }
+    if (path == "target.fit_to_vram") { r.target.fit_to_vram = parse_bool_value(value); return; }
+    if (path == "target.sizing_note") { r.target.sizing_note = value; return; }
+
+    if (path == "autotune.enabled") { r.autotune.enabled = parse_bool_value(value); return; }
+    if (path == "autotune.mode") { r.autotune.mode = value; return; }
+    if (path == "autotune.objective") { r.autotune.objective = value; return; }
+    if (path == "autotune.evidence") { r.autotune.evidence = value; return; }
+    if (path == "autotune.policy_set") { r.autotune.policy_set = value; return; }
+    if (path == "autotune.require_kld") { r.autotune.require_kld = parse_bool_value(value); return; }
+    if (path == "autotune.require_corpus") { r.autotune.require_corpus = parse_bool_value(value); return; }
+    if (path == "autotune.require_imatrix") { r.autotune.require_imatrix = parse_bool_value(value); return; }
+    if (path == "autotune.allow_diagnostic") { r.autotune.allow_diagnostic = parse_bool_value(value); return; }
+
+    if (path == "stock_ftype.source") { r.stock_ftype.source = value; return; }
+    if (path == "stock_ftype.mostly_type") { r.stock_ftype.mostly_type = value; return; }
+    if (path == "stock_ftype.preserve_embeddings") { r.stock_ftype.preserve_embeddings = parse_bool_value(value); return; }
+    if (path == "stock_ftype.output_policy") { r.stock_ftype.output_policy = value; return; }
+    if (path == "stock_ftype.sweep_tensor_policy") { r.stock_ftype.sweep_tensor_policy = parse_bool_value(value); r.stock_ftype.sweep_sensitive_tensors = r.stock_ftype.sweep_tensor_policy; return; }
+    if (path == "stock_ftype.sweep_sensitive_tensors") { r.stock_ftype.sweep_sensitive_tensors = parse_bool_value(value); r.stock_ftype.sweep_tensor_policy = r.stock_ftype.sweep_sensitive_tensors; return; }
+    if (path == "stock_ftype.token_embedding_candidates") { r.stock_ftype.token_embedding_candidates = parse_string_list(raw_value); return; }
+    if (path == "stock_ftype.output_tensor_candidates") { r.stock_ftype.output_tensor_candidates = parse_string_list(raw_value); return; }
+    if (path == "stock_ftype.min_quant_savings_mib") { r.stock_ftype.min_quant_savings_mib = parse_double_value(value); return; }
+    if (path == "stock_ftype.technique_candidates") { r.stock_ftype.technique_candidates = parse_string_list(raw_value); return; }
+    if (path == "stock_ftype.rationale") { r.stock_ftype.rationale = value; return; }
+
+    if (path == "io.input") { r.io.input = value; return; }
+    if (path == "io.output") { r.io.output = value; return; }
+    if (path == "io.patch_base") { r.io.patch_base = value; return; }
+    if (path == "io.keep_split") { r.io.keep_split = parse_bool_value(value); return; }
+
+    if (path == "base.ftype") { r.base.ftype = canonical_quant_type(value); return; }
+    if (path == "base.threads") { r.base.threads = parse_int_value(value); return; }
+    if (path == "base.output_tensor_type") { r.base.output_tensor_type = sanitize_tensor_type_token(value); return; }
+    if (path == "base.token_embedding_type") { r.base.token_embedding_type = sanitize_tensor_type_token(value); return; }
+    if (path == "base.dry_run") { r.base.dry_run = parse_bool_value(value); return; }
+    if (path == "base.allow_requantize") { r.base.allow_requantize = parse_bool_value(value); return; }
+    if (path == "base.leave_output_tensor") { r.base.leave_output_tensor = parse_bool_value(value); return; }
+    if (path == "base.pure") { r.base.pure = parse_bool_value(value); return; }
+    if (path == "base.copy_only") { r.base.copy_only = parse_bool_value(value); return; }
+
+    if (path == "model.prune_layers") { r.model.prune_layers = value; return; }
+
+    if (path == "metadata.overrides") { r.metadata.overrides = parse_string_list(raw_value); return; }
+
+    if (path == "calibration.imatrix") { r.calibration.imatrix = value; return; }
+    if (path == "calibration.corpus") { r.calibration.corpus = value; return; }
+    if (path == "calibration.imatrix_bin") { r.calibration.imatrix_bin = value; return; }
+    if (path == "calibration.ctx_size") { r.calibration.ctx_size = value; return; }
+    if (path == "calibration.batch_size") { r.calibration.batch_size = value; return; }
+    if (path == "calibration.ubatch_size") { r.calibration.ubatch_size = value; return; }
+    if (path == "calibration.threads") { r.calibration.threads = value; return; }
+    if (path == "calibration.threads_batch") { r.calibration.threads_batch = value; return; }
+    if (path == "calibration.chunks") { r.calibration.chunks = value; return; }
+    if (path == "calibration.extra_args") { r.calibration.extra_args = value; return; }
+    if (path == "calibration.include_weights") { r.calibration.include_weights = parse_string_list(raw_value); return; }
+    if (path == "calibration.exclude_weights") { r.calibration.exclude_weights = parse_string_list(raw_value); return; }
+
+    if (path == "evaluation.kld_mode") { r.evaluation.kld_mode = value; return; }
+    if (path == "evaluation.bf16_reference") { r.evaluation.bf16_reference = value; return; }
+    if (path == "evaluation.corpus") { r.evaluation.corpus = value; return; }
+    if (path == "evaluation.kld_base") { r.evaluation.kld_base = value; return; }
+    if (path == "evaluation.bundle") { r.evaluation.bundle = value; return; }
+    if (path == "evaluation.perplexity_bin") { r.evaluation.perplexity_bin = value; return; }
+
+    if (path == "tensor_overrides.files") { r.tensor_overrides.files = parse_string_list(raw_value); return; }
+    if (path == "tensor_overrides.entries") { r.tensor_overrides.entries = parse_string_list(raw_value); return; }
+
+    if (path == "nvfp4.preset") { r.nvfp4.preset = value; return; }
+    if (path == "nvfp4.cfg") { r.nvfp4.cfg = value; return; }
+    if (path == "nvfp4.correction_denom") { r.nvfp4.correction_denom = value; return; }
+    if (path == "nvfp4.input_scale_policy") { r.nvfp4.input_scale_policy = value; return; }
+    if (path == "nvfp4.calibration_families") { r.nvfp4.calibration_families = parse_string_list(raw_value); return; }
+    if (path == "nvfp4.scale_tie") { r.nvfp4.scale_tie = value; return; }
+    if (path == "nvfp4.autotune.max_blocks") { r.nvfp4.autotune.max_blocks = value; return; }
+    if (path == "nvfp4.autotune.threads") { r.nvfp4.autotune.threads = value; return; }
+
+    if (path == "nvfp4.four_six.choose46") { r.nvfp4.four_six.choose46 = value; return; }
+    if (path == "nvfp4.four_six.refit_iters") { r.nvfp4.four_six.refit_iters = value; return; }
+    if (path == "nvfp4.four_six.compand") { r.nvfp4.four_six.compand = value; return; }
+    if (path == "nvfp4.four_six.cap6") { r.nvfp4.four_six.cap6 = value; return; }
+    if (path == "nvfp4.four_six.cap4") { r.nvfp4.four_six.cap4 = value; return; }
+
+    if (path == "mxfp6.tensor_scale") { r.mxfp6.tensor_scale = value; return; }
+    if (path == "mxfp6.min_savings_bytes") { r.mxfp6.min_savings_bytes = value; return; }
+    if (path == "mxfp6.input_scale_denom") { r.mxfp6.input_scale_denom = value; return; }
+    if (path == "mxfp6.input_scale_quantile") { r.mxfp6.input_scale_quantile = value; return; }
+    if (path == "mxfp6.tensor_scale_sample_blocks") { r.mxfp6.tensor_scale_sample_blocks = value; return; }
+    if (path == "mxfp6.tensor_scale_steps") { r.mxfp6.tensor_scale_steps = value; return; }
+    if (path == "mxfp6.selector_scale_top") { r.mxfp6.selector_scale_top = value; return; }
+    if (path == "mxfp6.selector_scale_candidates") { r.mxfp6.selector_scale_candidates = value; return; }
+
+    if (path == "mixed.policy" || path == "mixed_format.policy" || path == "nv4mx6.policy") { r.nv4mx6.policy = canonical_mixed_policy(value); return; }
+    if (path == "mixed.mx6_penalty" || path == "mixed_format.mx6_penalty" || path == "nv4mx6.mx6_penalty") { r.nv4mx6.mx6_penalty = value; return; }
+    if (path == "mixed.bf16_mx6_threshold" || path == "mixed_format.bf16_mx6_threshold" || path == "nv4mx6.bf16_mx6_threshold") { r.nv4mx6.bf16_mx6_threshold = value; return; }
+    if (path == "mixed.sample_blocks" || path == "mixed_format.sample_blocks" || path == "nv4mx6.sample_blocks") { r.nv4mx6.sample_blocks = value; return; }
+    if (path == "mixed.sample_cap" || path == "mixed_format.sample_cap" || path == "nv4mx6.sample_cap") { r.nv4mx6.sample_cap = value; return; }
+    if (path == "mixed.imatrix_weight_blend" || path == "mixed_format.imatrix_weight_blend" || path == "nv4mx6.imatrix_weight_blend") { r.nv4mx6.imatrix_weight_blend = value; return; }
+    if (path == "mixed.imatrix_weight_power" || path == "mixed_format.imatrix_weight_power" || path == "nv4mx6.imatrix_weight_power") { r.nv4mx6.imatrix_weight_power = value; return; }
+    if (path == "mixed.imatrix_weight_min" || path == "mixed_format.imatrix_weight_min" || path == "nv4mx6.imatrix_weight_min") { r.nv4mx6.imatrix_weight_min = value; return; }
+    if (path == "mixed.imatrix_weight_max" || path == "mixed_format.imatrix_weight_max" || path == "nv4mx6.imatrix_weight_max") { r.nv4mx6.imatrix_weight_max = value; return; }
+
+    if (path == "selector.effort") { r.selector.effort = value; return; }
+    if (path == "selector.kld") { r.selector.kld = value; return; }
+    if (path == "selector.checkpoint_model" || path == "selector.seed_model") { r.selector.checkpoint_model = value; return; }
+    if (path == "selector.cache_dir") { r.selector.cache_dir = value; return; }
+    if (path == "selector.skip_file") { r.selector.skip_file = value; return; }
+    if (path == "selector.keep_checkpoint") { r.selector.keep_checkpoint = parse_bool_value(value); return; }
+    if (path == "selector.require_runtime_cache") { r.selector.require_runtime_cache = parse_bool_value(value); return; }
+    if (path == "selector.chunks") { r.selector.chunks = value; return; }
+    if (path == "selector.chunk_start") { r.selector.chunk_start = value; return; }
+    if (path == "selector.holdout_chunks") { r.selector.holdout_chunks = value; return; }
+    if (path == "selector.holdout_start") { r.selector.holdout_start = value; return; }
+    if (path == "selector.stagea_sample_blocks") { r.selector.stagea_sample_blocks = value; return; }
+    if (path == "selector.stagea_max_policies") { r.selector.stagea_max_policies = value; return; }
+    if (path == "selector.refine_top") { r.selector.refine_top = value; return; }
+    if (path == "selector.refine_budget") { r.selector.refine_budget = value; return; }
+    if (path == "selector.survey_top") { r.selector.survey_top = value; return; }
+    if (path == "selector.survey_sample_blocks") { r.selector.survey_sample_blocks = value; return; }
+    if (path == "selector.max_tensors") { r.selector.max_tensors = value; return; }
+    if (path == "selector.trace") { r.selector.trace = parse_bool_value(value); return; }
+    if (path == "selector.policy_threads") { r.selector.policy_threads = value; return; }
+    if (path == "selector.threads") { r.selector.threads = value; return; }
+    if (path == "selector.kld_threads") { r.selector.kld_threads = value; return; }
+    if (path == "selector.only") { r.selector.only = parse_bool_value(value); return; }
+    if (path == "selector.eval_top") { r.selector.eval_top = value; return; }
+    if (path == "selector.eval_chunks") { r.selector.eval_chunks = value; return; }
+    if (path == "selector.n_seq") { r.selector.n_seq = value; return; }
+    if (path == "selector.sensitivity_report") { r.selector.sensitivity_report = value; return; }
+    if (path == "selector.sensitivity_top") { r.selector.sensitivity_top = value; return; }
+    if (path == "selector.sensitivity_layer") { r.selector.sensitivity_layer = value; return; }
+    if (path == "selector.sensitivity_tensor") { r.selector.sensitivity_tensor = value; return; }
+    if (path == "selector.sensitivity_sample_blocks") { r.selector.sensitivity_sample_blocks = value; return; }
+
+    if (path == "selector.ranking.kld_penalty") { r.selector.ranking.kld_penalty = value; return; }
+    if (path == "selector.ranking.p99_penalty") { r.selector.ranking.p99_penalty = value; return; }
+    if (path == "selector.ranking.p999_penalty") { r.selector.ranking.p999_penalty = value; return; }
+    if (path == "selector.ranking.max_kld_penalty") { r.selector.ranking.max_kld_penalty = value; return; }
+    if (path == "selector.ranking.kld_threshold") { r.selector.ranking.kld_threshold = value; return; }
+    if (path == "selector.ranking.p99_threshold") { r.selector.ranking.p99_threshold = value; return; }
+    if (path == "selector.ranking.p999_threshold") { r.selector.ranking.p999_threshold = value; return; }
+    if (path == "selector.ranking.max_kld_threshold") { r.selector.ranking.max_kld_threshold = value; return; }
+    if (path == "selector.ranking.kld_hard_gate") { r.selector.ranking.kld_hard_gate = parse_bool_value(value); return; }
+    if (path == "selector.ranking.p99_hard_gate") { r.selector.ranking.p99_hard_gate = parse_bool_value(value); return; }
+    if (path == "selector.ranking.p999_hard_gate") { r.selector.ranking.p999_hard_gate = parse_bool_value(value); return; }
+    if (path == "selector.ranking.max_kld_hard_gate") { r.selector.ranking.max_kld_hard_gate = parse_bool_value(value); return; }
+
+    if (path == "rescue.enabled") { r.rescue.enabled = parse_bool_value(value); return; }
+    if (path == "rescue.type") { r.rescue.type = value; return; }
+    if (path == "rescue.top") { r.rescue.top = value; return; }
+    if (path == "rescue.report_top") { r.rescue.report_top = value; return; }
+    if (path == "rescue.budget_mb") { r.rescue.budget_mb = value; return; }
+    if (path == "rescue.bf16_budget_mb") { r.rescue.bf16_budget_mb = value; return; }
+    if (path == "rescue.class_limit") { r.rescue.class_limit = value; return; }
+    if (path == "rescue.nvfp4_top") { r.rescue.nvfp4_top = value; return; }
+    if (path == "rescue.sample_blocks") { r.rescue.sample_blocks = value; return; }
+    if (path == "rescue.coarse_max_blocks") { r.rescue.coarse_max_blocks = value; return; }
+    if (path == "rescue.refine_max_blocks") { r.rescue.refine_max_blocks = value; return; }
+    if (path == "rescue.guard_max_blocks") { r.rescue.guard_max_blocks = value; return; }
+    if (path == "rescue.report") { r.rescue.report = value; return; }
+    if (path == "rescue.tensor_types") { r.rescue.tensor_types = value; return; }
+
+    if (path == "artifacts.run_dir") { r.artifacts.run_dir = value; return; }
+
+    throw std::runtime_error("unknown recipe field: " + path);
+}
+
+static std::string nvfp4_four_six_cfg(const Recipe::Nvfp4::FourSix & fs) {
+    std::vector<std::pair<std::string, std::string>> tokens;
+    if (!fs.choose46.empty()) {
+        tokens.emplace_back("choose46", fs.choose46);
+    }
+    if (!fs.refit_iters.empty()) {
+        tokens.emplace_back("refit", fs.refit_iters);
+    }
+    if (!fs.compand.empty()) {
+        tokens.emplace_back("compand", fs.compand);
+    }
+    if (!fs.cap6.empty()) {
+        tokens.emplace_back("cap6", fs.cap6);
+    }
+    if (!fs.cap4.empty()) {
+        tokens.emplace_back("cap4", fs.cap4);
+    }
+    if (tokens.empty()) {
+        return {};
+    }
+
+    std::ostringstream out;
+    out << "NVFP4{";
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i > 0) {
+            out << ',';
+        }
+        out << tokens[i].first << '=' << tokens[i].second;
+    }
+    out << '}';
+    return out.str();
+}
+
+static std::string lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return value;
+}
+
+static std::string canonical_mixed_policy(std::string value) {
+    value = trim(value);
+    std::replace(value.begin(), value.end(), '-', '_');
+    const std::string lower = lower_copy(value);
+    if (lower.empty() || lower == "auto") {
+        return value.empty() ? std::string() : "auto";
+    }
+    if (lower == "off" || lower == "none") {
+        return "off";
+    }
+    if (lower == "nvfp4_quality_boost" ||
+            lower == "nvfp4_primary" ||
+            lower == "quality_boost" ||
+            lower == "promote_mxfp6" ||
+            lower == "nv4_promote_mx6") {
+        return "nv4_promote_mx6";
+    }
+    if (lower == "mxfp6_primary" ||
+            lower == "mxfp6_quality" ||
+            lower == "quality_first" ||
+            lower == "demote_nvfp4" ||
+            lower == "mx6_demote_nv4") {
+        return "mx6_demote_nv4";
+    }
+    if (lower == "mx6_slot" || lower == "mxfp6_slot") {
+        return "mx6_slot";
+    }
+    if (lower == "bf16_mx6" || lower == "bf16_to_mxfp6") {
+        return "bf16_mx6";
+    }
+    if (lower == "bf16_mx6_sse" || lower == "bf16_to_mxfp6_sse") {
+        return "bf16_mx6_sse";
+    }
+    return value;
+}
+
+static void append_unique(std::vector<std::string> & values, const std::string & value) {
+    if (!value.empty() && std::find(values.begin(), values.end(), value) == values.end()) {
+        values.push_back(value);
+    }
+}
+
+static void apply_native_policy_set(Recipe & r) {
+    const std::string policy = lower_copy(trim(r.autotune.policy_set));
+    if (policy == "manual" || policy == "custom") {
+        return;
+    }
+
+    const bool uses_nvfp4 = quant_type_uses_nvfp4(r.base.ftype) || quant_type_uses_nvfp4(r.target.precision_mode);
+    const bool uses_mxfp6 = quant_type_uses_mxfp6(r.base.ftype) || quant_type_uses_mxfp6(r.target.precision_mode);
+    if (!uses_nvfp4 && !uses_mxfp6) {
+        return;
+    }
+
+    const bool core = policy == "native-core" || policy == "core";
+    const bool full = policy.empty() || policy == "native-full" || policy == "full" || policy == "local-full";
+
+    if (core && uses_nvfp4) {
+        r.stock_ftype.technique_candidates = { "ptq", "kld-best" };
+        r.nvfp4.calibration_families = { "max", "kld_best" };
+        r.nvfp4.scale_tie = "none";
+    } else if (full && uses_nvfp4) {
+        r.stock_ftype.technique_candidates = {
+            "ptq",
+            "kld-best",
+            "auto_search",
+            "no_quantize_choice",
+            "awq_lite",
+            "awq_clip",
+            "awq_full",
+            "smoothquant",
+            "mse_scale_sweep",
+            "kl_div_sensitivity",
+        };
+        r.nvfp4.calibration_families = {
+            "max",
+            "kld_best",
+            "awq_lite",
+            "awq_clip",
+            "awq_full",
+            "smoothquant",
+            "mse_scale_sweep",
+            "kl_div_sensitivity",
+        };
+        if (r.nvfp4.scale_tie.empty() || r.nvfp4.scale_tie == "none") {
+            r.nvfp4.scale_tie = "qkv_gate_up_expert";
+        }
+    }
+
+    if (uses_nvfp4) {
+        for (const char * technique : { "ptq", "kld-best" }) {
+            append_unique(r.stock_ftype.technique_candidates, technique);
+        }
+        for (const char * family : { "max", "kld_best" }) {
+            append_unique(r.nvfp4.calibration_families, family);
+        }
+        for (const char * type : { "BF16", "Q8_0", "Q6_K" }) {
+            append_unique(r.stock_ftype.token_embedding_candidates, type);
+            append_unique(r.stock_ftype.output_tensor_candidates, type);
+        }
+        r.stock_ftype.sweep_tensor_policy = true;
+        r.stock_ftype.sweep_sensitive_tensors = true;
+    }
+
+    if (full && uses_nvfp4) {
+        for (const char * technique : {
+                "auto_search",
+                "no_quantize_choice",
+                "awq_lite",
+                "awq_clip",
+                "awq_full",
+                "smoothquant",
+                "mse_scale_sweep",
+                "kl_div_sensitivity",
+        }) {
+            append_unique(r.stock_ftype.technique_candidates, technique);
+        }
+        for (const char * family : {
+                "awq_lite",
+                "awq_clip",
+                "awq_full",
+                "smoothquant",
+                "mse_scale_sweep",
+                "kl_div_sensitivity",
+        }) {
+            append_unique(r.nvfp4.calibration_families, family);
+        }
+
+        if (r.nvfp4.scale_tie.empty() || r.nvfp4.scale_tie == "none") {
+            r.nvfp4.scale_tie = "qkv_gate_up_expert";
+        }
+    }
+
+    if (uses_mxfp6) {
+        for (const char * type : { "MXFP6_E2M3", "BF16", "Q8_0", "Q6_K" }) {
+            append_unique(r.stock_ftype.token_embedding_candidates, type);
+            append_unique(r.stock_ftype.output_tensor_candidates, type);
+        }
+    }
+}
+
+static void dump_string(std::ostringstream & out, const char * key, const std::string & value) {
+    if (!value.empty()) {
+        out << key << " = " << std::quoted(value) << "\n";
+    }
+}
+
+static void dump_bool(std::ostringstream & out, const char * key, bool value) {
+    if (value) {
+        out << key << " = true\n";
+    }
+}
+
+static void dump_double(std::ostringstream & out, const char * key, double value) {
+    if (value > 0.0) {
+        out << key << " = " << value << "\n";
+    }
+}
+
+static void dump_int(std::ostringstream & out, const char * key, int value) {
+    if (value > 0) {
+        out << key << " = " << value << "\n";
+    }
+}
+
+static void dump_string_list(std::ostringstream & out, const char * key, const std::vector<std::string> & values) {
+    if (values.empty()) {
+        return;
+    }
+    out << key << " = [";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << std::quoted(values[i]);
+    }
+    out << "]\n";
+}
+
+} // namespace
+
+std::string canonical_quant_type(std::string value) {
+    value = trim(value);
+    std::replace(value.begin(), value.end(), '-', '_');
+    const std::string lower = lower_copy(value);
+    if (lower == "mixed" || lower == "nvfp4_mxfp6") {
+        return "NVFP4_MXFP6";
+    }
+    if (lower == "nvfp4") {
+        return "NVFP4";
+    }
+    if (lower == "mxfp6" || lower == "mxfp6_e2m3") {
+        return "MXFP6";
+    }
+    if (lower == "q8" || lower == "q8_0") {
+        return "Q8_0";
+    }
+    return value;
+}
+
+std::string sanitize_tensor_type_token(std::string value) {
+    value = trim(value);
+    while (value.size() >= 2 &&
+            ((value.front() == '\'' && value.back() == '\'') ||
+             (value.front() == '"' && value.back() == '"'))) {
+        value = trim(value.substr(1, value.size() - 2));
+    }
+
+    bool only_quotes = !value.empty();
+    for (const unsigned char c : value) {
+        if (c != '\'' && c != '"' && !std::isspace(c)) {
+            only_quotes = false;
+            break;
+        }
+    }
+    return only_quotes ? std::string() : value;
+}
+
+bool quant_type_uses_nvfp4(const std::string & value) {
+    const std::string quant_type = canonical_quant_type(value);
+    return quant_type == "NVFP4" || quant_type == "NVFP4_MXFP6";
+}
+
+bool quant_type_uses_mxfp6(const std::string & value) {
+    const std::string quant_type = canonical_quant_type(value);
+    return quant_type == "MXFP6" || quant_type == "NVFP4_MXFP6";
+}
+
+std::vector<std::string> quant_type_choices() {
+    std::vector<std::string> out;
+    out.reserve(QUANT_TYPE_PROFILES.size());
+    for (const QuantTypeProfile & choice : QUANT_TYPE_PROFILES) {
+        out.push_back(choice.type);
+    }
+    return out;
+}
+
+LoadedRecipe load_recipe_file(const std::string & path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("failed to open recipe: " + path);
+    }
+
+    LoadedRecipe loaded;
+    std::string section;
+    std::string line;
+    int line_no = 0;
+    while (std::getline(in, line)) {
+        ++line_no;
+        line = trim(strip_comment(line));
+        if (line.empty()) {
+            continue;
+        }
+        if (line.front() == '[' && line.back() == ']') {
+            section = trim(line.substr(1, line.size() - 2));
+            if (section.empty()) {
+                throw std::runtime_error("empty section at line " + std::to_string(line_no));
+            }
+            continue;
+        }
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            throw std::runtime_error("expected key=value at line " + std::to_string(line_no));
+        }
+        const std::string key = trim(line.substr(0, eq));
+        const std::string value = trim(line.substr(eq + 1));
+        if (key.empty()) {
+            throw std::runtime_error("empty key at line " + std::to_string(line_no));
+        }
+        const std::string path_key = section.empty() ? key : section + "." + key;
+        try {
+            set_value(loaded, path_key, value);
+        } catch (const std::exception & e) {
+            throw std::runtime_error("line " + std::to_string(line_no) + ": " + e.what());
+        }
+    }
+
+    return loaded;
+}
+
+void apply_override(LoadedRecipe & loaded, const std::string & assignment) {
+    const size_t eq = assignment.find('=');
+    if (eq == std::string::npos || eq == 0) {
+        throw std::runtime_error("--set expects path=value, got: " + assignment);
+    }
+    set_value(loaded, trim(assignment.substr(0, eq)), trim(assignment.substr(eq + 1)));
+}
+
+std::vector<std::string> validate_recipe(const Recipe & recipe, bool require_io) {
+    std::vector<std::string> errors;
+    if (require_io && recipe.io.input.empty()) {
+        errors.push_back("io.input is required");
+    }
+    if (require_io && recipe.io.output.empty()) {
+        errors.push_back("io.output is required");
+    }
+    if (recipe.base.dry_run) {
+        errors.push_back("base.dry_run is no longer supported; use advanced-gguf-quantizer plan for inspection and advanced-gguf-quantizer run for real saved artifacts");
+    }
+    if (recipe.base.ftype.empty()) {
+        errors.push_back("base.ftype is required");
+    }
+    const auto check_tensor_type = [&errors](const char * name, const std::string & raw) {
+        const std::string value = sanitize_tensor_type_token(raw);
+        if (value.empty()) {
+            return;
+        }
+        if (value.find('\'') != std::string::npos || value.find('"') != std::string::npos) {
+            errors.push_back(std::string(name) + " contains quote characters; leave it blank for the profile default or use a tensor type like Q6_K");
+            return;
+        }
+        if (std::any_of(value.begin(), value.end(), [](unsigned char c) { return std::isspace(c); })) {
+            errors.push_back(std::string(name) + " must be a single tensor type token with no spaces");
+        }
+    };
+    check_tensor_type("base.output_tensor_type", recipe.base.output_tensor_type);
+    check_tensor_type("base.token_embedding_type", recipe.base.token_embedding_type);
+    const bool advanced_precision_quant =
+        quant_type_uses_nvfp4(recipe.base.ftype) ||
+        quant_type_uses_mxfp6(recipe.base.ftype) ||
+        quant_type_uses_nvfp4(recipe.target.precision_mode) ||
+        quant_type_uses_mxfp6(recipe.target.precision_mode);
+    if (recipe.autotune.mode == "diagnostic" && !recipe.autotune.allow_diagnostic) {
+        errors.push_back("autotune.mode=diagnostic requires autotune.allow_diagnostic=true and must not be used for model evidence");
+    }
+    if (advanced_precision_quant && recipe.autotune.require_kld && recipe.evaluation.kld_base.empty() && recipe.selector.kld.empty()) {
+        errors.push_back("real Blackwell autotune requires evaluation.kld_base or selector.kld");
+    }
+    if (advanced_precision_quant && recipe.autotune.require_corpus && recipe.evaluation.corpus.empty()) {
+        errors.push_back("quality Blackwell autotune requires evaluation.corpus so PPL/KLD uses a named corpus");
+    }
+    if (advanced_precision_quant && recipe.autotune.require_imatrix && recipe.calibration.imatrix.empty()) {
+        errors.push_back("quality Blackwell autotune requires calibration.imatrix; generate or select an imatrix for the same corpus before claiming a best-quality run");
+    }
+    if (advanced_precision_quant && recipe.autotune.require_imatrix && recipe.calibration.corpus.empty()) {
+        errors.push_back("quality Blackwell autotune requires calibration.corpus so imatrix and local calibration use the same training corpus");
+    }
+    if (recipe.calibration.include_weights.size() > 0 && recipe.calibration.exclude_weights.size() > 0) {
+        errors.push_back("calibration.include_weights and calibration.exclude_weights cannot both be set");
+    }
+    if (recipe.evaluation.kld_mode == "make_base" && recipe.evaluation.bf16_reference.empty() && recipe.io.input.empty()) {
+        errors.push_back("evaluation.bf16_reference or io.input is required when evaluation.kld_mode=make_base");
+    }
+    if (recipe.evaluation.kld_mode == "make_base" && recipe.evaluation.corpus.empty()) {
+        errors.push_back("evaluation.corpus is required when evaluation.kld_mode=make_base");
+    }
+    if ((recipe.evaluation.kld_mode == "existing" || recipe.evaluation.kld_mode == "make_base") &&
+            recipe.evaluation.kld_base.empty()) {
+        errors.push_back("evaluation.kld_base is required for existing or make_base KLD workflows");
+    }
+    return errors;
+}
+
+std::string dump_recipe_toml(const Recipe & r) {
+    std::ostringstream out;
+    out << "version = 1\n\n";
+
+    out << "[target]\n";
+    dump_string(out, "precision_mode", r.target.precision_mode);
+    dump_double(out, "model_params_b", r.target.model_params_b);
+    dump_int(out, "vram_gb", r.target.vram_gb);
+    dump_int(out, "ram_gb", r.target.ram_gb);
+    dump_double(out, "target_bpw", r.target.target_bpw);
+    dump_double(out, "weight_budget_gib", r.target.weight_budget_gib);
+    dump_double(out, "kv_cache_gib", r.target.kv_cache_gib);
+    dump_double(out, "activation_headroom_gib", r.target.activation_headroom_gib);
+    dump_bool(out, "fit_to_vram", r.target.fit_to_vram);
+    dump_string(out, "sizing_note", r.target.sizing_note);
+
+    out << "\n[autotune]\n";
+    dump_bool(out, "enabled", r.autotune.enabled);
+    dump_string(out, "mode", r.autotune.mode);
+    dump_string(out, "objective", r.autotune.objective);
+    dump_string(out, "evidence", r.autotune.evidence);
+    dump_string(out, "policy_set", r.autotune.policy_set);
+    dump_bool(out, "require_kld", r.autotune.require_kld);
+    dump_bool(out, "require_corpus", r.autotune.require_corpus);
+    dump_bool(out, "require_imatrix", r.autotune.require_imatrix);
+    dump_bool(out, "allow_diagnostic", r.autotune.allow_diagnostic);
+
+    out << "\n[stock_ftype]\n";
+    dump_string(out, "source", r.stock_ftype.source);
+    dump_string(out, "mostly_type", r.stock_ftype.mostly_type);
+    dump_bool(out, "preserve_embeddings", r.stock_ftype.preserve_embeddings);
+    dump_string(out, "output_policy", r.stock_ftype.output_policy);
+    dump_bool(out, "sweep_tensor_policy", r.stock_ftype.sweep_tensor_policy);
+    dump_string_list(out, "token_embedding_candidates", r.stock_ftype.token_embedding_candidates);
+    dump_string_list(out, "output_tensor_candidates", r.stock_ftype.output_tensor_candidates);
+    dump_double(out, "min_quant_savings_mib", r.stock_ftype.min_quant_savings_mib);
+    dump_string_list(out, "technique_candidates", r.stock_ftype.technique_candidates);
+    dump_string(out, "rationale", r.stock_ftype.rationale);
+
+    out << "\n[io]\n";
+    dump_string(out, "input", r.io.input);
+    dump_string(out, "output", r.io.output);
+    dump_string(out, "patch_base", r.io.patch_base);
+    dump_bool(out, "keep_split", r.io.keep_split);
+
+    out << "\n[base]\n";
+    dump_string(out, "ftype", r.base.ftype);
+    if (r.base.threads > 0) {
+        out << "threads = " << r.base.threads << "\n";
+    }
+    dump_string(out, "output_tensor_type", r.base.output_tensor_type);
+    dump_string(out, "token_embedding_type", r.base.token_embedding_type);
+    dump_bool(out, "allow_requantize", r.base.allow_requantize);
+    dump_bool(out, "leave_output_tensor", r.base.leave_output_tensor);
+    dump_bool(out, "pure", r.base.pure);
+    dump_bool(out, "copy_only", r.base.copy_only);
+
+    out << "\n[model]\n";
+    dump_string(out, "prune_layers", r.model.prune_layers);
+
+    out << "\n[metadata]\n";
+    dump_string_list(out, "overrides", r.metadata.overrides);
+
+    out << "\n[calibration]\n";
+    dump_string(out, "imatrix", r.calibration.imatrix);
+    dump_string(out, "corpus", r.calibration.corpus);
+    dump_string(out, "imatrix_bin", r.calibration.imatrix_bin);
+    dump_string(out, "ctx_size", r.calibration.ctx_size);
+    dump_string(out, "batch_size", r.calibration.batch_size);
+    dump_string(out, "ubatch_size", r.calibration.ubatch_size);
+    dump_string(out, "threads", r.calibration.threads);
+    dump_string(out, "threads_batch", r.calibration.threads_batch);
+    dump_string(out, "chunks", r.calibration.chunks);
+    dump_string(out, "extra_args", r.calibration.extra_args);
+    dump_string_list(out, "include_weights", r.calibration.include_weights);
+    dump_string_list(out, "exclude_weights", r.calibration.exclude_weights);
+
+    out << "\n[evaluation]\n";
+    dump_string(out, "kld_mode", r.evaluation.kld_mode);
+    dump_string(out, "bf16_reference", r.evaluation.bf16_reference);
+    dump_string(out, "corpus", r.evaluation.corpus);
+    dump_string(out, "kld_base", r.evaluation.kld_base);
+    dump_string(out, "bundle", r.evaluation.bundle);
+    dump_string(out, "perplexity_bin", r.evaluation.perplexity_bin);
+
+    out << "\n[tensor_overrides]\n";
+    dump_string_list(out, "files", r.tensor_overrides.files);
+    dump_string_list(out, "entries", r.tensor_overrides.entries);
+
+    out << "\n[nvfp4]\n";
+    dump_string(out, "preset", r.nvfp4.preset);
+    dump_string(out, "cfg", r.nvfp4.cfg);
+    dump_string(out, "correction_denom", r.nvfp4.correction_denom);
+    dump_string(out, "input_scale_policy", r.nvfp4.input_scale_policy);
+    dump_string_list(out, "calibration_families", r.nvfp4.calibration_families);
+    dump_string(out, "scale_tie", r.nvfp4.scale_tie);
+
+    const bool show_low_level = !r.autotune.enabled || r.autotune.allow_diagnostic;
+    if (show_low_level) {
+        out << "\n[nvfp4.autotune]\n";
+        dump_string(out, "max_blocks", r.nvfp4.autotune.max_blocks);
+        dump_string(out, "threads", r.nvfp4.autotune.threads);
+
+        out << "\n[nvfp4.four_six]\n";
+        dump_string(out, "choose46", r.nvfp4.four_six.choose46);
+        dump_string(out, "refit_iters", r.nvfp4.four_six.refit_iters);
+        dump_string(out, "compand", r.nvfp4.four_six.compand);
+        dump_string(out, "cap6", r.nvfp4.four_six.cap6);
+        dump_string(out, "cap4", r.nvfp4.four_six.cap4);
+    }
+
+    const bool uses_nvfp4 =
+        quant_type_uses_nvfp4(r.base.ftype) ||
+        quant_type_uses_nvfp4(r.target.precision_mode);
+    const bool uses_mxfp6 =
+        quant_type_uses_mxfp6(r.base.ftype) ||
+        quant_type_uses_mxfp6(r.target.precision_mode);
+    if (uses_mxfp6 || show_low_level) {
+        out << "\n[mxfp6]\n";
+        dump_string(out, "tensor_scale", r.mxfp6.tensor_scale);
+        dump_string(out, "min_savings_bytes", r.mxfp6.min_savings_bytes);
+        dump_string(out, "input_scale_denom", r.mxfp6.input_scale_denom);
+        dump_string(out, "input_scale_quantile", r.mxfp6.input_scale_quantile);
+        dump_string(out, "tensor_scale_sample_blocks", r.mxfp6.tensor_scale_sample_blocks);
+        dump_string(out, "tensor_scale_steps", r.mxfp6.tensor_scale_steps);
+        dump_string(out, "selector_scale_top", r.mxfp6.selector_scale_top);
+        dump_string(out, "selector_scale_candidates", r.mxfp6.selector_scale_candidates);
+    }
+
+    if ((uses_nvfp4 && uses_mxfp6) || show_low_level) {
+        out << "\n[mixed]\n";
+        dump_string(out, "policy", r.nv4mx6.policy);
+        dump_string(out, "mx6_penalty", r.nv4mx6.mx6_penalty);
+        dump_string(out, "bf16_mx6_threshold", r.nv4mx6.bf16_mx6_threshold);
+        dump_string(out, "sample_blocks", r.nv4mx6.sample_blocks);
+        dump_string(out, "sample_cap", r.nv4mx6.sample_cap);
+        dump_string(out, "imatrix_weight_blend", r.nv4mx6.imatrix_weight_blend);
+        dump_string(out, "imatrix_weight_power", r.nv4mx6.imatrix_weight_power);
+        dump_string(out, "imatrix_weight_min", r.nv4mx6.imatrix_weight_min);
+        dump_string(out, "imatrix_weight_max", r.nv4mx6.imatrix_weight_max);
+    }
+
+    out << "\n[selector]\n";
+    dump_string(out, "effort", r.selector.effort);
+    dump_string(out, "kld", r.selector.kld);
+    dump_string(out, "checkpoint_model", r.selector.checkpoint_model);
+    dump_string(out, "cache_dir", r.selector.cache_dir);
+    dump_string(out, "skip_file", r.selector.skip_file);
+    if (show_low_level) {
+        dump_bool(out, "keep_checkpoint", r.selector.keep_checkpoint);
+        dump_bool(out, "require_runtime_cache", r.selector.require_runtime_cache);
+        dump_string(out, "chunks", r.selector.chunks);
+        dump_string(out, "chunk_start", r.selector.chunk_start);
+        dump_string(out, "holdout_chunks", r.selector.holdout_chunks);
+        dump_string(out, "holdout_start", r.selector.holdout_start);
+        dump_string(out, "stagea_sample_blocks", r.selector.stagea_sample_blocks);
+        dump_string(out, "stagea_max_policies", r.selector.stagea_max_policies);
+        dump_string(out, "refine_top", r.selector.refine_top);
+        dump_string(out, "refine_budget", r.selector.refine_budget);
+        dump_string(out, "survey_top", r.selector.survey_top);
+        dump_string(out, "survey_sample_blocks", r.selector.survey_sample_blocks);
+        dump_string(out, "max_tensors", r.selector.max_tensors);
+        dump_bool(out, "trace", r.selector.trace);
+        dump_string(out, "policy_threads", r.selector.policy_threads);
+        dump_string(out, "threads", r.selector.threads);
+        dump_string(out, "kld_threads", r.selector.kld_threads);
+        dump_bool(out, "only", r.selector.only);
+        dump_string(out, "eval_top", r.selector.eval_top);
+        dump_string(out, "eval_chunks", r.selector.eval_chunks);
+        dump_string(out, "n_seq", r.selector.n_seq);
+    }
+    dump_string(out, "sensitivity_report", r.selector.sensitivity_report);
+    dump_string(out, "sensitivity_top", r.selector.sensitivity_top);
+    dump_string(out, "sensitivity_layer", r.selector.sensitivity_layer);
+    dump_string(out, "sensitivity_tensor", r.selector.sensitivity_tensor);
+    dump_string(out, "sensitivity_sample_blocks", r.selector.sensitivity_sample_blocks);
+
+    out << "\n[selector.ranking]\n";
+    dump_string(out, "kld_penalty", r.selector.ranking.kld_penalty);
+    dump_string(out, "p99_penalty", r.selector.ranking.p99_penalty);
+    dump_string(out, "p999_penalty", r.selector.ranking.p999_penalty);
+    dump_string(out, "max_kld_penalty", r.selector.ranking.max_kld_penalty);
+    dump_string(out, "kld_threshold", r.selector.ranking.kld_threshold);
+    dump_string(out, "p99_threshold", r.selector.ranking.p99_threshold);
+    dump_string(out, "p999_threshold", r.selector.ranking.p999_threshold);
+    dump_string(out, "max_kld_threshold", r.selector.ranking.max_kld_threshold);
+    dump_bool(out, "kld_hard_gate", r.selector.ranking.kld_hard_gate);
+    dump_bool(out, "p99_hard_gate", r.selector.ranking.p99_hard_gate);
+    dump_bool(out, "p999_hard_gate", r.selector.ranking.p999_hard_gate);
+    dump_bool(out, "max_kld_hard_gate", r.selector.ranking.max_kld_hard_gate);
+
+    out << "\n[rescue]\n";
+    dump_bool(out, "enabled", r.rescue.enabled);
+    dump_string(out, "type", r.rescue.type);
+    dump_string(out, "top", r.rescue.top);
+    dump_string(out, "report_top", r.rescue.report_top);
+    dump_string(out, "budget_mb", r.rescue.budget_mb);
+    dump_string(out, "bf16_budget_mb", r.rescue.bf16_budget_mb);
+    dump_string(out, "class_limit", r.rescue.class_limit);
+    dump_string(out, "nvfp4_top", r.rescue.nvfp4_top);
+    dump_string(out, "sample_blocks", r.rescue.sample_blocks);
+    dump_string(out, "coarse_max_blocks", r.rescue.coarse_max_blocks);
+    dump_string(out, "refine_max_blocks", r.rescue.refine_max_blocks);
+    dump_string(out, "guard_max_blocks", r.rescue.guard_max_blocks);
+    dump_string(out, "report", r.rescue.report);
+    dump_string(out, "tensor_types", r.rescue.tensor_types);
+
+    out << "\n[artifacts]\n";
+    dump_string(out, "run_dir", r.artifacts.run_dir);
+
+    return out.str();
+}
+
+std::string default_recipe_toml(const std::string & profile) {
+    return dump_recipe_toml(default_recipe(profile));
+}
+
+void apply_master_autotune(Recipe & r) {
+    if (!r.autotune.enabled) {
+        return;
+    }
+
+    const std::string mode = lower_copy(trim(r.autotune.mode));
+    const bool diagnostic = mode == "diagnostic";
+    const bool fast =
+        mode == "fast" ||
+        mode == "minimal" ||
+        mode == "fast-minimal" ||
+        mode == "minimal-autotune";
+    const std::string policy_set = lower_copy(trim(r.autotune.policy_set));
+    const bool native_full_policy =
+        policy_set.empty() ||
+        policy_set == "native-full" ||
+        policy_set == "full" ||
+        policy_set == "local-full";
+    if (diagnostic) {
+        r.selector.effort = "diagnostic";
+    } else if (fast) {
+        r.autotune.mode = "fast";
+        r.selector.effort = "fast-minimal";
+    } else if (mode == "balanced") {
+        r.autotune.mode = "balanced";
+        r.selector.effort = "real-best";
+    } else {
+        r.autotune.mode = "quality";
+        r.selector.effort = "full-best";
+    }
+
+    if (r.autotune.objective.empty()) {
+        r.autotune.objective = "kld-first";
+    }
+    if (r.autotune.evidence.empty()) {
+        r.autotune.evidence = "real-ppl-kld";
+    }
+    r.autotune.require_kld = !fast;
+    r.autotune.require_corpus = !fast;
+    r.autotune.require_imatrix = !fast;
+
+    apply_native_policy_set(r);
+
+    const bool uses_nvfp4 = quant_type_uses_nvfp4(r.base.ftype) || quant_type_uses_nvfp4(r.target.precision_mode);
+    const bool uses_mxfp6 = quant_type_uses_mxfp6(r.base.ftype) || quant_type_uses_mxfp6(r.target.precision_mode);
+
+    if (!uses_nvfp4 && !uses_mxfp6) {
+        return;
+    }
+
+    const bool strict_size_target =
+        r.target.fit_to_vram ||
+        r.target.target_bpw > 0.0 ||
+        r.target.weight_budget_gib > 0.0;
+    if (uses_nvfp4 && !uses_mxfp6 && native_full_policy && !diagnostic && !fast && !strict_size_target &&
+            !r.rescue.enabled && r.rescue.top.empty() && r.rescue.budget_mb.empty() &&
+            r.rescue.bf16_budget_mb.empty() && r.rescue.class_limit.empty()) {
+        r.rescue.enabled = true;
+        r.rescue.type = "Q8_0";
+        r.rescue.top = r.autotune.mode == "balanced" ? "3" : "4";
+        r.rescue.report_top = r.autotune.mode == "balanced" ? "8" : "12";
+        r.rescue.budget_mb = r.autotune.mode == "balanced" ? "256" : "384";
+        r.rescue.bf16_budget_mb = r.autotune.mode == "balanced" ? "64" : "128";
+        r.rescue.class_limit = "1";
+        r.rescue.nvfp4_top = "0";
+    }
+
+    r.selector.keep_checkpoint = true;
+    r.selector.require_runtime_cache = !fast && r.autotune.evidence == "real-ppl-kld";
+    auto assign_if_empty = [](std::string & value, const std::string & fallback) {
+        if (value.empty()) {
+            value = fallback;
+        }
+    };
+    if (diagnostic) {
+        assign_if_empty(r.selector.chunks, "4");
+        assign_if_empty(r.selector.holdout_chunks, "1");
+        assign_if_empty(r.selector.stagea_sample_blocks, "2048");
+        assign_if_empty(r.selector.stagea_max_policies, "16");
+        assign_if_empty(r.selector.refine_top, "8");
+        assign_if_empty(r.selector.refine_budget, "64");
+        assign_if_empty(r.selector.survey_top, "64");
+        assign_if_empty(r.selector.survey_sample_blocks, "2048");
+        assign_if_empty(r.selector.max_tensors, "0");
+        assign_if_empty(r.selector.eval_top, "4");
+        assign_if_empty(r.selector.eval_chunks, "4");
+        assign_if_empty(r.selector.n_seq, "1");
+        assign_if_empty(r.nvfp4.autotune.max_blocks, "8192");
+        assign_if_empty(r.nvfp4.four_six.refit_iters, "8");
+        if (uses_mxfp6) {
+            if (uses_nvfp4) {
+                assign_if_empty(r.nv4mx6.policy, "nv4_promote_mx6");
+                assign_if_empty(r.nv4mx6.mx6_penalty, "3.0");
+            }
+            assign_if_empty(r.mxfp6.selector_scale_top, "64");
+        }
+        return;
+    }
+
+    if (fast) {
+        assign_if_empty(r.selector.chunks, "2");
+        assign_if_empty(r.selector.holdout_chunks, "0");
+        assign_if_empty(r.selector.stagea_sample_blocks, "512");
+        assign_if_empty(r.selector.stagea_max_policies, "8");
+        assign_if_empty(r.selector.refine_top, "4");
+        assign_if_empty(r.selector.refine_budget, "16");
+        assign_if_empty(r.selector.survey_top, "8");
+        assign_if_empty(r.selector.survey_sample_blocks, "512");
+        assign_if_empty(r.selector.max_tensors, "0");
+        assign_if_empty(r.selector.eval_top, "2");
+        assign_if_empty(r.selector.eval_chunks, "2");
+        assign_if_empty(r.selector.n_seq, "1");
+        assign_if_empty(r.selector.ranking.kld_penalty, "1.0");
+        assign_if_empty(r.selector.ranking.p99_penalty, "0.35");
+        assign_if_empty(r.selector.ranking.p999_penalty, "0.15");
+        assign_if_empty(r.selector.ranking.max_kld_penalty, "0.05");
+        if (uses_nvfp4) {
+            assign_if_empty(r.nvfp4.autotune.max_blocks, "4096");
+            assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
+            assign_if_empty(r.nvfp4.four_six.refit_iters, "4");
+            assign_if_empty(r.nvfp4.four_six.compand, "1");
+            assign_if_empty(r.nvfp4.four_six.cap6, "448");
+            assign_if_empty(r.nvfp4.four_six.cap4, "256");
+        }
+        if (uses_mxfp6) {
+            if (uses_nvfp4) {
+                assign_if_empty(r.nv4mx6.policy, "nv4_promote_mx6");
+                assign_if_empty(r.nv4mx6.mx6_penalty, "3.5");
+            }
+            assign_if_empty(r.mxfp6.selector_scale_top, "16");
+        }
+        r.rescue.enabled = false;
+        assign_if_empty(r.rescue.top, "0");
+        assign_if_empty(r.rescue.report_top, "0");
+        return;
+    }
+
+    const bool balanced = r.autotune.mode == "balanced";
+    assign_if_empty(r.selector.chunks, balanced ? "32" : "64");
+    assign_if_empty(r.selector.holdout_chunks, balanced ? "8" : "16");
+    assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "8192" : "16384");
+    assign_if_empty(r.selector.stagea_max_policies, "0");
+    assign_if_empty(r.selector.refine_top, balanced ? "32" : "48");
+    assign_if_empty(r.selector.refine_budget, balanced ? "384" : "768");
+    assign_if_empty(r.selector.survey_top, balanced ? "256" : "512");
+    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "16384" : "32768");
+    assign_if_empty(r.selector.max_tensors, "0");
+    assign_if_empty(r.selector.eval_top, balanced ? "16" : "32");
+    assign_if_empty(r.selector.eval_chunks, balanced ? "32" : "64");
+    assign_if_empty(r.selector.n_seq, "4");
+
+    if (uses_nvfp4) {
+        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "32768" : "65536");
+        assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
+        assign_if_empty(r.nvfp4.four_six.refit_iters, "16");
+        assign_if_empty(r.nvfp4.four_six.compand, "1");
+        assign_if_empty(r.nvfp4.four_six.cap6, "448");
+        assign_if_empty(r.nvfp4.four_six.cap4, "224");
+        assign_if_empty(r.selector.ranking.kld_penalty, "12.0");
+        assign_if_empty(r.selector.ranking.p99_penalty, "7.0");
+        assign_if_empty(r.selector.ranking.p999_penalty, "2.0");
+        assign_if_empty(r.selector.ranking.max_kld_penalty, "0.04");
+        r.selector.ranking.p99_hard_gate = true;
+        r.selector.ranking.p999_hard_gate = true;
+    } else if (uses_mxfp6) {
+        assign_if_empty(r.selector.ranking.kld_penalty, "8.0");
+        assign_if_empty(r.selector.ranking.p99_penalty, "4.0");
+        assign_if_empty(r.selector.ranking.p999_penalty, "1.5");
+        assign_if_empty(r.selector.ranking.max_kld_penalty, "0.03");
+        r.selector.ranking.p99_hard_gate = true;
+        r.selector.ranking.p999_hard_gate = true;
+    }
+
+    if (uses_mxfp6) {
+        if (uses_nvfp4) {
+            assign_if_empty(r.nv4mx6.policy, "nv4_promote_mx6");
+            assign_if_empty(r.nv4mx6.mx6_penalty, balanced ? "3.0" : "3.5");
+        }
+        assign_if_empty(r.mxfp6.selector_scale_top, balanced ? "128" : "256");
+        assign_if_empty(r.mxfp6.selector_scale_candidates, "0.771105,0.840896,0.917004,0.957603,1,1.04427,1.09051,1.18921,1.29684");
+    } else {
+        r.nv4mx6.policy.clear();
+        r.nv4mx6.mx6_penalty.clear();
+        r.nv4mx6.bf16_mx6_threshold.clear();
+        r.mxfp6.selector_scale_top.clear();
+        r.mxfp6.selector_scale_candidates.clear();
+    }
+
+    if (uses_nvfp4 && r.rescue.enabled) {
+        assign_if_empty(r.rescue.sample_blocks, balanced ? "4096" : "8192");
+        assign_if_empty(r.rescue.coarse_max_blocks, balanced ? "32768" : "65536");
+        assign_if_empty(r.rescue.refine_max_blocks, balanced ? "65536" : "131072");
+        assign_if_empty(r.rescue.guard_max_blocks, balanced ? "65536" : "131072");
+    }
+}
+
+static void apply_real_best_defaults(Recipe & r) {
+    r.autotune.enabled = true;
+    r.autotune.mode = "quality";
+    r.autotune.objective = "kld-first";
+    r.autotune.evidence = "real-ppl-kld";
+    r.autotune.require_kld = true;
+    r.autotune.require_corpus = true;
+    r.autotune.require_imatrix = true;
+    r.autotune.allow_diagnostic = false;
+    apply_master_autotune(r);
+}
+
+Recipe default_recipe(const std::string & profile) {
+    Recipe r;
+    if (profile == "mxfp6") {
+        r.target.precision_mode = "MXFP6";
+        r.base.ftype = "MXFP6";
+        r.nvfp4.preset.clear();
+        r.nvfp4.correction_denom.clear();
+        r.nvfp4.input_scale_policy.clear();
+        r.nvfp4.calibration_families.clear();
+        r.nvfp4.scale_tie.clear();
+        r.base.output_tensor_type = "MXFP6_E2M3";
+        r.base.token_embedding_type = "MXFP6_E2M3";
+        apply_real_best_defaults(r);
+        r.mxfp6.tensor_scale = "on";
+        r.stock_ftype.mostly_type = "MOSTLY_MXFP6_E2M3";
+        r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
+        r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
+        r.stock_ftype.rationale = "Explicit local MXFP6_E2M3 recipe; embeddings/output use MXFP6_E2M3.";
+    } else if (profile == "nvfp4-mxfp6-balanced" || profile == "nvfp4_mxfp6" || profile == "nvfp4-mxfp6") {
+        r.target.precision_mode = "NVFP4_MXFP6";
+        r.base.ftype = "NVFP4_MXFP6";
+        r.base.output_tensor_type = "MXFP6_E2M3";
+        r.base.token_embedding_type = "MXFP6_E2M3";
+        r.nvfp4.preset = "baseline_auto";
+        r.nvfp4.correction_denom = "2688";
+        r.nvfp4.input_scale_policy = "imatrix-rms";
+        apply_real_best_defaults(r);
+        r.nv4mx6.policy = "nv4_promote_mx6";
+        r.nv4mx6.mx6_penalty = "3.5";
+        r.selector.ranking.kld_penalty = "12.0";
+        r.selector.ranking.p99_penalty = "7.0";
+        r.selector.ranking.p999_penalty = "2.0";
+        r.selector.ranking.max_kld_penalty = "0.04";
+        r.rescue.enabled = true;
+        r.rescue.type = "MXFP6_E2M3";
+        r.rescue.top = "-1";
+        r.rescue.budget_mb = "3000";
+        r.rescue.class_limit = "0";
+        r.rescue.nvfp4_top = "256";
+        apply_master_autotune(r);
+        r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
+        r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
+        r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
+        r.stock_ftype.rationale = "Local mixed NVFP4/MXFP6 recipe starts compact and promotes measured high-risk tensors to MXFP6_E2M3.";
+    } else if (profile == "mxfp6-nvfp4-quality" || profile == "mxfp6_nvfp4" || profile == "mxfp6-primary") {
+        r.target.precision_mode = "NVFP4_MXFP6";
+        r.base.ftype = "MXFP6";
+        r.base.output_tensor_type = "MXFP6_E2M3";
+        r.base.token_embedding_type = "MXFP6_E2M3";
+        r.nvfp4.preset = "baseline_auto";
+        r.nvfp4.correction_denom = "2688";
+        r.nvfp4.input_scale_policy = "imatrix-rms";
+        apply_real_best_defaults(r);
+        r.nv4mx6.policy = "mx6_demote_nv4";
+        r.nv4mx6.mx6_penalty = "1.75";
+        r.rescue.enabled = true;
+        r.rescue.type = "MXFP6_E2M3";
+        r.rescue.top = "0";
+        r.rescue.report_top = "12";
+        r.rescue.budget_mb = "0";
+        r.rescue.class_limit = "0";
+        apply_master_autotune(r);
+        r.stock_ftype.mostly_type = "MOSTLY_MXFP6_E2M3";
+        r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
+        r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
+        r.stock_ftype.rationale = "Local mixed quality recipe starts MXFP6_E2M3-first and demotes measured safe tensors to NVFP4 for speed/size.";
+    } else if (profile == "nvfp4") {
+        r.target.precision_mode = "NVFP4";
+        r.base.ftype = "NVFP4";
+        r.base.output_tensor_type = "Q6_K";
+        r.base.token_embedding_type = "NVFP4";
+        apply_real_best_defaults(r);
+        r.selector.ranking.kld_penalty = "12.0";
+        r.selector.ranking.p99_penalty = "7.0";
+        r.selector.ranking.p999_penalty = "2.0";
+        r.selector.ranking.max_kld_penalty = "0.04";
+        r.rescue.enabled = true;
+        r.rescue.type = "Q8_0";
+        r.rescue.top = "4";
+        r.rescue.report_top = "12";
+        r.rescue.budget_mb = "384";
+        r.rescue.bf16_budget_mb = "128";
+        r.rescue.class_limit = "1";
+        r.rescue.nvfp4_top = "0";
+        r.nv4mx6.policy.clear();
+        r.mxfp6 = {};
+        r.mxfp6.tensor_scale.clear();
+        r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
+        r.stock_ftype.token_embedding_candidates = { "NVFP4" };
+        r.stock_ftype.output_tensor_candidates = { "Q6_K" };
+        r.stock_ftype.rationale = "Quality-first default: local NVFP4 keeps token embeddings NVFP4 and stores separate output.weight as Q6_K.";
+    } else if (profile == "nvfp4-fast" || profile == "nvfp4-minimal" || profile == "fast") {
+        r.target.precision_mode = "NVFP4";
+        r.base.ftype = "NVFP4";
+        r.base.output_tensor_type = "Q6_K";
+        r.base.token_embedding_type = "NVFP4";
+        r.autotune.mode = "fast";
+        apply_master_autotune(r);
+        r.nv4mx6.policy.clear();
+        r.mxfp6 = {};
+        r.mxfp6.tensor_scale.clear();
+        r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
+        r.stock_ftype.token_embedding_candidates = { "NVFP4" };
+        r.stock_ftype.output_tensor_candidates = { "Q6_K" };
+        r.stock_ftype.rationale = "Fast real-artifact default: compact NVFP4 autotune/selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
+    } else if (profile == "q8_0") {
+        r.target.precision_mode = "Q8_0";
+        r.base.ftype = "Q8_0";
+        r.autotune.enabled = false;
+        r.autotune.require_kld = false;
+        r.autotune.require_corpus = false;
+        r.autotune.require_imatrix = false;
+        r.base.output_tensor_type = "Q8_0";
+        r.base.token_embedding_type = "Q8_0";
+        r.nvfp4.preset.clear();
+        r.nvfp4.correction_denom.clear();
+        r.nvfp4.input_scale_policy.clear();
+        r.nvfp4.calibration_families.clear();
+        r.nvfp4.scale_tie.clear();
+        r.nv4mx6.policy.clear();
+        r.selector = {};
+        r.selector.effort.clear();
+        r.rescue.enabled = false;
+        r.rescue.type.clear();
+        r.mxfp6.tensor_scale.clear();
+        r.stock_ftype.mostly_type = "MOSTLY_Q8_0";
+        r.stock_ftype.rationale = "Plain GGUF Q8_0 recipe for users who want a high-compatibility baseline.";
+    } else {
+        throw std::runtime_error("unknown profile: " + profile);
+    }
+    return r;
+}
+
+Recipe default_recipe_for_quant_type(const std::string & precision_mode) {
+    const std::string quant_type = canonical_quant_type(precision_mode);
+    for (const QuantTypeProfile & choice : QUANT_TYPE_PROFILES) {
+        if (quant_type == choice.type) {
+            return default_recipe(choice.profile);
+        }
+    }
+    throw std::runtime_error("unsupported quant type: " + precision_mode);
+}
+
+Recipe default_recipe() {
+    return default_recipe_for_quant_type(Recipe().target.precision_mode);
+}
+
+std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_run) {
+    (void) force_dry_run;
+    std::vector<std::string> args;
+    args.push_back("llama-quantize");
+    const std::string quant_type = canonical_quant_type(
+        !r.target.precision_mode.empty() ? r.target.precision_mode : r.base.ftype);
+    const std::string mixed_policy = canonical_mixed_policy(r.nv4mx6.policy);
+    const bool mixed_mx6_primary = quant_type == "NVFP4_MXFP6" && mixed_policy == "mx6_demote_nv4";
+    const std::string ftype = r.base.copy_only ? "COPY" :
+        (quant_type == "NVFP4_MXFP6" ? (mixed_mx6_primary ? "MXFP6" : "NVFP4_MXFP6") :
+            (quant_type == "NVFP4" || quant_type == "MXFP6" ? quant_type : r.base.ftype));
+    const bool uses_nvfp4 = quant_type == "NVFP4" || quant_type == "NVFP4_MXFP6" || ftype == "NVFP4";
+    const bool uses_mxfp6 = quant_type == "MXFP6" || quant_type == "NVFP4_MXFP6" || ftype == "MXFP6";
+    auto push_pair = [&args](const char * flag, const std::string & value) {
+        if (!value.empty()) {
+            args.push_back(flag);
+            args.push_back(value);
+        }
+    };
+    auto push_bool = [&args](const char * flag, bool value) {
+        if (value) {
+            args.push_back(flag);
+        }
+    };
+
+    push_bool("--allow-requantize", r.base.allow_requantize);
+    push_bool("--leave-output-tensor", r.base.leave_output_tensor);
+    push_bool("--pure", r.base.pure);
+    push_bool("--keep-split", r.io.keep_split);
+    push_pair("--patch-base", r.io.patch_base);
+    push_pair("--prune-layers", r.model.prune_layers);
+    push_pair("--output-tensor-type", sanitize_tensor_type_token(r.base.output_tensor_type));
+    push_pair("--token-embedding-type", sanitize_tensor_type_token(r.base.token_embedding_type));
+    for (const std::string & item : r.metadata.overrides) {
+        push_pair("--override-kv", item);
+    }
+    push_pair("--imatrix", r.calibration.imatrix);
+    for (const std::string & item : r.calibration.include_weights) {
+        push_pair("--include-weights", item);
+    }
+    for (const std::string & item : r.calibration.exclude_weights) {
+        push_pair("--exclude-weights", item);
+    }
+    for (const std::string & item : r.tensor_overrides.files) {
+        push_pair("--tensor-type-file", item);
+    }
+    for (const std::string & item : r.tensor_overrides.entries) {
+        push_pair("--tensor-type", item);
+    }
+
+    if (uses_nvfp4) {
+        const std::string autotune_mode = lower_copy(trim(r.autotune.mode));
+        push_bool("--nvfp4-fast-quantize",
+            r.autotune.enabled &&
+            (autotune_mode == "fast" || autotune_mode == "minimal" ||
+             autotune_mode == "fast-minimal" || autotune_mode == "minimal-autotune"));
+        const std::string four_six_cfg = nvfp4_four_six_cfg(r.nvfp4.four_six);
+        if (four_six_cfg.empty()) {
+            push_pair("--nvfp4-preset", r.nvfp4.preset);
+            push_pair("--nvfp4-cfg", r.nvfp4.cfg);
+        } else {
+            push_pair("--nvfp4-cfg", four_six_cfg);
+        }
+        push_pair("--nvfp4-correction-denom", r.nvfp4.correction_denom);
+        push_pair("--nvfp4-input-scale-policy", r.nvfp4.input_scale_policy);
+        push_pair("--nvfp4-autotune-max-blocks", r.nvfp4.autotune.max_blocks);
+        push_pair("--nvfp4-autotune-threads", r.nvfp4.autotune.threads);
+    }
+
+    const bool uses_mxfp6_controls =
+        uses_mxfp6 ||
+        (r.rescue.enabled && r.rescue.type == "MXFP6_E2M3") ||
+        !r.mxfp6.selector_scale_top.empty() ||
+        !r.mxfp6.selector_scale_candidates.empty();
+    if (uses_mxfp6_controls) {
+        push_pair("--mxfp6_e2m3-tensor-scale", r.mxfp6.tensor_scale);
+        push_pair("--mxfp6_e2m3-min-savings", r.mxfp6.min_savings_bytes);
+        push_pair("--mxfp6_e2m3-input-scale-denom", r.mxfp6.input_scale_denom);
+        push_pair("--mxfp6_e2m3-input-scale-quantile", r.mxfp6.input_scale_quantile);
+        push_pair("--mxfp6_e2m3-tensor-scale-sample-blocks", r.mxfp6.tensor_scale_sample_blocks);
+        push_pair("--mxfp6_e2m3-tensor-scale-steps", r.mxfp6.tensor_scale_steps);
+        push_pair("--mxfp6_e2m3-selector-scale-top", r.mxfp6.selector_scale_top);
+        push_pair("--mxfp6_e2m3-selector-scale-candidates", r.mxfp6.selector_scale_candidates);
+    }
+    if (uses_nvfp4 && uses_mxfp6) {
+        push_pair("--mixed-format-policy", mixed_policy);
+        push_pair("--mixed-mx6-penalty", r.nv4mx6.mx6_penalty);
+        push_pair("--mixed-bf16-mx6-threshold", r.nv4mx6.bf16_mx6_threshold);
+        push_pair("--mixed-sample-blocks", r.nv4mx6.sample_blocks);
+        push_pair("--mixed-sample-cap", r.nv4mx6.sample_cap);
+        push_pair("--mixed-imatrix-weight-blend", r.nv4mx6.imatrix_weight_blend);
+        push_pair("--mixed-imatrix-weight-power", r.nv4mx6.imatrix_weight_power);
+        push_pair("--mixed-imatrix-weight-min", r.nv4mx6.imatrix_weight_min);
+        push_pair("--mixed-imatrix-weight-max", r.nv4mx6.imatrix_weight_max);
+    }
+
+    push_pair("--nvfp4-selector-kld", r.selector.kld);
+    push_pair("--nvfp4-selector-checkpoint-model", r.selector.checkpoint_model);
+    push_pair("--nvfp4-selector-cache-dir", r.selector.cache_dir);
+    push_pair("--nvfp4-selector-skip-file", r.selector.skip_file);
+    push_bool("--nvfp4-selector-keep-checkpoint", r.selector.keep_checkpoint);
+    push_bool("--nvfp4-selector-require-runtime-cache", r.selector.require_runtime_cache);
+    push_pair("--nvfp4-selector-chunks", r.selector.chunks);
+    push_pair("--nvfp4-selector-chunk-start", r.selector.chunk_start);
+    push_pair("--nvfp4-selector-holdout-chunks", r.selector.holdout_chunks);
+    push_pair("--nvfp4-selector-holdout-start", r.selector.holdout_start);
+    push_pair("--nvfp4-selector-stagea-sample-blocks", r.selector.stagea_sample_blocks);
+    push_pair("--nvfp4-selector-stagea-max-policies", r.selector.stagea_max_policies);
+    push_pair("--nvfp4-selector-refine-top", r.selector.refine_top);
+    push_pair("--nvfp4-selector-refine-budget", r.selector.refine_budget);
+    push_pair("--nvfp4-selector-survey-top", r.selector.survey_top);
+    push_pair("--nvfp4-selector-survey-sample-blocks", r.selector.survey_sample_blocks);
+    push_pair("--nvfp4-selector-max-tensors", r.selector.max_tensors);
+    push_bool("--nvfp4-selector-trace", r.selector.trace);
+    push_pair("--nvfp4-selector-policy-threads", r.selector.policy_threads);
+    push_pair("--nvfp4-selector-threads", r.selector.threads);
+    push_pair("--nvfp4-selector-kld-threads", r.selector.kld_threads);
+    push_bool("--nvfp4-selector-only", r.selector.only);
+    push_pair("--nvfp4-selector-eval-top", r.selector.eval_top);
+    push_pair("--nvfp4-selector-eval-chunks", r.selector.eval_chunks);
+    push_pair("--nvfp4-selector-n-seq", r.selector.n_seq);
+    push_pair("--nvfp4-selector-sensitivity-report", r.selector.sensitivity_report);
+    push_pair("--nvfp4-selector-sensitivity-top", r.selector.sensitivity_top);
+    push_pair("--nvfp4-selector-sensitivity-layer", r.selector.sensitivity_layer);
+    push_pair("--nvfp4-selector-sensitivity-tensor", r.selector.sensitivity_tensor);
+    push_pair("--nvfp4-selector-sensitivity-sample-blocks", r.selector.sensitivity_sample_blocks);
+
+    push_pair("--nvfp4-selector-kld-penalty", r.selector.ranking.kld_penalty);
+    push_pair("--nvfp4-selector-p99-penalty", r.selector.ranking.p99_penalty);
+    push_pair("--nvfp4-selector-p999-penalty", r.selector.ranking.p999_penalty);
+    push_pair("--nvfp4-selector-max-kld-penalty", r.selector.ranking.max_kld_penalty);
+    push_pair("--nvfp4-selector-rank-kld-threshold", r.selector.ranking.kld_threshold);
+    push_pair("--nvfp4-selector-rank-p99-threshold", r.selector.ranking.p99_threshold);
+    push_pair("--nvfp4-selector-rank-p999-threshold", r.selector.ranking.p999_threshold);
+    push_pair("--nvfp4-selector-rank-max-kld-threshold", r.selector.ranking.max_kld_threshold);
+    push_bool("--nvfp4-selector-rank-kld-hard-gate", r.selector.ranking.kld_hard_gate);
+    push_bool("--nvfp4-selector-rank-p99-hard-gate", r.selector.ranking.p99_hard_gate);
+    push_bool("--nvfp4-selector-rank-p999-hard-gate", r.selector.ranking.p999_hard_gate);
+    push_bool("--nvfp4-selector-rank-max-kld-hard-gate", r.selector.ranking.max_kld_hard_gate);
+
+    if (uses_nvfp4 && r.rescue.enabled) {
+        args.push_back("--nvfp4-selector-auto-rescue");
+        push_pair("--nvfp4-selector-rescue-type", r.rescue.type);
+        push_pair("--nvfp4-selector-rescue-top", r.rescue.top);
+        push_pair("--nvfp4-selector-rescue-report-top", r.rescue.report_top);
+        push_pair("--nvfp4-selector-rescue-budget-mb", r.rescue.budget_mb);
+        push_pair("--nvfp4-selector-rescue-bf16-budget-mb", r.rescue.bf16_budget_mb);
+        push_pair("--nvfp4-selector-rescue-class-limit", r.rescue.class_limit);
+        push_pair("--nvfp4-selector-rescue-nvfp4-top", r.rescue.nvfp4_top);
+        push_pair("--nvfp4-selector-rescue-sample-blocks", r.rescue.sample_blocks);
+        push_pair("--nvfp4-selector-rescue-coarse-max-blocks", r.rescue.coarse_max_blocks);
+        push_pair("--nvfp4-selector-rescue-refine-max-blocks", r.rescue.refine_max_blocks);
+        push_pair("--nvfp4-selector-rescue-guard-max-blocks", r.rescue.guard_max_blocks);
+        push_pair("--nvfp4-selector-rescue-report", r.rescue.report);
+        push_pair("--nvfp4-selector-rescue-tensor-types", r.rescue.tensor_types);
+    }
+
+    args.push_back(r.io.input);
+    if (!r.io.output.empty()) {
+        args.push_back(r.io.output);
+    }
+    args.push_back(ftype);
+    if (r.base.threads > 0) {
+        args.push_back(std::to_string(r.base.threads));
+    }
+    return args;
+}
+
+} // namespace bq

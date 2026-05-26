@@ -1,0 +1,39 @@
+{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "cuda-release",
+      "displayName": "CUDA release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GGML_CUDA": "ON",
+        "ADVANCED_GGUF_QUANTIZER_STANDALONE": "ON"
+      }
+    },
+    {
+      "name": "cuda-debug",
+      "displayName": "CUDA debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GGML_CUDA": "ON",
+        "ADVANCED_GGUF_QUANTIZER_STANDALONE": "ON"
+      }
+    },
+    {
+      "name": "cuda-release-with-helpers",
+      "displayName": "CUDA release with optional evidence helpers",
+      "inherits": "cuda-release",
+      "binaryDir": "${sourceDir}/build-helpers",
+      "cacheVariables": {
+        "ADVANCED_GGUF_QUANTIZER_BUILD_BENCH": "ON",
+        "ADVANCED_GGUF_QUANTIZER_BUILD_FIT_PARAMS": "ON"
+      }
+    }
+  ]
+}

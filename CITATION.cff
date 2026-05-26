@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use advanced-gguf-quantizer to publish models, measurements, or derivative tools, please cite this project."
+title: "advanced-gguf-quantizer"
+authors:
+  - family-names: "Wand"
+    given-names: "Michael"
+repository-code: "https://github.com/michaelw9999/llama.cpp/tree/mxfp6-cuda"
+license: "MIT"
+keywords:
+  - "GGUF"
+  - "llama.cpp"
+  - "NVFP4"
+  - "MXFP6"
+  - "quantization"
+references:
+  - type: article
+    title: "Four Over Six: More Accurate NVFP4 Quantization with Adaptive Block Scaling"
+    authors:
+      - family-names: "Cook"
+        given-names: "Jack"
+      - family-names: "Guo"
+        given-names: "Junxian"
+      - family-names: "Xiao"
+        given-names: "Guangxuan"
+      - family-names: "Lin"
+        given-names: "Yujun"
+      - family-names: "Han"
+        given-names: "Song"
+    year: 2025
+    repository: "https://github.com/mit-han-lab/fouroversix"
+    url: "https://arxiv.org/abs/2512.02010"

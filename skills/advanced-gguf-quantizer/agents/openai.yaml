@@ -1,0 +1,4 @@
+interface:
+  display_name: "Advanced GGUF Quantizer"
+  short_description: "Continue the CUDA GGUF quantizer."
+  default_prompt: "Use this skill to continue advanced-gguf-quantizer work, update project/recipe features, preserve CUDA-first constraints, and document release status."
