@@ -5222,61 +5222,119 @@ static bool nvfp4_selector_choose_policy(
                     stageb_binding_nthread,
                     eval_binding_indices.size());
             }
-            if (stageb_patch_threads <= 1 || eval_binding_indices.size() <= 1) {
-                for (size_t pos = 0; pos < eval_binding_indices.size(); ++pos) {
-                    auto & b = all_bindings[eval_binding_indices[pos]];
-                    auto & r = patch_results[pos];
-                    if (stageb_direct_patch &&
-                            nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
-                        r.direct_applied = true;
-                        continue;
-                    }
-                    if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                            r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
-                        r.ok = false;
-                        break;
+            const size_t no_failed_patch = std::numeric_limits<size_t>::max();
+            auto clear_stageb_retry_caches = [&]() {
+                nvfp4_clear_cuda_stream_cache();
+                for (auto & b : all_bindings) {
+                    if (b.device_samples) {
+                        std::lock_guard<std::mutex> lock(b.device_samples->mutex);
+                        b.device_samples->entries.clear();
                     }
                 }
-            } else {
-                std::atomic<size_t> next_patch { 0 };
-                std::atomic<bool> patch_failed { false };
-                std::vector<std::thread> workers;
-                workers.reserve((size_t) stageb_patch_threads);
-                for (int ti = 0; ti < stageb_patch_threads; ++ti) {
-                    workers.emplace_back([&]() {
-                        while (true) {
-                            if (patch_failed.load(std::memory_order_acquire)) {
-                                break;
-                            }
-                            const size_t pos = next_patch.fetch_add(1, std::memory_order_relaxed);
-                            if (pos >= eval_binding_indices.size()) {
-                                break;
-                            }
-                            auto & b = all_bindings[eval_binding_indices[pos]];
-                            auto & r = patch_results[pos];
-                            if (stageb_direct_patch &&
-                                    nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                        r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
-                                r.direct_applied = true;
-                                continue;
-                            }
-                            if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                    r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
-                                r.ok = false;
-                                patch_failed.store(true, std::memory_order_release);
-                            }
+            };
+            auto patch_policy_once = [&](int attempt, size_t & failed_pos) -> bool {
+                failed_pos = no_failed_patch;
+                for (auto & r : patch_results) {
+                    r = stageb_patch_result{};
+                }
+                if (stageb_patch_threads <= 1 || eval_binding_indices.size() <= 1) {
+                    for (size_t pos = 0; pos < eval_binding_indices.size(); ++pos) {
+                        auto & b = all_bindings[eval_binding_indices[pos]];
+                        auto & r = patch_results[pos];
+                        if (stageb_direct_patch &&
+                                nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
+                                    r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
+                            r.direct_applied = true;
+                            continue;
                         }
-                    });
+                        if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
+                                r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
+                            r.ok = false;
+                            failed_pos = pos;
+                            return false;
+                        }
+                    }
+                    return true;
+                } else {
+                    std::atomic<size_t> next_patch { 0 };
+                    std::atomic<size_t> failed_patch { no_failed_patch };
+                    std::atomic<bool> patch_failed { false };
+                    std::vector<std::thread> workers;
+                    workers.reserve((size_t) stageb_patch_threads);
+                    for (int ti = 0; ti < stageb_patch_threads; ++ti) {
+                        workers.emplace_back([&]() {
+                            while (true) {
+                                if (patch_failed.load(std::memory_order_acquire)) {
+                                    break;
+                                }
+                                const size_t pos = next_patch.fetch_add(1, std::memory_order_relaxed);
+                                if (pos >= eval_binding_indices.size()) {
+                                    break;
+                                }
+                                auto & b = all_bindings[eval_binding_indices[pos]];
+                                auto & r = patch_results[pos];
+                                if (stageb_direct_patch &&
+                                        nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
+                                            r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
+                                    r.direct_applied = true;
+                                    continue;
+                                }
+                                if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
+                                        r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
+                                    r.ok = false;
+                                    size_t expected = no_failed_patch;
+                                    (void) failed_patch.compare_exchange_strong(
+                                        expected, pos, std::memory_order_acq_rel, std::memory_order_acquire);
+                                    patch_failed.store(true, std::memory_order_release);
+                                }
+                            }
+                        });
+                    }
+                    for (auto & worker : workers) {
+                        worker.join();
+                    }
+                    failed_pos = failed_patch.load(std::memory_order_acquire);
+                    if (failed_pos != no_failed_patch) {
+                        auto & b = all_bindings[eval_binding_indices[failed_pos]];
+                        fprintf(stderr,
+                            "%s: selector stage-b patch attempt=%d failed policy=%s tensor=%s; stopped remaining workers\n",
+                            __func__, attempt, policy.name.c_str(), b.name.c_str());
+                        return false;
+                    }
+                    return true;
                 }
-                for (auto & worker : workers) {
-                    worker.join();
+            };
+            size_t failed_patch_pos = no_failed_patch;
+            bool stageb_patch_quant_ok = patch_policy_once(1, failed_patch_pos);
+            if (!stageb_patch_quant_ok) {
+                const char * failed_name = failed_patch_pos != no_failed_patch
+                    ? all_bindings[eval_binding_indices[failed_patch_pos]].name.c_str()
+                    : "<unknown>";
+                fprintf(stderr,
+                    "%s: selector stage-b CUDA patch recovery policy=%s failed_tensor=%s; "
+                    "clearing CUDA caches and retrying once with threads=%d\n",
+                    __func__, policy.name.c_str(), failed_name, stageb_patch_threads);
+                clear_stageb_retry_caches();
+                restore_all();
+                clear_stageb_retry_caches();
+                failed_patch_pos = no_failed_patch;
+                stageb_patch_quant_ok = patch_policy_once(2, failed_patch_pos);
+                if (!stageb_patch_quant_ok) {
+                    const char * retry_failed_name = failed_patch_pos != no_failed_patch
+                        ? all_bindings[eval_binding_indices[failed_patch_pos]].name.c_str()
+                        : "<unknown>";
+                    fprintf(stderr,
+                        "%s: selector stage-b CUDA patch recovery failed policy=%s tensor=%s after retry\n",
+                        __func__, policy.name.c_str(), retry_failed_name);
                 }
             }
             const auto patch_quant_t1 = std::chrono::steady_clock::now();
             size_t direct_patch_count = 0;
             size_t direct_fallback_count = 0;
-            for (size_t pos = 0; pos < eval_binding_indices.size(); ++pos) {
+            if (!stageb_patch_quant_ok) {
+                policy_patch_ok = false;
+            }
+            for (size_t pos = 0; policy_patch_ok && pos < eval_binding_indices.size(); ++pos) {
                 auto & b = all_bindings[eval_binding_indices[pos]];
                 const auto & r = patch_results[pos];
                 if (!r.ok) {
