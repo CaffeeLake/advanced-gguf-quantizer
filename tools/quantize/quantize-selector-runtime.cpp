@@ -296,6 +296,14 @@ void nvfp4_selector_progress_heartbeat::detail(std::string detail, bool print_no
     }
 }
 
+void nvfp4_selector_progress_heartbeat::eta_hint(std::string eta, bool print_now) {
+    std::lock_guard<std::mutex> lock(mu_);
+    eta_hint_ = std::move(eta);
+    if (print_now) {
+        print_locked(std::chrono::steady_clock::now());
+    }
+}
+
 void nvfp4_selector_progress_heartbeat::finish(std::string detail) {
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -341,11 +349,11 @@ void nvfp4_selector_progress_heartbeat::run() {
 
 void nvfp4_selector_progress_heartbeat::print_locked(std::chrono::steady_clock::time_point now) {
     const double elapsed_s = std::chrono::duration<double>(now - start_).count();
-    std::string eta = "unknown";
-    if (total_ > 0 && completed_ > 0 && completed_ < total_) {
+    std::string eta = eta_hint_.empty() ? "TBD..." : eta_hint_;
+    if (total_ > 0 && completed_ > 0 && completed_ < total_ && eta_hint_.empty()) {
         eta = nvfp4_selector_format_duration(elapsed_s * (double) (total_ - completed_) / (double) completed_);
     } else if (total_ > 0 && completed_ >= total_) {
-        eta = finished_ ? "0s" : "unknown";
+        eta = finished_ ? "done" : "TBD...";
     }
     if (total_ > 0) {
         const double pct = 100.0 * (double) std::min(completed_, total_) / (double) total_;

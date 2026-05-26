@@ -4079,12 +4079,50 @@ static bool nvfp4_selector_choose_policy(
     nvfp4_selector_progress_heartbeat full_quant_eta("full_quant_eta");
     int64_t full_quant_eta_done = 0;
     int64_t full_quant_eta_total = 0;
+    int64_t stageb_policy_total = 0;
+    int64_t stageb_policy_done = 0;
+    double stageb_policy_done_seconds = 0.0;
+    bool stageb_policy_active = false;
+    std::chrono::steady_clock::time_point stageb_policy_start;
+    auto stageb_eta_hint = [&]() -> std::string {
+        if (full_quant_eta_total > 0 && full_quant_eta_done >= full_quant_eta_total) {
+            return "done";
+        }
+        if (stageb_policy_total <= 0) {
+            return {};
+        }
+        if (stageb_policy_done <= 0 || !(stageb_policy_done_seconds > 0.0)) {
+            return "TBD...";
+        }
+        const double avg_policy_s = stageb_policy_done_seconds / (double) stageb_policy_done;
+        int64_t remaining_policies = std::max<int64_t>(0, stageb_policy_total - stageb_policy_done);
+        double remaining_s = 0.0;
+        if (stageb_policy_active && remaining_policies > 0) {
+            const double active_s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stageb_policy_start).count();
+            remaining_s += std::max(0.0, avg_policy_s - active_s);
+            --remaining_policies;
+        }
+        remaining_s += (double) remaining_policies * avg_policy_s;
+        return nvfp4_selector_format_duration(remaining_s);
+    };
     auto update_full_quant_eta = [&](const char * phase, bool print_now = false) {
         char detail[256];
         snprintf(detail, sizeof(detail),
             "phase=%s scope=whole_artifact_estimate basis=selector_stageb_policy_units_plus_final_materialization",
             phase);
+        full_quant_eta.eta_hint(stageb_eta_hint());
         full_quant_eta.update(full_quant_eta_done, full_quant_eta_total, detail, print_now);
+    };
+    auto finish_stageb_policy_unit = [&](const char * phase, bool print_now = false) {
+        if (stageb_policy_active) {
+            stageb_policy_done_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stageb_policy_start).count();
+            ++stageb_policy_done;
+            stageb_policy_active = false;
+        }
+        full_quant_eta_done = std::min<int64_t>(full_quant_eta_total, 2 + stageb_policy_done);
+        update_full_quant_eta(phase, print_now);
     };
     update_full_quant_eta("selector-setup", true);
 
@@ -4895,10 +4933,18 @@ static bool nvfp4_selector_choose_policy(
     if (run_stageb_eval) {
         full_quant_eta_total = (int64_t) eval_policy_indices.size() + 2;
         full_quant_eta_done = 0;
+        stageb_policy_total = (int64_t) eval_policy_indices.size();
+        stageb_policy_done = 0;
+        stageb_policy_done_seconds = 0.0;
+        stageb_policy_active = false;
         update_full_quant_eta("selector-stage-b-runtime-load", true);
     } else {
         full_quant_eta_total = 1;
         full_quant_eta_done = 0;
+        stageb_policy_total = 0;
+        stageb_policy_done = 0;
+        stageb_policy_done_seconds = 0.0;
+        stageb_policy_active = false;
         update_full_quant_eta(skip_remaining_tuning ? "selector-skipping-to-final-materialization" : "selector-proxy-only", true);
     }
     const nvfp4_selector_kld_subset kld_budget = nvfp4_selector_make_kld_budget_subset(kld, (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", 4));
@@ -5170,6 +5216,7 @@ static bool nvfp4_selector_choose_policy(
             params.n_batch,
             params.n_ubatch,
             kld_metric_threads);
+        full_quant_eta_done = 1;
         update_full_quant_eta("selector-stage-b-baseline-kld", true);
         nvfp4_selector_kld_metrics baseline_km;
         if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, baseline_km, true)) {
@@ -5200,9 +5247,15 @@ static bool nvfp4_selector_choose_policy(
                 "selector stage-b baseline %s\n",
                 baseline_holdout_summary.c_str());
         }
+        full_quant_eta_done = 2;
+        update_full_quant_eta("selector-stage-b-policy-eval", true);
 
         for (size_t i = 0; i < eval_policy_indices.size(); ++i) {
             auto & policy = policies[eval_policy_indices[i]];
+            stageb_policy_active = true;
+            stageb_policy_start = std::chrono::steady_clock::now();
+            full_quant_eta_done = std::min<int64_t>(full_quant_eta_total, 2 + stageb_policy_done);
+            update_full_quant_eta("selector-stage-b-policy-running", true);
             fprintf(stderr,
                 "selector stage-b start [%zu/%zu] policy=%s tensors=%zu search_chunks=%d validation_chunks=%d\n",
                 i + 1,
@@ -5482,11 +5535,13 @@ static bool nvfp4_selector_choose_policy(
                 patch_quant_s,
                 patch_apply_s,
                 patch_ensure_s + patch_quant_s + patch_apply_s);
+            update_full_quant_eta("selector-stage-b-policy-kld", false);
             if (!policy_patch_ok) {
                 restore_all();
                 policy.proxy_rejected = true;
                 policy.measured_pass = false;
                 policy.measured_score = std::numeric_limits<double>::infinity();
+                finish_stageb_policy_unit("selector-stage-b-policy-rejected", true);
                 continue;
             }
 
@@ -5530,6 +5585,7 @@ static bool nvfp4_selector_choose_policy(
                     policy.name.c_str(),
                     policy_holdout_summary.c_str());
             }
+            finish_stageb_policy_unit("selector-stage-b-policy-complete", true);
             if (note_skip_remaining("stage-b")) {
                 break;
             }

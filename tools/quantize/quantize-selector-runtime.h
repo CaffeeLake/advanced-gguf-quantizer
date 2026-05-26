@@ -59,6 +59,7 @@ public:
     void update(int64_t completed, int64_t total, std::string detail = {}, bool print_now = false);
     void update(int64_t completed, std::string detail = {}, bool print_now = false);
     void detail(std::string detail, bool print_now = false);
+    void eta_hint(std::string eta, bool print_now = false);
     void finish(std::string detail = {});
 
 private:
@@ -70,6 +71,7 @@ private:
     int64_t completed_ = 0;
     int64_t total_ = 0;
     std::string detail_;
+    std::string eta_hint_;
     std::chrono::steady_clock::time_point start_;
     std::chrono::steady_clock::time_point last_print_;
     std::mutex mu_;

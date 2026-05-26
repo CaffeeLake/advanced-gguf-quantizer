@@ -7,6 +7,8 @@
 #include <cctype>
 #include <cstddef>
 #include <ctime>
+#include <cinttypes>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -27,6 +29,24 @@ static std::string trim_copy_simple(const std::string & value) {
         --end;
     }
     return value.substr(begin, end - begin);
+}
+
+static std::string format_elapsed_seconds(int64_t seconds) {
+    if (seconds < 0) {
+        seconds = 0;
+    }
+    const int64_t hours = seconds / 3600;
+    const int64_t minutes = (seconds / 60) % 60;
+    const int64_t secs = seconds % 60;
+    char buf[64];
+    if (hours > 0) {
+        snprintf(buf, sizeof(buf), "%" PRId64 "h%02" PRId64 "m%02" PRId64 "s", hours, minutes, secs);
+    } else if (minutes > 0) {
+        snprintf(buf, sizeof(buf), "%" PRId64 "m%02" PRId64 "s", minutes, secs);
+    } else {
+        snprintf(buf, sizeof(buf), "%" PRId64 "s", secs);
+    }
+    return buf;
 }
 
 } // namespace
@@ -277,8 +297,9 @@ void RunStatusThread::loop() {
                 now - start).count();
         const uint64_t output_bytes = file_size_or_zero(output);
         if (now - last_stderr >= stderr_interval || output_bytes != last_stderr_output_bytes) {
-            std::cerr << "\n" << PRODUCT_COMMAND << " status: elapsed=" << elapsed
-                      << "s output=" << mib_string(output_bytes) << " MiB\n";
+            std::cerr << "\n" << PRODUCT_COMMAND << " status: elapsed="
+                      << format_elapsed_seconds(elapsed)
+                      << " output=" << mib_string(output_bytes) << " MiB\n";
             last_stderr = now;
             last_stderr_output_bytes = output_bytes;
         }
