@@ -273,48 +273,38 @@ static RunKey build_run_key(
     return fp;
 }
 
-static bool run_key_has_top_level_string(
-        const std::string & json,
-        const std::string & key,
-        const std::string & value) {
-    const std::string needle = "\"" + key + "\": \"" + json_escape(value) + "\"";
-    return json.find(needle) != std::string::npos;
-}
-
-static bool run_key_has_file_key(
-        const std::string & json,
-        const std::string & key,
-        const FileKey & fp) {
-    std::ostringstream out;
-    append_json_file_key(out, key, fp, "");
-    std::string needle = out.str();
-    if (!needle.empty() && needle.back() == '\n') {
-        needle.pop_back();
-    }
-    return json.find(needle) != std::string::npos;
-}
-
-static bool run_key_matches_checkpoint_material(const std::string & old, const RunKey & fp) {
-    return run_key_has_top_level_string(old, "recipe_hash64", fp.recipe_hash64) &&
-        run_key_has_file_key(old, "source_model", fp.source) &&
-        run_key_has_file_key(old, "imatrix", fp.imatrix) &&
-        run_key_has_file_key(old, "kld_base", fp.kld_base);
-}
-
 static void write_or_check_run_key(const std::filesystem::path & run_dir, const RunKey & fp) {
     const std::filesystem::path path = run_dir / "checkpoint-key.json";
     if (std::filesystem::exists(path)) {
         std::ifstream in(path);
         std::stringstream old;
         old << in.rdbuf();
-        if (old.str() != fp.json) {
-            if (!run_key_matches_checkpoint_material(old.str(), fp)) {
+        const std::string old_json = old.str();
+        if (old_json != fp.json) {
+            auto has_line = [&](const std::string & s) {
+                return old_json.find(s) != std::string::npos;
+            };
+            auto has_file = [&](const char * key, const FileKey & file) {
+                std::ostringstream s;
+                append_json_file_key(s, key, file, "");
+                std::string needle = s.str();
+                if (!needle.empty() && needle.back() == '\n') {
+                    needle.pop_back();
+                }
+                return has_line(needle);
+            };
+            const bool same_material =
+                has_line("\"recipe_hash64\": \"" + fp.recipe_hash64 + "\"") &&
+                has_file("source_model", fp.source) &&
+                has_file("imatrix", fp.imatrix) &&
+                has_file("kld_base", fp.kld_base);
+            if (!same_material) {
                 write_text_file(run_dir / "checkpoint-key.mismatch.json", fp.json);
                 throw std::runtime_error(
                     "run checkpoint key mismatch in " + run_dir.string() +
                     "; use a new artifacts.run_dir or remove stale checkpoint/cache files");
             }
-            write_text_file(run_dir / "checkpoint-key.previous.json", old.str());
+            write_text_file(run_dir / "checkpoint-key.previous.json", old_json);
             fprintf(stderr,
                 "%s: run checkpoint key changed in code/selector command only; reusing checkpoint because source, imatrix, KLD base, and recipe hash match\n",
                 __func__);

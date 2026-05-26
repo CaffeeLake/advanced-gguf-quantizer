@@ -1076,12 +1076,12 @@ void apply_master_autotune(Recipe & r) {
     assign_if_empty(r.selector.holdout_chunks, balanced ? "8" : "32");
     assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "8192" : "16384");
     assign_if_empty(r.selector.stagea_max_policies, "0");
-    assign_if_empty(r.selector.refine_top, balanced ? "24" : "32");
-    assign_if_empty(r.selector.refine_budget, balanced ? "256" : "384");
-    assign_if_empty(r.selector.survey_top, balanced ? "128" : "256");
+    assign_if_empty(r.selector.refine_top, balanced ? "12" : "16");
+    assign_if_empty(r.selector.refine_budget, balanced ? "96" : "128");
+    assign_if_empty(r.selector.survey_top, balanced ? "16" : "24");
     assign_if_empty(r.selector.survey_sample_blocks, balanced ? "8192" : "16384");
     assign_if_empty(r.selector.max_tensors, "0");
-    assign_if_empty(r.selector.eval_top, balanced ? "8" : "12");
+    assign_if_empty(r.selector.eval_top, balanced ? "6" : "8");
     assign_if_empty(r.selector.eval_chunks, balanced ? "32" : "96");
     assign_if_empty(r.selector.n_seq, "4");
 
@@ -1112,7 +1112,7 @@ void apply_master_autotune(Recipe & r) {
             assign_if_empty(r.nv4mx6.policy, "nv4_promote_mx6");
             assign_if_empty(r.nv4mx6.mx6_penalty, balanced ? "3.0" : "3.5");
         }
-        assign_if_empty(r.mxfp6.selector_scale_top, balanced ? "128" : "256");
+        assign_if_empty(r.mxfp6.selector_scale_top, balanced ? "32" : "48");
         assign_if_empty(r.mxfp6.selector_scale_candidates, "0.771105,0.840896,0.917004,0.957603,1,1.04427,1.09051,1.18921,1.29684");
     } else {
         r.nv4mx6.policy.clear();

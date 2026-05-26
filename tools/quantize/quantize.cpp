@@ -3516,16 +3516,25 @@ static bool nvfp4_selector_metric_close(double a, double b, double abs_tol, doub
     return std::fabs(a - b) <= tol;
 }
 
+static bool nvfp4_selector_policy_is_recipe(const std::string & name) {
+    return name == "recipe_current" || name.rfind("recipe_", 0) == 0;
+}
+
 static bool nvfp4_selector_proxy_equivalent(
         const nvfp4_selector_policy & a,
         const nvfp4_selector_policy & b,
         bool prefer_survey) {
-    if (a.cfg.choose46_mode != b.cfg.choose46_mode ||
+    if (nvfp4_selector_policy_is_recipe(a.name) != nvfp4_selector_policy_is_recipe(b.name)) {
+        return false;
+    }
+    const bool require_cfg_match = quantize_control_i64("LLAMA_NVFP4_SELECTOR_DEDUP_REQUIRE_CFG", 0) != 0;
+    if (require_cfg_match && (
+            a.cfg.choose46_mode != b.cfg.choose46_mode ||
             a.cfg.refit_iters != b.cfg.refit_iters ||
             a.cfg.use_compand_sat != b.cfg.use_compand_sat ||
             a.cfg.reserved_i32 != b.cfg.reserved_i32 ||
             a.cfg.cap_m6 != b.cfg.cap_m6 ||
-            a.cfg.cap_m4 != b.cfg.cap_m4) {
+            a.cfg.cap_m4 != b.cfg.cap_m4)) {
         return false;
     }
     const bool use_survey = prefer_survey && a.has_survey && b.has_survey;
@@ -4598,6 +4607,28 @@ static bool nvfp4_selector_choose_policy(
     };
 
     auto policies = nvfp4_selector_default_policies(recipe_cfg, recipe_policy_name);
+    const bool has_expert_bindings = std::any_of(all_bindings.begin(), all_bindings.end(), [](const nvfp4_selector_binding & b) {
+        return b.name.find(".ffn_gate_exps.weight") != std::string::npos ||
+               b.name.find(".ffn_up_exps.weight") != std::string::npos ||
+               b.name.find(".ffn_down_exps.weight") != std::string::npos;
+    });
+    const bool include_moe_policies = quantize_control_i64(
+        "LLAMA_NVFP4_SELECTOR_INCLUDE_MOE_POLICIES", has_expert_bindings ? 1 : 0) != 0;
+    if (!include_moe_policies) {
+        const size_t before = policies.size();
+        policies.erase(std::remove_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
+            return !nvfp4_selector_policy_is_recipe(policy.name) &&
+                   (policy.name.find("_moe") != std::string::npos ||
+                    policy.name.find("moe_") != std::string::npos ||
+                    policy.name.find("awq_tail_moe") != std::string::npos);
+        }), policies.end());
+        if (before != policies.size()) {
+            fprintf(stderr,
+                "%s: selector pruned %zu MoE-specialized policy candidate(s) for dense/non-expert model\n",
+                __func__,
+                before - policies.size());
+        }
+    }
     const std::unordered_set<std::string> skip_policy_names =
         selector_policy_set_from_control("LLAMA_NVFP4_SELECTOR_SKIP_POLICIES");
     auto selector_policy_skipped = [&](const nvfp4_selector_policy & policy) {
