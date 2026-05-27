@@ -66,6 +66,31 @@ common mistakes.
 
 10. Record PPL/KLD, BPW, tensor mix, and smoke verdict in the project report.
 
+## Long-Running Run Discipline
+
+Large dense models can run for hours. Treat an in-progress production run as
+valuable state:
+
+- start runs with a log file and a project directory;
+- keep the terminal/session attached or record the process ID;
+- monitor the log, checkpoint/output file size, process state, CPU/RSS, and GPU
+  memory/utilization;
+- do not stop a run just because one status field is quiet or shows
+  `output=0.0 MiB`;
+- do not run overlapping GPU benchmarks or evaluations;
+- if a run fails, preserve the project directory and checkpoints, diagnose the
+  first error in the log, fix the cause, rebuild, and resume when possible;
+- do not restart a broad search from scratch when a checkpoint can be reused.
+
+Useful monitoring commands are intentionally ordinary:
+
+```bash
+pgrep -af 'llama-quantize|advanced-gguf-quantizer'
+nvidia-smi
+tail -f runs/model/logs/run.log
+ls -lh runs/model/*.gguf runs/model/*.gguf.bwq-checkpoint.gguf
+```
+
 ## Recipe Checklist
 
 For a high-quality run, verify:
@@ -101,6 +126,34 @@ official support may use a different format, so keep model cards and reports
 clear about the exact branch/runtime used. Feedback is requested at
 <https://github.com/michaelw9999/llama.cpp/tree/mxfp6-cuda>.
 
+## Candidate Search Expectations
+
+Quality mode may build a quantized checkpoint before candidate search. That
+checkpoint is the measured seed model used for runtime patch evaluation; it is
+not necessarily the final artifact. The selector can then load the checkpoint
+once, patch candidate tensors or tensor scales, measure KLD/PPL, and restore
+the original bytes without rebuilding the whole model from BF16 for every
+candidate.
+
+Do not confuse the search stages:
+
+- proxy ranking uses tensor-local evidence and can reject obviously redundant
+  candidates quickly;
+- measured ranking uses runtime model output against the KLD base and is the
+  quality evidence that matters;
+- holdout KLD is validation evidence, not the same subset used to choose
+  candidates;
+- the final artifact should be based on the exact measured checkpoint or exact
+  accepted patches, not on a fresh unmeasured rewrite when avoidable.
+
+For pure MXFP6_E2M3 runs, the implementation may still pass through shared
+NVFP4/MXFP6 selector plumbing. NVFP4 policy names with `tensors=0` and
+`skipped=no_nvfp4_tensors` are bookkeeping noise, not active NVFP4 cap tuning.
+The active MXFP6-only refinement is tensor-scale selection over
+`mxfp6.selector_scale_candidates`; these are positive scale multipliers for the
+MXFP6 tensor scale around the E8M0 block-scale representation, not NVFP4
+four-over-six or FP8 cap policies.
+
 ## Quality Rules
 
 - Treat PPL as a guardrail, not the whole objective.
@@ -112,6 +165,32 @@ clear about the exact branch/runtime used. Feedback is requested at
   corpora, KLD bases, or commits.
 - Do not claim quality from proxy scores, first chunks, tiny KLD samples, or
   mismatched baselines.
+
+## Final Evaluation And Benchmarks
+
+After a serious artifact run, evaluate the final GGUF with the same reference
+model, KLD base, corpus, and code commit used for comparable models. Prefer a
+plain command shape for final evidence:
+
+```bash
+./build/bin/llama-perplexity \
+  -m runs/model/output.gguf \
+  -f data/wiki.test.raw \
+  --kl-divergence \
+  --kl-divergence-base runs/model/reference.kld
+```
+
+Record PPL(Q), PPL(base), mean KLD, p95/p99/p999 KLD, max KLD, RMS probability
+delta, same-top rate, top-flip weight, entropy drift/RMSE, non-finite counts,
+elapsed time, and maximum RSS. Then run `llama-bench` separately on a quiet GPU:
+
+```bash
+./build/bin/llama-bench -m runs/model/output.gguf
+```
+
+When comparing two GGUFs, also report exact byte size, BPW, tensor mix, and MTP
+status. Do not compare one model using full KLD evidence against another model
+using a proxy, a first chunk, or a different KLD base.
 
 ## Best Candidate Reports
 
@@ -135,6 +214,11 @@ deliberate optimizer study. The useful expert controls are MXFP6 input-scale
 denom/quantile, MXFP6 tensor-scale sample/step effort, mixed-format proxy sample
 breadth, and mixed-format imatrix weight shaping. Prefer recipe fields over ad
 hoc process settings.
+
+Do not add runtime-shape, batch, fit, or scheduling overrides to final PPL/KLD
+commands unless the comparison explicitly requires them. If a knob is needed for
+quantization quality, put it in the recipe so it is visible in `plan`, the
+recipe lock, and the run manifest.
 
 ## Memory Discipline
 
