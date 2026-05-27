@@ -8514,6 +8514,14 @@ int llama_quantize(int argc, char ** argv) {
                             return 0;
                         }
                     }
+                    if (selector_chose_seed_keep && !selector_checkpoint_path.empty()) {
+                        patch_base_model = selector_checkpoint_path;
+                        params.patch_base_model = patch_base_model.c_str();
+                        fprintf(stderr,
+                            "%s: selector chose seed_keep; final output will patch unchanged tensors from measured checkpoint %s\n",
+                            __func__,
+                            patch_base_model.c_str());
+                    }
 	            } else if (!selector_checkpoint_path.empty()) {
                 fprintf(stderr, "%s: selector failed, continuing with the built-in CUDA policy search\n", __func__);
                 if (quantize_control_i64("LLAMA_NVFP4_SELECTOR_REQUIRE_RUNTIME_CACHE", 0) != 0) {
