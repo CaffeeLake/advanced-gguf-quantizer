@@ -946,12 +946,6 @@ void apply_master_autotune(Recipe & r) {
         mode == "minimal" ||
         mode == "fast-minimal" ||
         mode == "minimal-autotune";
-    const std::string policy_set = lower_copy(trim(r.autotune.policy_set));
-    const bool native_full_policy =
-        policy_set.empty() ||
-        policy_set == "native-full" ||
-        policy_set == "full" ||
-        policy_set == "local-full";
     if (diagnostic) {
         r.selector.effort = "diagnostic";
     } else if (fast) {
@@ -982,23 +976,6 @@ void apply_master_autotune(Recipe & r) {
 
     if (!uses_nvfp4 && !uses_mxfp6) {
         return;
-    }
-
-    const bool strict_size_target =
-        r.target.fit_to_vram ||
-        r.target.target_bpw > 0.0 ||
-        r.target.weight_budget_gib > 0.0;
-    if (uses_nvfp4 && !uses_mxfp6 && native_full_policy && !diagnostic && !fast && !strict_size_target &&
-            !r.rescue.enabled && r.rescue.top.empty() && r.rescue.budget_mb.empty() &&
-            r.rescue.bf16_budget_mb.empty() && r.rescue.class_limit.empty()) {
-        r.rescue.enabled = true;
-        r.rescue.type = "Q8_0";
-        r.rescue.top = r.autotune.mode == "balanced" ? "3" : "4";
-        r.rescue.report_top = r.autotune.mode == "balanced" ? "8" : "12";
-        r.rescue.budget_mb = r.autotune.mode == "balanced" ? "256" : "384";
-        r.rescue.bf16_budget_mb = r.autotune.mode == "balanced" ? "64" : "128";
-        r.rescue.class_limit = "1";
-        r.rescue.nvfp4_top = "0";
     }
 
     r.selector.keep_checkpoint = true;
@@ -1086,7 +1063,7 @@ void apply_master_autotune(Recipe & r) {
     assign_if_empty(r.selector.n_seq, "4");
 
     if (uses_nvfp4) {
-        assign_if_empty(r.nvfp4.autotune.max_blocks, "32768");
+        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "32768" : "65536");
         assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
         assign_if_empty(r.nvfp4.four_six.refit_iters, "16");
         assign_if_empty(r.nvfp4.four_six.compand, "1");
@@ -1218,14 +1195,7 @@ Recipe default_recipe(const std::string & profile) {
         r.selector.ranking.p99_penalty = "7.0";
         r.selector.ranking.p999_penalty = "2.0";
         r.selector.ranking.max_kld_penalty = "0.04";
-        r.rescue.enabled = true;
-        r.rescue.type = "Q8_0";
-        r.rescue.top = "4";
-        r.rescue.report_top = "12";
-        r.rescue.budget_mb = "384";
-        r.rescue.bf16_budget_mb = "128";
-        r.rescue.class_limit = "1";
-        r.rescue.nvfp4_top = "0";
+        r.rescue.type.clear();
         r.nv4mx6.policy.clear();
         r.mxfp6 = {};
         r.mxfp6.tensor_scale.clear();
