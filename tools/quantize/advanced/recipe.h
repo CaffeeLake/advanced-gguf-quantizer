@@ -106,12 +106,16 @@ struct Recipe {
     } tensor_overrides;
 
     struct Nvfp4 {
-        std::string preset = "baseline_auto";
+        std::string preset = "baseline";
         std::string cfg;
         std::string correction_denom = "2688";
         std::string input_scale_policy = "imatrix-rms";
         std::vector<std::string> calibration_families = { "max", "kld_best" };
         std::string scale_tie = "none";
+
+        struct Rsf {
+            std::string mode = "tensor";
+        } rsf;
 
         struct Autotune {
             std::string max_blocks;
@@ -182,6 +186,7 @@ struct Recipe {
         std::string sensitivity_layer;
         std::string sensitivity_tensor;
         std::string sensitivity_sample_blocks;
+        std::string rsf_report;
 
         struct Ranking {
             std::string kld_penalty;

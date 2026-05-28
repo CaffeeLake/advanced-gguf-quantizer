@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cfloat>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -185,6 +186,10 @@ static constexpr int NVFP4_REFIT_ITERS = 8;
 static constexpr int NVFP4_TUNE_REFIT_ITERS = 8;
 static constexpr int NVFP4_TUNE_POOL_SIZE = 48;
 static constexpr int NVFP4_COMPAND_TOPK = 6;
+static constexpr int NVFP4_RSF_ANALYTIC_POOL_SIZE = 24;
+static constexpr int NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS = 128;
+static constexpr float NVFP4_RSF_SCALE_MUL_MIN = 0.75f;
+static constexpr float NVFP4_RSF_SCALE_MUL_MAX = 1.50f;
 static constexpr float NVFP4_E2M1_MAX_VALUE = 6.0f;
 static constexpr float NVFP4_TUNE_FIXED_POOL[] = {
     0.9918823242f,
@@ -1732,21 +1737,6 @@ struct nvfp4_tune_eval_stats {
     double abs_mean_err_rel = DBL_MAX;
 };
 
-static int64_t nvfp4_cuda_env_i64(const char * name, int64_t fallback) {
-    const char * value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') {
-        return fallback;
-    }
-
-    char * end = nullptr;
-    const long long parsed = std::strtoll(value, &end, 10);
-    if (end == value || (end != nullptr && *end != '\0') || parsed <= 0) {
-        return fallback;
-    }
-
-    return (int64_t) parsed;
-}
-
 static bool ggml_cuda_nvfp4_kld_copy_base_to_scratch(
         nvfp4_cuda_kld_tls & tls,
         const uint16_t * base_host,
@@ -1916,6 +1906,302 @@ static bool nvfp4_host_eval_better(
     if (nearly_eq(cand.obj_norm, best.obj_norm) && nearly_eq(cand.p95_rel_obj, best.p95_rel_obj) && nearly_eq(cand.tail_rel_obj, best.tail_rel_obj) && cand.max_rel_obj < best.max_rel_obj) return true;
     if (nearly_eq(cand.obj_norm, best.obj_norm) && nearly_eq(cand.p95_rel_obj, best.p95_rel_obj) && nearly_eq(cand.tail_rel_obj, best.tail_rel_obj) && nearly_eq(cand.max_rel_obj, best.max_rel_obj) && cand.abs_mean_err_rel < best.abs_mean_err_rel) return true;
     return false;
+}
+
+static float nvfp4_host_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) {
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    const float raw = exp == 0 ?
+        std::ldexp((float) man, -9) :
+        std::ldexp(1.0f + (float) man * 0.125f, exp - 7);
+    return raw * 0.5f;
+}
+
+static float nvfp4_host_ue4m3_raw(uint8_t x) {
+    return 2.0f * nvfp4_host_ue4m3_to_fp32(x);
+}
+
+static uint8_t nvfp4_host_fp32_to_ue4m3(float x) {
+    if (!(x > 0.0f) || !std::isfinite(x)) {
+        return 0;
+    }
+    if (x > 448.0f) {
+        x = 448.0f;
+    }
+
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    const int fp32_exp  = ((bits >> 23) & 0xFF) - 127;
+    const int fp32_man  = (bits >> 20) & 0x7;
+    const int ue4m3_exp = fp32_exp + 7;
+
+    if (ue4m3_exp <= 0) {
+        int man = (int) (x * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        return man < 1 ? 0 : (uint8_t) man;
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+
+    int ue4m3_man = fp32_man + ((bits >> 19) & 1);
+    int ue4m3_exp_adj = ue4m3_exp;
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ++ue4m3_exp_adj;
+        if (ue4m3_exp_adj >= 15) {
+            return 0x7E;
+        }
+    }
+
+    return (uint8_t) ((ue4m3_exp_adj << 3) | ue4m3_man);
+}
+
+static float nvfp4_host_kvalue(int i) {
+    static const float values[16] = {
+         0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return values[i & 0x0F];
+}
+
+static float nvfp4_host_qw(const float * qw16, int i) {
+    if (qw16 == nullptr) {
+        return 1.0f;
+    }
+    const float w = qw16[i];
+    return (std::isfinite(w) && w > 0.0f) ? w : 0.0f;
+}
+
+static double nvfp4_host_subblock_sse_w_best(
+        const float * x16,
+        const float * qw16,
+        float scale) {
+    if (!(scale > 0.0f) || !std::isfinite(scale)) {
+        return DBL_MAX;
+    }
+
+    double sse = 0.0;
+    for (int i = 0; i < QK_NVFP4_SUB; ++i) {
+        const float w = nvfp4_host_qw(qw16, i);
+        const float v = x16[i];
+        if (w == 0.0f || !std::isfinite(v)) {
+            continue;
+        }
+
+        uint8_t best = 0;
+        float best_err = FLT_MAX;
+        for (int qi = 0; qi < 16; ++qi) {
+            const float q = scale * nvfp4_host_kvalue(qi);
+            const float e = q - v;
+            const float err = e * e;
+            if (err < best_err) {
+                best_err = err;
+                best = (uint8_t) qi;
+            }
+        }
+
+        const double e = (double) scale * (double) nvfp4_host_kvalue(best) - (double) v;
+        sse += (double) w * e * e;
+    }
+
+    return sse;
+}
+
+struct nvfp4_rsf_subblock_hint {
+    float ideal;
+    float cap;
+    uint8_t code;
+    double priority;
+};
+
+static bool nvfp4_host_copy_sample_for_rsf(
+        const float * sample,
+        bool device_sample,
+        int64_t sample_nb,
+        std::vector<float> & storage,
+        const float ** host_sample,
+        const char * what,
+        cudaStream_t stream) {
+    *host_sample = nullptr;
+    if (sample == nullptr || sample_nb <= 0) {
+        return true;
+    }
+    if (!device_sample) {
+        *host_sample = sample;
+        return true;
+    }
+
+    const size_t bytes = (size_t) sample_nb * QK_NVFP4 * sizeof(float);
+    storage.resize((size_t) sample_nb * QK_NVFP4);
+    cudaError_t err = cudaMemcpyAsync(storage.data(), sample, bytes, cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        nvfp4_cuda_log_failure(what, err);
+        cudaGetLastError();
+        storage.clear();
+        return false;
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        nvfp4_cuda_log_failure(what, err);
+        cudaGetLastError();
+        storage.clear();
+        return false;
+    }
+
+    *host_sample = storage.data();
+    return true;
+}
+
+static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
+        const float * x,
+        const float * qw,
+        int64_t sample_nb,
+        const nvfp4_cuda_runtime_cfg & cfg) {
+    std::vector<nvfp4_rsf_subblock_hint> hints;
+    if (x == nullptr || sample_nb <= 0) {
+        return {};
+    }
+    hints.reserve((size_t) std::min<int64_t>(
+        sample_nb * (QK_NVFP4 / QK_NVFP4_SUB) * 2,
+        NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS * 2));
+
+    auto add_hint = [&](const float * x16, const float * qw16, float anchor, float cap) {
+        if (!(anchor > 0.0f) || !(cap > 0.0f) || !std::isfinite(anchor) || !std::isfinite(cap)) {
+            return;
+        }
+
+        float max_abs = 0.0f;
+        float max2 = 0.0f;
+        double x2 = 0.0;
+        double wsum = 0.0;
+        for (int i = 0; i < QK_NVFP4_SUB; ++i) {
+            const float v = x16[i];
+            if (!std::isfinite(v)) {
+                continue;
+            }
+            const float ax = std::fabs(v);
+            if (ax > max_abs) {
+                max2 = max_abs;
+                max_abs = ax;
+            } else if (ax > max2) {
+                max2 = ax;
+            }
+            const float w = nvfp4_host_qw(qw16, i);
+            if (w > 0.0f) {
+                x2 += (double) w * (double) v * (double) v;
+                wsum += (double) w;
+            }
+        }
+        if (!(max_abs > 0.0f) || !(x2 > 0.0)) {
+            return;
+        }
+
+        const float ideal = max_abs / anchor;
+        const uint8_t code = nvfp4_host_fp32_to_ue4m3(std::min(ideal, cap));
+        const float raw = nvfp4_host_ue4m3_raw(code);
+        if (!(raw > 0.0f)) {
+            return;
+        }
+
+        const double sse = nvfp4_host_subblock_sse_w_best(x16, qw16, raw);
+        const double rel = std::isfinite(sse) ? sse / std::max(x2, 1e-30) : 0.0;
+        const double rms = std::sqrt(x2 / std::max(wsum, 1e-30));
+        const double tail = (double) max_abs / std::max(rms, 1e-30);
+        const double top2 = max_abs > 0.0f ? (double) max2 / (double) max_abs : 0.0;
+        const double priority = rel * (1.0 + 0.08 * std::min(tail, 8.0)) + 0.02 * top2 + 1e-18 * x2;
+        hints.push_back({ ideal, cap, code, priority });
+    };
+
+    const float cap_m6 = (std::isfinite(cfg.cap_m6) && cfg.cap_m6 > 0.0f) ? cfg.cap_m6 : 448.0f;
+    const float cap_m4_raw = (std::isfinite(cfg.cap_m4) && cfg.cap_m4 > 0.0f) ? cfg.cap_m4 : 256.0f;
+    const float cap_m4 = std::min(cap_m4_raw, cap_m6);
+    const int subblocks_per_block = QK_NVFP4 / QK_NVFP4_SUB;
+    for (int64_t ib = 0; ib < sample_nb; ++ib) {
+        for (int sub = 0; sub < subblocks_per_block; ++sub) {
+            const int off = sub * QK_NVFP4_SUB;
+            const float * x16 = x + (size_t) ib * QK_NVFP4 + off;
+            const float * qw16 = qw != nullptr ? (qw + (size_t) ib * QK_NVFP4 + off) : nullptr;
+            if (cfg.choose46_mode == NVFP4_CUDA_CHOOSE46_FORCE_M6) {
+                add_hint(x16, qw16, 6.0f, cap_m6);
+            } else if (cfg.choose46_mode == NVFP4_CUDA_CHOOSE46_FORCE_M4) {
+                add_hint(x16, qw16, 4.0f, cap_m4);
+            } else {
+                add_hint(x16, qw16, 6.0f, cap_m6);
+                add_hint(x16, qw16, 4.0f, cap_m4);
+            }
+        }
+    }
+
+    if (hints.empty()) {
+        return {};
+    }
+
+    std::sort(hints.begin(), hints.end(), [](const nvfp4_rsf_subblock_hint & a, const nvfp4_rsf_subblock_hint & b) {
+        return a.priority > b.priority;
+    });
+    if ((int) hints.size() > NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS) {
+        hints.resize(NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS);
+    }
+
+    struct candidate {
+        float scale_mul;
+        double score;
+    };
+    std::vector<candidate> candidates;
+    candidates.reserve(NVFP4_RSF_ANALYTIC_POOL_SIZE);
+    auto add_candidate = [&](float scale_mul, double score) {
+        if (!(scale_mul > 0.0f) || !std::isfinite(scale_mul) || !(score > 0.0) || !std::isfinite(score)) {
+            return;
+        }
+        scale_mul = std::clamp(scale_mul, NVFP4_RSF_SCALE_MUL_MIN, NVFP4_RSF_SCALE_MUL_MAX);
+        if (std::fabs(scale_mul - 1.0f) <= 1e-5f) {
+            return;
+        }
+        for (candidate & cand : candidates) {
+            const float tol = 5e-4f * std::max(1.0f, std::max(std::fabs(cand.scale_mul), std::fabs(scale_mul)));
+            if (std::fabs(cand.scale_mul - scale_mul) <= tol) {
+                cand.score += score;
+                return;
+            }
+        }
+        candidates.push_back({ scale_mul, score });
+    };
+
+    for (const nvfp4_rsf_subblock_hint & hint : hints) {
+        const int center = (int) hint.code;
+        for (int delta = -3; delta <= 3; ++delta) {
+            const int code = center + delta;
+            if (code <= 0 || code >= 0x7F) {
+                continue;
+            }
+            const float raw = nvfp4_host_ue4m3_raw((uint8_t) code);
+            if (!(raw > 0.0f) || raw > hint.cap * 1.001f) {
+                continue;
+            }
+            const double weight = hint.priority / (1.0 + (double) std::abs(delta));
+            add_candidate(hint.ideal / raw, weight);
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
+        return a.score > b.score;
+    });
+    if ((int) candidates.size() > NVFP4_RSF_ANALYTIC_POOL_SIZE) {
+        candidates.resize(NVFP4_RSF_ANALYTIC_POOL_SIZE);
+    }
+
+    std::vector<float> out;
+    out.reserve(candidates.size());
+    for (const candidate & cand : candidates) {
+        out.push_back(cand.scale_mul);
+    }
+    return out;
 }
 
 struct nvfp4_cuda_eval_request {
@@ -3295,12 +3581,9 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     }
 
     const int64_t nb_total = n / QK_NVFP4;
-    const int64_t coarse_cap = std::max<int64_t>(32, nvfp4_cuda_env_i64("LLAMA_NVFP4_AUTOTUNE_COARSE_BLOCKS", 512));
-    const int64_t refine_cap = std::max<int64_t>(
-            coarse_cap,
-            nvfp4_cuda_env_i64("LLAMA_NVFP4_AUTOTUNE_REFINE_BLOCKS",
-                nvfp4_cuda_env_i64("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", NVFP4_AUTOTUNE_MAX_SAMPLE_BLOCKS)));
-    const int coarse_topk = (int) std::clamp<int64_t>(nvfp4_cuda_env_i64("LLAMA_NVFP4_AUTOTUNE_TOPK", 24), 1, 48);
+    const int64_t coarse_cap = 512;
+    const int64_t refine_cap = NVFP4_AUTOTUNE_MAX_SAMPLE_BLOCKS;
+    const int coarse_topk = 24;
 
     const int64_t coarse_nb = std::min<int64_t>(nb_total, coarse_cap);
     const int64_t refine_nb = std::min<int64_t>(nb_total, refine_cap);
@@ -3338,7 +3621,25 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     const float * b_candidates = NVFP4_TUNE_FIXED_POOL;
     const int a_candidates_n = (int) (sizeof(NVFP4_TUNE_FIXED_POOL) / sizeof(NVFP4_TUNE_FIXED_POOL[0]));
     const int b_candidates_n = a_candidates_n;
-    const bool enable_scale_mul_tune = cfg_hint == nullptr;
+    const bool enable_rsf_scale_tune =
+        cfg_hint == nullptr ||
+        ((cfg_hint->reserved_i32 & NVFP4_CUDA_FLAG_RSF) != 0);
+
+    std::vector<float> rsf_scale_mul_candidates;
+    if (enable_rsf_scale_tune) {
+        nvfp4_cuda_runtime_cfg rsf_cfg{};
+        nvfp4_cuda_resolve_cfg(rsf_cfg, NVFP4_A0, NVFP4_B0, cfg_hint);
+        std::vector<float> rsf_x_storage;
+        std::vector<float> rsf_qw_storage;
+        const float * rsf_x = nullptr;
+        const float * rsf_qw = nullptr;
+        if (nvfp4_host_copy_sample_for_rsf(x_coarse, input_device, coarse_nb, rsf_x_storage, &rsf_x,
+                "autotune RSF D2H(x)", st) &&
+            nvfp4_host_copy_sample_for_rsf(qw_coarse, qw_coarse != nullptr && qw_device, coarse_nb, rsf_qw_storage, &rsf_qw,
+                "autotune RSF D2H(qw)", st)) {
+            rsf_scale_mul_candidates = nvfp4_host_collect_rsf_scale_muls(rsf_x, rsf_qw, coarse_nb, rsf_cfg);
+        }
+    }
 
     struct coarse_candidate {
         float a;
@@ -3378,16 +3679,46 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         }
     };
 
+    std::vector<float> scale_mul_candidates;
+    if (enable_rsf_scale_tune) {
+        scale_mul_candidates.reserve(rsf_scale_mul_candidates.size() + (size_t) a_candidates_n);
+        auto add_scale_mul_candidate = [&](float cand_scale) {
+            if (!(cand_scale > 0.0f) || !std::isfinite(cand_scale)) {
+                return;
+            }
+            cand_scale = std::clamp(cand_scale, NVFP4_RSF_SCALE_MUL_MIN, NVFP4_RSF_SCALE_MUL_MAX);
+            if (std::fabs(cand_scale - 1.0f) <= 1e-5f) {
+                return;
+            }
+            for (float existing : scale_mul_candidates) {
+                const float tol = 5e-4f * std::max(1.0f, std::max(std::fabs(existing), std::fabs(cand_scale)));
+                if (std::fabs(existing - cand_scale) <= tol) {
+                    return;
+                }
+            }
+            scale_mul_candidates.push_back(cand_scale);
+        };
+        for (float cand_scale : rsf_scale_mul_candidates) {
+            add_scale_mul_candidate(cand_scale);
+        }
+        for (int si = 0; si < a_candidates_n; ++si) {
+            add_scale_mul_candidate(a_candidates[si]);
+        }
+        if (trace && !rsf_scale_mul_candidates.empty()) {
+            fprintf(stderr,
+                "NVFP4_TUNE (CUDA RSF) analytic_scale_mul=%d total_scale_mul=%d\n",
+                (int) rsf_scale_mul_candidates.size(),
+                (int) scale_mul_candidates.size());
+        }
+    }
+
     std::vector<nvfp4_cuda_eval_request> coarse_requests;
-    const size_t coarse_request_limit = 1 + (size_t) a_candidates_n * (size_t) b_candidates_n;
+    const size_t coarse_request_limit =
+        1 + scale_mul_candidates.size() + (size_t) a_candidates_n * (size_t) b_candidates_n;
     coarse_requests.reserve(coarse_request_limit);
     coarse_requests.push_back(make_ab_request(NVFP4_A0, NVFP4_B0));
-    if (enable_scale_mul_tune) {
-        for (int si = 0; si < a_candidates_n && coarse_requests.size() < coarse_request_limit; ++si) {
-            const float cand_scale = a_candidates[si];
-            if (std::fabs(cand_scale - 1.0f) <= 1e-12f) {
-                continue;
-            }
+    if (enable_rsf_scale_tune) {
+        for (float cand_scale : scale_mul_candidates) {
             coarse_requests.push_back(make_ab_request(NVFP4_A0, NVFP4_B0, cand_scale));
         }
     }
@@ -3896,7 +4227,7 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     if (result) {
         result->a = best_a_now;
         result->b = best_b_now;
-        result->scale_mul = enable_scale_mul_tune ? best_scale_mul_now : 1.0f;
+        result->scale_mul = enable_rsf_scale_tune ? best_scale_mul_now : 1.0f;
         result->cfg = final_cfg;
         result->has_cfg = 1;
     }

@@ -1360,7 +1360,7 @@ static std::string candidate_id_token(const std::string & value) {
 static std::vector<std::string> nvfp4_selector_preset_candidates() {
     std::vector<std::string> out;
     for (const llama_nvfp4_named_preset & preset : llama_nvfp4_preset_catalog()) {
-        if (std::string(preset.name) != "baseline_auto") {
+        if (std::string(preset.name) != "baseline") {
             out.emplace_back(preset.name);
         }
     }
@@ -1429,6 +1429,7 @@ static int candidates_main(int argc, char ** argv) {
     const bool family_awq = family_awq_lite || family_awq_full || family_awq_clip;
     const bool family_smoothquant = has_native_family("smoothquant");
     const bool family_mse = has_native_family("mse_scale_sweep");
+    const bool family_rsf = has_native_family("nvfp4_rsf");
     const bool family_kl = has_native_family("kl_div_sensitivity");
     const bool family_gradient_sidecar = has_native_family("gradient_or_hessian_sidecar");
     const bool native_auto_search = has_native_candidate("auto_search");
@@ -1449,7 +1450,7 @@ static int candidates_main(int argc, char ** argv) {
                     r.target.precision_mode = "NVFP4";
                     r.base.ftype = "NVFP4";
                     if (r.nvfp4.preset.empty()) {
-                        r.nvfp4.preset = "baseline_auto";
+                        r.nvfp4.preset = "baseline";
                     }
                     if (family_kl) {
                         r.selector.effort = "kl-div-sensitivity";
@@ -1560,6 +1561,22 @@ static int candidates_main(int argc, char ** argv) {
                 });
     }
 
+    if (family_rsf) {
+        write_candidate_recipe(base, output_dir, manifest,
+                "nvfp4-rsf",
+                "NVFP4 refined scale fit (RSF) variants for the normal selector policies",
+                [](bq::Recipe & r) {
+                    r.target.precision_mode = "NVFP4";
+                    r.base.ftype = "NVFP4";
+                    append_unique_type(r.stock_ftype.technique_candidates, "nvfp4_rsf");
+                    append_unique_type(r.nvfp4.calibration_families, "nvfp4_rsf");
+                    r.selector.effort = "nvfp4-rsf";
+                    r.selector.stagea_sample_blocks = r.selector.stagea_sample_blocks.empty() ? "4096" : r.selector.stagea_sample_blocks;
+                    r.selector.eval_top = r.selector.eval_top.empty() ? "6" : r.selector.eval_top;
+                    r.selector.require_runtime_cache = true;
+                });
+    }
+
     if (family_kl) {
         write_candidate_recipe(base, output_dir, manifest,
                 "kl-div-sensitivity",
@@ -1578,39 +1595,12 @@ static int candidates_main(int argc, char ** argv) {
                 });
     }
 
-    write_candidate_recipe(base, output_dir, manifest, "adaptive46", "NVFP4 W4A4 adaptive 4/6 baseline", [](bq::Recipe & r) {
-        r.nvfp4.preset.clear();
-        r.nvfp4.cfg.clear();
-        r.nvfp4.four_six.choose46 = "adaptive";
-        r.nvfp4.four_six.refit_iters = "8";
-        r.nvfp4.four_six.compand = "1";
-        r.nvfp4.four_six.cap6 = "448";
-        r.nvfp4.four_six.cap4 = "256";
-    });
-    write_candidate_recipe(base, output_dir, manifest, "prefer4", "NVFP4 W4A4 candidate that prefers 4-bit lanes when quality allows it", [](bq::Recipe & r) {
-        r.nvfp4.preset.clear();
-        r.nvfp4.cfg.clear();
-        r.nvfp4.four_six.choose46 = "force_m4";
-        r.nvfp4.four_six.refit_iters = "8";
-        r.nvfp4.four_six.compand = "1";
-        r.nvfp4.four_six.cap6 = "448";
-        r.nvfp4.four_six.cap4 = "256";
-    });
-    write_candidate_recipe(base, output_dir, manifest, "prefer6", "NVFP4 W4A4 candidate that prefers 6-bit lanes for safer block-level encoding", [](bq::Recipe & r) {
-        r.nvfp4.preset.clear();
-        r.nvfp4.cfg.clear();
-        r.nvfp4.four_six.choose46 = "force_m6";
-        r.nvfp4.four_six.refit_iters = "12";
-        r.nvfp4.four_six.compand = "1";
-        r.nvfp4.four_six.cap6 = "448";
-        r.nvfp4.four_six.cap4 = "256";
-    });
     const bool allow_mxfp6_candidates =
         quant_type_uses_mxfp6(base.target.precision_mode) ||
         quant_type_uses_mxfp6(base.base.ftype) ||
         (base.rescue.enabled && base.rescue.type == "MXFP6_E2M3");
     if (allow_mxfp6_candidates) {
-        write_candidate_recipe(base, output_dir, manifest, "mixed-quality", "Adaptive 4/6 plus lower MXFP6 penalty and larger edit budget", [](bq::Recipe & r) {
+        write_candidate_recipe(base, output_dir, manifest, "mixed-quality", "Mixed NVFP4/MXFP6 quality-first candidate with lower MXFP6 penalty and larger edit budget", [](bq::Recipe & r) {
             r.target.precision_mode = "NVFP4_MXFP6";
             r.base.ftype = "NVFP4_MXFP6";
             r.nvfp4.preset.clear();
@@ -2496,13 +2486,11 @@ static void configure_standard_quantize_options(bq::Recipe & recipe) {
 static void configure_four_six_mixed(bq::Recipe & recipe) {
     const int choice = menu_select("NVFP4 4/6 encoder", {
         "Balanced adaptive 4/6 - current default, lets CUDA choose M4 or M6 per block",
-        "Prefer 4-bit lanes - smaller/faster bias when quality allows it",
-        "Prefer 6-bit lanes - safer NVFP4 encoding before promoting whole tensors",
         "NVFP4_MXFP6 quality-first - spend more MXFP6 budget on risky tensors",
         "Keep current recipe settings",
         "Back",
     });
-    if (choice == 4 || choice == 5) {
+    if (choice == 2 || choice == 3) {
         return;
     }
 
@@ -2516,16 +2504,6 @@ static void configure_four_six_mixed(bq::Recipe & recipe) {
         recipe.nvfp4.four_six.cap6 = "448";
         recipe.nvfp4.four_six.cap4 = "256";
     } else if (choice == 1) {
-        recipe.nvfp4.four_six.choose46 = "force_m4";
-        recipe.nvfp4.four_six.refit_iters = "8";
-        recipe.nvfp4.four_six.cap6 = "448";
-        recipe.nvfp4.four_six.cap4 = "256";
-    } else if (choice == 2) {
-        recipe.nvfp4.four_six.choose46 = "force_m6";
-        recipe.nvfp4.four_six.refit_iters = "12";
-        recipe.nvfp4.four_six.cap6 = "448";
-        recipe.nvfp4.four_six.cap4 = "256";
-    } else if (choice == 3) {
         recipe.target.precision_mode = "NVFP4_MXFP6";
         recipe.base.ftype = "NVFP4_MXFP6";
         recipe.nvfp4.four_six.choose46 = "adaptive";
@@ -4546,21 +4524,13 @@ static void shell_configure_nvfp4_46_autotune(ShellState & state) {
     state.recipe.nvfp4.cfg = shell_prompt_on_page(state, title, "raw NVFP4 cfg override", state.recipe.nvfp4.cfg);
     const int mode = shell_submenu_select(state, "Project > Options > NVFP4 4/6 > Lane Selection", {
         "Adaptive",
-        "Force 4-bit lanes",
-        "Force 6-bit lanes",
         "Back",
     });
-    if (mode < 0 || mode == 3) {
+    if (mode < 0 || mode == 1) {
         state.status = "NVFP4 autotune unchanged";
         return;
     }
-    if (mode == 0) {
-        state.recipe.nvfp4.four_six.choose46 = "adaptive";
-    } else if (mode == 1) {
-        state.recipe.nvfp4.four_six.choose46 = "force_m4";
-    } else if (mode == 2) {
-        state.recipe.nvfp4.four_six.choose46 = "force_m6";
-    }
+    state.recipe.nvfp4.four_six.choose46 = "adaptive";
     const std::string params_title = "Project > Options > NVFP4 4/6 and Autotune > Parameters";
     state.recipe.nvfp4.four_six.refit_iters = shell_prompt_on_page(state, params_title, "4/6 refit iterations", state.recipe.nvfp4.four_six.refit_iters);
     state.recipe.nvfp4.four_six.compand = shell_prompt_on_page(state, params_title, "4/6 companding enabled (0/1)", state.recipe.nvfp4.four_six.compand);
@@ -4596,6 +4566,7 @@ static void shell_configure_native_techniques(ShellState & state) {
         const bool awq = has_family("awq_lite");
         const bool smoothquant = has_family("smoothquant");
         const bool mse = has_family("mse_scale_sweep");
+        const bool rsf = has_family("nvfp4_rsf");
         const bool kl = has_family("kl_div_sensitivity");
         const bool gradient = has_family("gradient_or_hessian_sidecar");
         const bool grouped = state.recipe.nvfp4.scale_tie == "qkv_gate_up_expert";
@@ -4612,14 +4583,15 @@ static void shell_configure_native_techniques(ShellState & state) {
             label("Add BF16/no-quantize tensor choices", no_quantize),
             label("AWQ candidates", awq),
             label("SmoothQuant input-scale candidates", smoothquant),
-            label("MSE scale-sweep candidates", mse),
+            label("Scale/cap sweep candidates", mse),
+            label("NVFP4 RSF variants", rsf),
             label("KL-divergence sensitivity scorer", kl),
             label("Gradient/Hessian sidecar scorer", gradient),
             label("Tie Q/K/V, gate/up, and experts as groups", grouped),
             "Manual native lists",
             "Back",
         });
-        if (choice < 0 || choice == 13) {
+        if (choice < 0 || choice == 14) {
             shell_remember_recipe(state, state.last_recipe, state.recipe);
             state.status = "Native technique families updated";
             return;
@@ -4658,6 +4630,7 @@ static void shell_configure_native_techniques(ShellState & state) {
                 "awq_full",
                 "smoothquant",
                 "mse_scale_sweep",
+                "nvfp4_rsf",
                 "kl_div_sensitivity",
             };
             state.recipe.nvfp4.calibration_families = {
@@ -4668,6 +4641,7 @@ static void shell_configure_native_techniques(ShellState & state) {
                 "awq_full",
                 "smoothquant",
                 "mse_scale_sweep",
+                "nvfp4_rsf",
                 "kl_div_sensitivity",
             };
             state.recipe.nvfp4.scale_tie = "qkv_gate_up_expert";
@@ -4703,19 +4677,29 @@ static void shell_configure_native_techniques(ShellState & state) {
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "mse_scale_sweep" }, !mse);
         } else if (choice == 9) {
             state.recipe.autotune.policy_set = "manual";
+            set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "nvfp4_rsf" }, !rsf);
+            set_type_tokens(state.recipe.nvfp4.calibration_families, { "nvfp4_rsf" }, !rsf);
+            if (!rsf) {
+                state.recipe.selector.require_runtime_cache = true;
+                if (state.recipe.selector.eval_top.empty()) {
+                    state.recipe.selector.eval_top = "6";
+                }
+            }
+        } else if (choice == 10) {
+            state.recipe.autotune.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "kl_div_sensitivity" }, !kl);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "kl_div_sensitivity" }, !kl);
             if (!kl) {
                 state.recipe.selector.require_runtime_cache = true;
             }
-        } else if (choice == 10) {
+        } else if (choice == 11) {
             state.recipe.autotune.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "gradient_or_hessian_sidecar" }, !gradient);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "gradient_or_hessian_sidecar" }, !gradient);
-        } else if (choice == 11) {
+        } else if (choice == 12) {
             state.recipe.autotune.policy_set = "manual";
             state.recipe.nvfp4.scale_tie = grouped ? "none" : "qkv_gate_up_expert";
-        } else if (choice == 12) {
+        } else if (choice == 13) {
             state.recipe.autotune.policy_set = "manual";
             const std::string title = "Project > Options > Native Technique Families > Manual";
             state.recipe.stock_ftype.technique_candidates = split_type_csv(shell_prompt_on_page(

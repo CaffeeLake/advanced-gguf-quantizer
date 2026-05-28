@@ -152,6 +152,32 @@ Hard gates reject candidates that cross configured risk thresholds. Soft
 penalties let a candidate survive only when it earns the tail risk with better
 overall evidence.
 
+## Native NVFP4 Candidate Families
+
+`nvfp4_rsf` enables NVFP4 refined scale fit (RSF) variants for the active
+NVFP4 selector policies: each tensor can refine its tensor scale while the
+existing per-16 block fit remains imatrix-weighted. The local refinement uses
+calibration weights, and final ranking still comes from the normal PPL/KLD
+selector machinery. This is a modifier on the normal candidate set, not a
+standalone policy lane. Enable it through native candidate lists or directly:
+
+```bash
+./build/bin/llama-quantize ... --nvfp4-selector-rsf --nvfp4-selector-rsf-mode tensor \
+  --nvfp4-selector-rsf-report runs/model/rsf-report.txt
+```
+
+Recipe files can set the RSF granularity explicitly:
+
+```toml
+[nvfp4.rsf]
+mode = "tensor" # tensor | slice | expert | group
+```
+
+RSF variants are shortlisted by the existing proxy path and, when a KLD base is
+available, scored by the same full PPL/KLD selector machinery as other NVFP4
+policies. Adaptive four-over-six remains the default NVFP4 encoder path for
+these variants and the base policies they extend.
+
 ## Best Candidate Reports
 
 Use `best` for non-dominated candidate sets. Internally this is Pareto-style

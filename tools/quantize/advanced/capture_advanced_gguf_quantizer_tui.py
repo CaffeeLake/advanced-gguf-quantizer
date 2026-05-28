@@ -1091,7 +1091,8 @@ def case_candidate_search_all_paths(session: PtySession, case_dir: Path) -> None
             "Add BF16/no-quantize tensor choices",
             "AWQ candidates",
             "SmoothQuant input-scale candidates",
-            "MSE scale-sweep candidates",
+            "Scale/cap sweep candidates",
+            "NVFP4 RSF variants",
             "KL-divergence sensitivity scorer",
             "Gradient/Hessian sidecar scorer",
             "Tie grouped decisions",
@@ -1100,7 +1101,7 @@ def case_candidate_search_all_paths(session: PtySession, case_dir: Path) -> None
     ):
         select_down(session, index, label)
         session.wait_screen("Native Technique Families")
-    select_down(session, 12, "Manual native lists")
+    select_down(session, 13, "Manual native lists")
     press_prompt_defaults(session, ["technique candidates", "calibration/search families", "scale/group tie policy"])
     session.wait_screen("Native Technique Families")
     session.key(KEY_ESC, "Back from native techniques")

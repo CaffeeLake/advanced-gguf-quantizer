@@ -32,6 +32,18 @@ std::string trim_copy(std::string value) {
     return value;
 }
 
+static bool parse_nvfp4_bool_value(const std::string & value) {
+    if (striequals(value.c_str(), "true") || striequals(value.c_str(), "yes") ||
+            striequals(value.c_str(), "on")) {
+        return true;
+    }
+    if (striequals(value.c_str(), "false") || striequals(value.c_str(), "no") ||
+            striequals(value.c_str(), "off")) {
+        return false;
+    }
+    return std::stoi(value) != 0;
+}
+
 struct quant_option {
     std::string name;
     llama_ftype ftype;
@@ -163,10 +175,10 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --patch-base model.gguf\n");
     printf("                                      reuse unchanged tensor bytes from an existing quantized GGUF.\n");
     printf("                                      useful for surgical tensor rescues without a full requantization pass.\n");
-    printf("  --nvfp4-cfg NVFP4{choose46=...,refit=...,compand=...,cap6=...,cap4=...}\n");
+    printf("  --nvfp4-cfg NVFP4{choose46=...,refit=...,compand=...,cap6=...,cap4=...,rsf=0|1}\n");
     printf("                                      set the global NVFP4 CUDA encoder policy directly.\n");
     printf("  --nvfp4-preset name\n");
-    printf("                                      set a named global NVFP4 encoder policy, e.g. baseline_auto or asym_tail.\n");
+    printf("                                      set a named global NVFP4 encoder policy, e.g. baseline or asym_tail.\n");
     printf("  --nvfp4-correction-denom value\n");
     printf("                                      set NVFP4 weight correction denominator, e.g. 105, 1536, 1728, 2304, 2688.\n");
     printf("  --nvfp4-input-scale-policy name\n");
@@ -176,6 +188,10 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      set CUDA NVFP4 encoder autotune sample cap and worker count.\n");
     printf("  --nvfp4-fast-quantize\n");
     printf("                                      use a compact real-artifact NVFP4 selector/autotune budget.\n");
+    printf("  --nvfp4-selector-rsf / --nvfp4-selector-rsf-mode tensor|slice|expert|group\n");
+    printf("                                      add refined scale fit (RSF) variants for each NVFP4 selector policy.\n");
+    printf("  --nvfp4-selector-rsf-report file.txt\n");
+    printf("                                      write the RSF policy summary, tensor rows, and scale-multiplier histograms.\n");
     printf("  --mxfp6_e2m3-tensor-scale on|off\n");
     printf("                                      write MXFP6_E2M3 tensor correction scales. default: on.\n");
     printf("                                      WARNING: MXFP6_E2M3 is experimental and unsupported by NVIDIA/llama.cpp.\n");
@@ -416,6 +432,26 @@ bool parse_tensor_type_nvfp4_cfg(const std::string & spec, tensor_type_option & 
             out.nvfp4_cfg.cap_m6 = (float) std::stof(value);
         } else if (striequals(key.c_str(), "cap4") || striequals(key.c_str(), "cap_m4")) {
             out.nvfp4_cfg.cap_m4 = (float) std::stof(value);
+        } else if (striequals(key.c_str(), "rsf") || striequals(key.c_str(), "nvfp4_rsf")) {
+            if (parse_nvfp4_bool_value(value)) {
+                out.nvfp4_cfg.reserved_i32 |= NVFP4_CUDA_FLAG_RSF;
+            } else {
+                out.nvfp4_cfg.reserved_i32 &= ~(NVFP4_CUDA_FLAG_RSF | NVFP4_CUDA_RSF_MODE_MASK);
+            }
+        } else if (striequals(key.c_str(), "rsf_mode")) {
+            out.nvfp4_cfg.reserved_i32 &= ~NVFP4_CUDA_RSF_MODE_MASK;
+            if (striequals(value.c_str(), "tensor")) {
+                out.nvfp4_cfg.reserved_i32 |= NVFP4_CUDA_RSF_MODE_TENSOR << NVFP4_CUDA_RSF_MODE_SHIFT;
+            } else if (striequals(value.c_str(), "slice")) {
+                out.nvfp4_cfg.reserved_i32 |= NVFP4_CUDA_RSF_MODE_SLICE << NVFP4_CUDA_RSF_MODE_SHIFT;
+            } else if (striequals(value.c_str(), "expert")) {
+                out.nvfp4_cfg.reserved_i32 |= NVFP4_CUDA_RSF_MODE_EXPERT << NVFP4_CUDA_RSF_MODE_SHIFT;
+            } else if (striequals(value.c_str(), "group")) {
+                out.nvfp4_cfg.reserved_i32 |= NVFP4_CUDA_RSF_MODE_GROUP << NVFP4_CUDA_RSF_MODE_SHIFT;
+            } else {
+                fprintf(stderr, "%s: invalid NVFP4 RSF mode '%s'\n", __func__, value.c_str());
+                return false;
+            }
         } else if (striequals(key.c_str(), "sample") || striequals(key.c_str(), "sample_blocks")) {
             out.nvfp4_sample_blocks = std::max<int64_t>(0, std::stoll(value));
         } else if (striequals(key.c_str(), "policy") || striequals(key.c_str(), "name")) {
@@ -563,6 +599,16 @@ std::string format_tensor_type_value(const tensor_type_option & opt) {
            << ",compand=" << opt.nvfp4_cfg.use_compand_sat
            << ",cap6=" << opt.nvfp4_cfg.cap_m6
            << ",cap4=" << opt.nvfp4_cfg.cap_m4;
+        if ((opt.nvfp4_cfg.reserved_i32 & NVFP4_CUDA_FLAG_RSF) != 0) {
+            os << ",rsf=1";
+            const int rsf_mode = (opt.nvfp4_cfg.reserved_i32 & NVFP4_CUDA_RSF_MODE_MASK) >> NVFP4_CUDA_RSF_MODE_SHIFT;
+            switch (rsf_mode) {
+                case NVFP4_CUDA_RSF_MODE_SLICE:  os << ",rsf_mode=slice"; break;
+                case NVFP4_CUDA_RSF_MODE_EXPERT: os << ",rsf_mode=expert"; break;
+                case NVFP4_CUDA_RSF_MODE_GROUP:  os << ",rsf_mode=group"; break;
+                default:                         os << ",rsf_mode=tensor"; break;
+            }
+        }
         if (opt.nvfp4_sample_blocks > 0) {
             os << ",sample=" << opt.nvfp4_sample_blocks;
         }

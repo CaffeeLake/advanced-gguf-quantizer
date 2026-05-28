@@ -58,6 +58,17 @@ enum nvfp4_cuda_choose46_mode {
     NVFP4_CUDA_CHOOSE46_FORCE_M4 = 2,
 };
 
+#define NVFP4_CUDA_FLAG_RSF           (1 << 0)
+#define NVFP4_CUDA_RSF_MODE_SHIFT     4
+#define NVFP4_CUDA_RSF_MODE_MASK      (3 << NVFP4_CUDA_RSF_MODE_SHIFT)
+
+enum nvfp4_cuda_rsf_mode {
+    NVFP4_CUDA_RSF_MODE_TENSOR = 0,
+    NVFP4_CUDA_RSF_MODE_SLICE  = 1,
+    NVFP4_CUDA_RSF_MODE_EXPERT = 2,
+    NVFP4_CUDA_RSF_MODE_GROUP  = 3,
+};
+
 typedef struct nvfp4_cuda_runtime_cfg {
     int32_t choose46_mode;
     int32_t refit_iters;
@@ -76,9 +87,9 @@ typedef struct nvfp4_cuda_tune_result {
 } nvfp4_cuda_tune_result;
 
 #define GGML_NVFP4_CUDA_PRESET_LIST(X) \
-    X("baseline_auto",                    NVFP4_CUDA_CHOOSE46_ADAPTIVE, 8,  1, 448.0f, 256.0f) \
-    X("baseline_auto_gentler_m4",         NVFP4_CUDA_CHOOSE46_ADAPTIVE, 8,  1, 448.0f, 224.0f) \
-    X("baseline_auto_refit4",             NVFP4_CUDA_CHOOSE46_ADAPTIVE, 4,  1, 448.0f, 256.0f) \
+    X("baseline",                         NVFP4_CUDA_CHOOSE46_ADAPTIVE, 8,  1, 448.0f, 256.0f) \
+    X("baseline_gentler_m4",              NVFP4_CUDA_CHOOSE46_ADAPTIVE, 8,  1, 448.0f, 224.0f) \
+    X("baseline_refit4",                  NVFP4_CUDA_CHOOSE46_ADAPTIVE, 4,  1, 448.0f, 256.0f) \
     X("baseline_recover_320_224",         NVFP4_CUDA_CHOOSE46_ADAPTIVE, 8,  1, 320.0f, 224.0f) \
     X("baseline_recover_320_224_refit4",  NVFP4_CUDA_CHOOSE46_ADAPTIVE, 4,  1, 320.0f, 224.0f) \
     X("baseline_recover_352_224",         NVFP4_CUDA_CHOOSE46_ADAPTIVE, 8,  1, 352.0f, 224.0f) \
@@ -147,6 +158,7 @@ GGML_BACKEND_API void nvfp4_sample_cache_cuda_free(void * cache);
 GGML_BACKEND_API void nvfp4_set_ab(float a, float b);
 GGML_BACKEND_API void nvfp4_clear_ab(void);
 GGML_BACKEND_API void nvfp4_set_runtime_cfg(const nvfp4_cuda_runtime_cfg * cfg);
+GGML_BACKEND_API bool nvfp4_get_runtime_cfg(nvfp4_cuda_runtime_cfg * cfg, const nvfp4_cuda_runtime_cfg * cfg_hint);
 GGML_BACKEND_API void nvfp4_clear_runtime_cfg(void);
 GGML_BACKEND_API void nvfp4_set_autotune_threads(int32_t n_threads);
 GGML_BACKEND_API void nvfp4_clear_cuda_stream_cache(void);

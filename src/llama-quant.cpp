@@ -1480,8 +1480,7 @@ static size_t llama_tensor_quantize_impl(
         double autotune_ms = 0.0;
         bool autotune_ok = false;
 
-        if (nvfp4_cfg_hint != nullptr) {
-            nvfp4_cfg = *nvfp4_cfg_hint;
+        if (nvfp4_get_runtime_cfg(&nvfp4_cfg, nvfp4_cfg_hint)) {
             nvfp4_cfg_valid = true;
         }
 
@@ -1572,7 +1571,7 @@ static size_t llama_tensor_quantize_impl(
                     tune_x_ptr,
                     tune_qw_ptr,
                     sample_n,
-                    nvfp4_cfg_hint != nullptr ? &nvfp4_cfg : nullptr,
+                    nvfp4_cfg_valid ? &nvfp4_cfg : nullptr,
                     &tune_result,
                     nvfp4_tune_stream);
             if (autotune_ok) {

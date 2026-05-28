@@ -233,6 +233,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "nvfp4.input_scale_policy") { r.nvfp4.input_scale_policy = value; return; }
     if (path == "nvfp4.calibration_families") { r.nvfp4.calibration_families = parse_string_list(raw_value); return; }
     if (path == "nvfp4.scale_tie") { r.nvfp4.scale_tie = value; return; }
+    if (path == "nvfp4.rsf.mode") { r.nvfp4.rsf.mode = value; return; }
     if (path == "nvfp4.autotune.max_blocks") { r.nvfp4.autotune.max_blocks = value; return; }
     if (path == "nvfp4.autotune.threads") { r.nvfp4.autotune.threads = value; return; }
 
@@ -292,6 +293,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.sensitivity_layer") { r.selector.sensitivity_layer = value; return; }
     if (path == "selector.sensitivity_tensor") { r.selector.sensitivity_tensor = value; return; }
     if (path == "selector.sensitivity_sample_blocks") { r.selector.sensitivity_sample_blocks = value; return; }
+    if (path == "selector.rsf_report") { r.selector.rsf_report = value; return; }
 
     if (path == "selector.ranking.kld_penalty") { r.selector.ranking.kld_penalty = value; return; }
     if (path == "selector.ranking.p99_penalty") { r.selector.ranking.p99_penalty = value; return; }
@@ -438,6 +440,7 @@ static void apply_native_policy_set(Recipe & r) {
             "awq_full",
             "smoothquant",
             "mse_scale_sweep",
+            "nvfp4_rsf",
             "kl_div_sensitivity",
         };
         r.nvfp4.calibration_families = {
@@ -448,6 +451,7 @@ static void apply_native_policy_set(Recipe & r) {
             "awq_full",
             "smoothquant",
             "mse_scale_sweep",
+            "nvfp4_rsf",
             "kl_div_sensitivity",
         };
         if (r.nvfp4.scale_tie.empty() || r.nvfp4.scale_tie == "none") {
@@ -479,6 +483,7 @@ static void apply_native_policy_set(Recipe & r) {
                 "awq_full",
                 "smoothquant",
                 "mse_scale_sweep",
+                "nvfp4_rsf",
                 "kl_div_sensitivity",
         }) {
             append_unique(r.stock_ftype.technique_candidates, technique);
@@ -489,6 +494,7 @@ static void apply_native_policy_set(Recipe & r) {
                 "awq_full",
                 "smoothquant",
                 "mse_scale_sweep",
+                "nvfp4_rsf",
                 "kl_div_sensitivity",
         }) {
             append_unique(r.nvfp4.calibration_families, family);
@@ -710,6 +716,14 @@ std::vector<std::string> validate_recipe(const Recipe & recipe, bool require_io)
     if (recipe.calibration.include_weights.size() > 0 && recipe.calibration.exclude_weights.size() > 0) {
         errors.push_back("calibration.include_weights and calibration.exclude_weights cannot both be set");
     }
+    const std::string rsf_mode = lower_copy(trim(recipe.nvfp4.rsf.mode));
+    if (!rsf_mode.empty() &&
+            rsf_mode != "tensor" &&
+            rsf_mode != "slice" &&
+            rsf_mode != "expert" &&
+            rsf_mode != "group") {
+        errors.push_back("nvfp4.rsf.mode must be one of: tensor, slice, expert, group");
+    }
     if (recipe.evaluation.kld_mode == "make_base" && recipe.evaluation.bf16_reference.empty() && recipe.io.input.empty()) {
         errors.push_back("evaluation.bf16_reference or io.input is required when evaluation.kld_mode=make_base");
     }
@@ -822,6 +836,9 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string_list(out, "calibration_families", r.nvfp4.calibration_families);
     dump_string(out, "scale_tie", r.nvfp4.scale_tie);
 
+    out << "\n[nvfp4.rsf]\n";
+    dump_string(out, "mode", r.nvfp4.rsf.mode);
+
     const bool show_low_level = !r.autotune.enabled || r.autotune.allow_diagnostic;
     if (show_low_level) {
         out << "\n[nvfp4.autotune]\n";
@@ -901,6 +918,7 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "sensitivity_layer", r.selector.sensitivity_layer);
     dump_string(out, "sensitivity_tensor", r.selector.sensitivity_tensor);
     dump_string(out, "sensitivity_sample_blocks", r.selector.sensitivity_sample_blocks);
+    dump_string(out, "rsf_report", r.selector.rsf_report);
 
     out << "\n[selector.ranking]\n";
     dump_string(out, "kld_penalty", r.selector.ranking.kld_penalty);
@@ -1150,7 +1168,7 @@ Recipe default_recipe(const std::string & profile) {
         r.base.ftype = "NVFP4_MXFP6";
         r.base.output_tensor_type = "MXFP6_E2M3";
         r.base.token_embedding_type = "MXFP6_E2M3";
-        r.nvfp4.preset = "baseline_auto";
+        r.nvfp4.preset = "baseline";
         r.nvfp4.correction_denom = "2688";
         r.nvfp4.input_scale_policy = "imatrix-rms";
         apply_real_best_defaults(r);
@@ -1176,7 +1194,7 @@ Recipe default_recipe(const std::string & profile) {
         r.base.ftype = "MXFP6";
         r.base.output_tensor_type = "MXFP6_E2M3";
         r.base.token_embedding_type = "MXFP6_E2M3";
-        r.nvfp4.preset = "baseline_auto";
+        r.nvfp4.preset = "baseline";
         r.nvfp4.correction_denom = "2688";
         r.nvfp4.input_scale_policy = "imatrix-rms";
         apply_real_best_defaults(r);
@@ -1291,6 +1309,20 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
             args.push_back(flag);
         }
     };
+    auto has_token = [](const std::vector<std::string> & values, const char * token) {
+        const std::string want = lower_copy(trim(token));
+        for (std::string value : values) {
+            value = lower_copy(trim(value));
+            std::replace(value.begin(), value.end(), '-', '_');
+            if (value == want) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool wants_nvfp4_rsf =
+        has_token(r.stock_ftype.technique_candidates, "nvfp4_rsf") ||
+        has_token(r.nvfp4.calibration_families, "nvfp4_rsf");
 
     push_bool("--allow-requantize", r.base.allow_requantize);
     push_bool("--leave-output-tensor", r.base.leave_output_tensor);
@@ -1335,6 +1367,10 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--nvfp4-input-scale-policy", r.nvfp4.input_scale_policy);
         push_pair("--nvfp4-autotune-max-blocks", r.nvfp4.autotune.max_blocks);
         push_pair("--nvfp4-autotune-threads", r.nvfp4.autotune.threads);
+        push_bool("--nvfp4-selector-rsf", wants_nvfp4_rsf);
+        if (wants_nvfp4_rsf) {
+            push_pair("--nvfp4-selector-rsf-mode", r.nvfp4.rsf.mode);
+        }
     }
 
     const bool uses_mxfp6_controls =
@@ -1394,6 +1430,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_pair("--nvfp4-selector-sensitivity-layer", r.selector.sensitivity_layer);
     push_pair("--nvfp4-selector-sensitivity-tensor", r.selector.sensitivity_tensor);
     push_pair("--nvfp4-selector-sensitivity-sample-blocks", r.selector.sensitivity_sample_blocks);
+    push_pair("--nvfp4-selector-rsf-report", r.selector.rsf_report);
 
     push_pair("--nvfp4-selector-kld-penalty", r.selector.ranking.kld_penalty);
     push_pair("--nvfp4-selector-p99-penalty", r.selector.ranking.p99_penalty);

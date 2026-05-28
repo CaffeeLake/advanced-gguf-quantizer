@@ -215,7 +215,10 @@ static inline void nvfp4_get_ab(float * a_out, float * b_out) {
     *b_out = b;
 }
 
-static inline bool nvfp4_get_runtime_cfg(nvfp4_cuda_runtime_cfg * cfg_out, const nvfp4_cuda_runtime_cfg * cfg_hint) {
+extern "C" bool nvfp4_get_runtime_cfg(nvfp4_cuda_runtime_cfg * cfg_out, const nvfp4_cuda_runtime_cfg * cfg_hint) {
+    if (cfg_out == nullptr) {
+        return false;
+    }
     if (cfg_hint != nullptr) {
         *cfg_out = *cfg_hint;
         return true;
