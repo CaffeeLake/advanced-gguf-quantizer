@@ -460,6 +460,8 @@ extern "C" {
         float mixed_format_imatrix_power;                            // mixed-format imatrix weight power, negative = default
         float mixed_format_imatrix_min;                              // mixed-format imatrix minimum weight, negative = default
         float mixed_format_imatrix_max;                              // mixed-format imatrix maximum weight, negative = default
+        bool q4_k_rsf;                                                // experimental K-quant refined scale fit
+        int32_t q4_k_rsf_mode;                                        // 1=scale fit, 2=AWQ-style, 3=SQ-style
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

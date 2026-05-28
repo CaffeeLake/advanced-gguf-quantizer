@@ -9101,6 +9101,14 @@ int llama_quantize(int argc, char ** argv) {
             params.nv4mx6_policy = LLAMA_NV4MX6_POLICY_AUTO;
         }
     }
+    if (ftype_str == "Q2_K_RSF" ||
+            ftype_str == "Q3_K_RSF" || ftype_str == "Q3_K_M_RSF" ||
+            ftype_str == "Q4_K_RSF" || ftype_str == "Q4_K_RSF_AWQ" || ftype_str == "Q4_K_RSF_SQ") {
+        params.q4_k_rsf = true;
+        params.q4_k_rsf_mode =
+            ftype_str == "Q4_K_RSF_AWQ" ? 2 :
+            ftype_str == "Q4_K_RSF_SQ"  ? 3 : 1;
+    }
 
     // parse nthreads
     if (argc > arg_idx) {

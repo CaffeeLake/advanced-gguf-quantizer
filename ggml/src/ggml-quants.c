@@ -1787,6 +1787,925 @@ size_t quantize_q4_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+static float q4_K_rsf_f16(float x) {
+    return GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(x));
+}
+
+enum {
+    Q4_K_RSF_MODE_SCALE  = 1,
+    Q4_K_RSF_MODE_AWQ    = 2,
+    Q4_K_RSF_MODE_SMOOTH = 3,
+};
+
+static float qk_K_rsf_tail_aware_score(
+        float err,
+        const float * GGML_RESTRICT sub_err,
+        const float * GGML_RESTRICT sub_weight,
+        int nsub,
+        float worst_penalty,
+        float tail_penalty) {
+    float total_weight = 0.0f;
+    for (int i = 0; i < nsub; ++i) {
+        total_weight += sub_weight[i];
+    }
+    if (!(total_weight > 0.0f) || !isfinite(total_weight)) {
+        return err;
+    }
+
+    const float mean = err / total_weight;
+    float top[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    int ntop = 0;
+    for (int i = 0; i < nsub; ++i) {
+        if (!(sub_weight[i] > 0.0f)) {
+            continue;
+        }
+        const float norm = sub_err[i] / sub_weight[i];
+        if (!isfinite(norm)) {
+            continue;
+        }
+        const int limit = MIN(4, ntop + 1);
+        for (int j = 0; j < limit; ++j) {
+            if (norm > top[j]) {
+                for (int k = limit - 1; k > j; --k) {
+                    top[k] = top[k - 1];
+                }
+                top[j] = norm;
+                break;
+            }
+        }
+        ntop = limit;
+    }
+
+    if (ntop == 0) {
+        return err;
+    }
+
+    float top_mean = 0.0f;
+    for (int i = 0; i < ntop; ++i) {
+        top_mean += top[i];
+    }
+    top_mean /= (float) ntop;
+
+    const float worst_excess = MAX(0.0f, top[0] - mean);
+    const float tail_excess  = MAX(0.0f, top_mean - mean);
+    return err + total_weight * (worst_penalty * worst_excess + tail_penalty * tail_excess);
+}
+
+static void q4_K_rsf_pack_scales(block_q4_K * GGML_RESTRICT y, const uint8_t * GGML_RESTRICT Ls, const uint8_t * GGML_RESTRICT Lm) {
+    memset(y->scales, 0, sizeof(y->scales));
+    for (int j = 0; j < QK_K/32; ++j) {
+        const uint8_t ls = MIN(63, Ls[j]);
+        const uint8_t lm = MIN(63, Lm[j]);
+        if (j < 4) {
+            y->scales[j]   = ls & 0x3f;
+            y->scales[j+4] = lm & 0x3f;
+        } else {
+            y->scales[j+4]  = (ls & 0x0f) | ((lm & 0x0f) << 4);
+            y->scales[j-4] |= (ls >> 4) << 6;
+            y->scales[j-0] |= (lm >> 4) << 6;
+        }
+    }
+}
+
+static float q4_K_rsf_score(
+        const float * GGML_RESTRICT x,
+        const float * GGML_RESTRICT weights,
+        const float * GGML_RESTRICT scales,
+        const float * GGML_RESTRICT mins,
+        float d_block,
+        float m_block,
+        uint8_t * GGML_RESTRICT out_Ls,
+        uint8_t * GGML_RESTRICT out_Lm) {
+    d_block = q4_K_rsf_f16(d_block);
+    m_block = q4_K_rsf_f16(m_block);
+    if (!(d_block >= 0.0f) || !isfinite(d_block)) {
+        d_block = 0.0f;
+    }
+    if (!(m_block >= 0.0f) || !isfinite(m_block)) {
+        m_block = 0.0f;
+    }
+
+    uint8_t Ls[QK_K/32];
+    uint8_t Lm[QK_K/32];
+    float err = 0.0f;
+    for (int j = 0; j < QK_K/32; ++j) {
+        const int ls = d_block > 0.0f ? MIN(63, MAX(0, nearest_int(scales[j] / d_block))) : 0;
+        const int lm = m_block > 0.0f ? MIN(63, MAX(0, nearest_int(mins[j] / m_block))) : 0;
+        Ls[j] = (uint8_t) ls;
+        Lm[j] = (uint8_t) lm;
+
+        const float d  = d_block * (float) ls;
+        const float dm = m_block * (float) lm;
+        for (int ii = 0; ii < 32; ++ii) {
+            const int k = 32*j + ii;
+            float q = -dm;
+            if (d > 0.0f) {
+                int l = nearest_int((x[k] + dm) / d);
+                l = MAX(0, MIN(15, l));
+                q = d * (float) l - dm;
+            }
+            const float diff = q - x[k];
+            err += weights[k] * diff * diff;
+        }
+    }
+
+    if (out_Ls) {
+        memcpy(out_Ls, Ls, sizeof(Ls));
+    }
+    if (out_Lm) {
+        memcpy(out_Lm, Lm, sizeof(Lm));
+    }
+    return err;
+}
+
+static void q4_K_rsf_add_mul(float * GGML_RESTRICT pool, int * GGML_RESTRICT n, int cap, float mul, float lo, float hi) {
+    if (!(mul > 0.0f) || !isfinite(mul)) {
+        return;
+    }
+    mul = MAX(lo, MIN(hi, mul));
+    for (int i = 0; i < *n; ++i) {
+        if (fabsf(pool[i] - mul) <= 5e-4f * MAX(1.0f, MAX(fabsf(pool[i]), fabsf(mul)))) {
+            return;
+        }
+    }
+    if (*n < cap) {
+        pool[(*n)++] = mul;
+    }
+}
+
+static int q4_K_rsf_make_mul_pool(
+        float * GGML_RESTRICT pool,
+        int cap,
+        float base,
+        const float * GGML_RESTRICT values,
+        int mode) {
+    int n = 0;
+    static const float fixed_scale[] = {
+        0.875000f, 0.906250f, 0.937500f, 0.953125f, 0.968750f,
+        0.984375f, 1.000000f, 1.015625f, 1.031250f, 1.046875f,
+        1.062500f, 1.093750f, 1.125000f,
+    };
+    static const float fixed_awq[] = {
+        0.625000f, 0.687500f, 0.750000f, 0.812500f, 0.875000f,
+        0.906250f, 0.937500f, 0.953125f, 0.968750f, 0.984375f,
+        1.000000f, 1.015625f, 1.031250f, 1.046875f, 1.062500f,
+        1.093750f, 1.125000f, 1.187500f,
+    };
+    static const float fixed_smooth[] = {
+        0.812500f, 0.875000f, 0.906250f, 0.937500f, 0.953125f,
+        0.968750f, 0.984375f, 1.000000f, 1.015625f, 1.031250f,
+        1.046875f, 1.062500f, 1.093750f, 1.125000f, 1.187500f,
+    };
+    const float lo = mode == Q4_K_RSF_MODE_AWQ ? 0.625f : 0.75f;
+    const float hi = mode == Q4_K_RSF_MODE_AWQ ? 1.50f  : 1.3333334f;
+    const float * fixed = fixed_scale;
+    int nfixed = (int) (sizeof(fixed_scale) / sizeof(fixed_scale[0]));
+    if (mode == Q4_K_RSF_MODE_AWQ) {
+        fixed = fixed_awq;
+        nfixed = (int) (sizeof(fixed_awq) / sizeof(fixed_awq[0]));
+    } else if (mode == Q4_K_RSF_MODE_SMOOTH) {
+        fixed = fixed_smooth;
+        nfixed = (int) (sizeof(fixed_smooth) / sizeof(fixed_smooth[0]));
+    }
+    for (int i = 0; i < nfixed; ++i) {
+        q4_K_rsf_add_mul(pool, &n, cap, fixed[i], lo, hi);
+    }
+    if (base > 0.0f && isfinite(base)) {
+        for (int j = 0; j < QK_K/32; ++j) {
+            const float target = values[j];
+            if (!(target > 0.0f) || !isfinite(target)) {
+                continue;
+            }
+            const int code = MIN(63, MAX(1, nearest_int(target / base)));
+            q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) code), lo, hi);
+            if (code > 1) {
+                q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) (code - 1)), lo, hi);
+            }
+            if (code < 63) {
+                q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) (code + 1)), lo, hi);
+            }
+        }
+    }
+    return n;
+}
+
+static void q4_K_rsf_write(
+        const float * GGML_RESTRICT x,
+        block_q4_K * GGML_RESTRICT y,
+        float d_block,
+        float m_block,
+        const uint8_t * GGML_RESTRICT Ls,
+        const uint8_t * GGML_RESTRICT Lm) {
+    d_block = q4_K_rsf_f16(d_block);
+    m_block = q4_K_rsf_f16(m_block);
+    y->d    = GGML_FP32_TO_FP16(d_block);
+    y->dmin = GGML_FP32_TO_FP16(m_block);
+    q4_K_rsf_pack_scales(y, Ls, Lm);
+
+    uint8_t L[QK_K];
+    memset(L, 0, sizeof(L));
+    for (int j = 0; j < QK_K/32; ++j) {
+        const float d  = d_block * (float) Ls[j];
+        const float dm = m_block * (float) Lm[j];
+        if (!(d > 0.0f)) {
+            continue;
+        }
+        for (int ii = 0; ii < 32; ++ii) {
+            int l = nearest_int((x[32*j + ii] + dm) / d);
+            L[32*j + ii] = MAX(0, MIN(15, l));
+        }
+    }
+
+    uint8_t * q = y->qs;
+    for (int j = 0; j < QK_K; j += 64) {
+        for (int l = 0; l < 32; ++l) {
+            q[l] = L[j + l] | (L[j + l + 32] << 4);
+        }
+        q += 32;
+    }
+}
+
+static void quantize_row_q4_K_rsf_impl(const float * GGML_RESTRICT x, block_q4_K * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights, int mode) {
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb = n_per_row / QK_K;
+
+    uint8_t L[QK_K];
+    uint8_t Laux[32];
+    uint8_t Ls[QK_K/32];
+    uint8_t Lm[QK_K/32];
+    uint8_t best_Ls[QK_K/32];
+    uint8_t best_Lm[QK_K/32];
+    float weights[32];
+    float eval_weights[QK_K];
+    float qw_rel[32];
+    float sw[QK_K/32];
+    float mins[QK_K/32];
+    float scales[QK_K/32];
+
+    for (int i = 0; i < nb; i++) {
+        float sum_x2 = 0;
+        for (int l = 0; l < QK_K; ++l) {
+            sum_x2 += x[l] * x[l];
+        }
+        const float sigma2 = 2*sum_x2/QK_K;
+        const float av_x = sqrtf(sigma2);
+
+        for (int j = 0; j < QK_K/32; ++j) {
+            if (quant_weights) {
+                const float * qw = quant_weights + QK_K*i + 32*j;
+                if (mode == Q4_K_RSF_MODE_AWQ || mode == Q4_K_RSF_MODE_SMOOTH) {
+                    float sum_qw = 0.0f;
+                    for (int l = 0; l < 32; ++l) {
+                        const float qwv = qw[l] > 0.0f && isfinite(qw[l]) ? qw[l] : 1.0f;
+                        qw_rel[l] = qwv;
+                        sum_qw += qwv;
+                    }
+                    const float mean_qw = sum_qw > 0.0f ? sum_qw / 32.0f : 1.0f;
+                    for (int l = 0; l < 32; ++l) {
+                        float rel = qw_rel[l] / mean_qw;
+                        rel = MAX(0.0625f, MIN(16.0f, rel));
+                        if (mode == Q4_K_RSF_MODE_AWQ) {
+                            rel = MIN(32.0f, rel * sqrtf(rel));
+                            const float mag = av_x > 0.0f ? MIN(8.0f, fabsf(x[32*j + l]) / av_x) : 0.0f;
+                            rel *= 1.0f + 0.20f * mag;
+                        } else {
+                            rel = sqrtf(rel);
+                        }
+                        weights[l] = rel * sqrtf(sigma2 + x[32*j + l]*x[32*j + l]);
+                        eval_weights[32*j + l] = weights[l];
+                    }
+                } else {
+                for (int l = 0; l < 32; ++l) {
+                    weights[l] = qw[l] * sqrtf(sigma2 + x[32*j + l]*x[32*j + l]);
+                    eval_weights[32*j + l] = weights[l];
+                }
+                }
+            } else {
+                for (int l = 0; l < 32; ++l) {
+                    weights[l] = av_x + fabsf(x[32*j + l]);
+                    eval_weights[32*j + l] = weights[l];
+                }
+            }
+            float sumw = 0;
+            for (int l = 0; l < 32; ++l) {
+                sumw += weights[l];
+            }
+            sw[j] = sumw;
+            const int nstep = mode == Q4_K_RSF_MODE_AWQ ? 64 : 36;
+            scales[j] = make_qkx3_quants(32, 15, x + 32*j, weights, L + 32*j, &mins[j], Laux, -0.9f, 0.05f, nstep, false);
+        }
+
+        float d_block = make_qp_quants(QK_K/32, 63, scales, Ls, sw);
+        float m_block = make_qp_quants(QK_K/32, 63, mins,   Lm, sw);
+        d_block = q4_K_rsf_f16(d_block);
+        m_block = q4_K_rsf_f16(m_block);
+
+        float best_d = d_block;
+        float best_m = m_block;
+        float best_err = q4_K_rsf_score(x, eval_weights, scales, mins, best_d, best_m, best_Ls, best_Lm);
+
+        float d_pool[48];
+        float m_pool[48];
+        const int nd = q4_K_rsf_make_mul_pool(d_pool, (int) (sizeof(d_pool) / sizeof(d_pool[0])), d_block, scales, mode);
+        const int nm = q4_K_rsf_make_mul_pool(m_pool, (int) (sizeof(m_pool) / sizeof(m_pool[0])), m_block, mins, mode);
+
+        uint8_t cand_Ls[QK_K/32];
+        uint8_t cand_Lm[QK_K/32];
+        for (int id = 0; id < nd; ++id) {
+            const float cand_d = q4_K_rsf_f16(d_block * d_pool[id]);
+            const float err = q4_K_rsf_score(x, eval_weights, scales, mins, cand_d, best_m, cand_Ls, cand_Lm);
+            if (err < best_err) {
+                best_err = err;
+                best_d = cand_d;
+                memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+                memcpy(best_Lm, cand_Lm, sizeof(best_Lm));
+            }
+        }
+        for (int im = 0; im < nm; ++im) {
+            const float cand_m = q4_K_rsf_f16(m_block * m_pool[im]);
+            const float err = q4_K_rsf_score(x, eval_weights, scales, mins, best_d, cand_m, cand_Ls, cand_Lm);
+            if (err < best_err) {
+                best_err = err;
+                best_m = cand_m;
+                memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+                memcpy(best_Lm, cand_Lm, sizeof(best_Lm));
+            }
+        }
+
+        static const float local_scale[] = { 0.984375f, 1.0f, 1.015625f };
+        static const float local_awq[] = { 0.968750f, 0.984375f, 1.0f, 1.015625f, 1.031250f };
+        const float * local = mode == Q4_K_RSF_MODE_AWQ ? local_awq : local_scale;
+        const int nlocal = mode == Q4_K_RSF_MODE_AWQ ?
+            (int) (sizeof(local_awq) / sizeof(local_awq[0])) :
+            (int) (sizeof(local_scale) / sizeof(local_scale[0]));
+        for (int id = 0; id < nlocal; ++id) {
+            for (int im = 0; im < nlocal; ++im) {
+                const float cand_d = q4_K_rsf_f16(best_d * local[id]);
+                const float cand_m = q4_K_rsf_f16(best_m * local[im]);
+                const float err = q4_K_rsf_score(x, eval_weights, scales, mins, cand_d, cand_m, cand_Ls, cand_Lm);
+                if (err < best_err) {
+                    best_err = err;
+                    best_d = cand_d;
+                    best_m = cand_m;
+                    memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+                    memcpy(best_Lm, cand_Lm, sizeof(best_Lm));
+                }
+            }
+        }
+
+        q4_K_rsf_write(x, y + i, best_d, best_m, best_Ls, best_Lm);
+        x += QK_K;
+    }
+}
+
+size_t quantize_q4_K_rsf(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights, int32_t mode) {
+    size_t row_size = ggml_row_size(GGML_TYPE_Q4_K, n_per_row);
+    char * qrow = (char *) dst;
+    if (mode < Q4_K_RSF_MODE_SCALE || mode > Q4_K_RSF_MODE_SMOOTH) {
+        mode = Q4_K_RSF_MODE_SCALE;
+    }
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4_K_rsf_impl(src, (block_q4_K *) qrow, n_per_row, quant_weights, mode);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+static int q2_K_rsf_make_mul_pool(
+        float * GGML_RESTRICT pool,
+        int cap,
+        float base,
+        const float * GGML_RESTRICT values,
+        int mode) {
+    int n = 0;
+    static const float fixed_scale[] = {
+        0.750000f, 0.812500f, 0.875000f, 0.906250f, 0.937500f,
+        0.953125f, 0.968750f, 0.984375f, 1.000000f, 1.015625f,
+        1.031250f, 1.046875f, 1.062500f, 1.093750f, 1.125000f,
+        1.187500f, 1.250000f,
+    };
+    static const float fixed_awq[] = {
+        0.562500f, 0.625000f, 0.687500f, 0.750000f, 0.812500f,
+        0.875000f, 0.906250f, 0.937500f, 0.953125f, 0.968750f,
+        0.984375f, 1.000000f, 1.015625f, 1.031250f, 1.046875f,
+        1.062500f, 1.093750f, 1.125000f, 1.187500f, 1.250000f,
+        1.375000f, 1.500000f,
+    };
+    const float lo = mode == Q4_K_RSF_MODE_AWQ ? 0.5625f : 0.625f;
+    const float hi = mode == Q4_K_RSF_MODE_AWQ ? 1.75f   : 1.50f;
+    const float * fixed = mode == Q4_K_RSF_MODE_AWQ ? fixed_awq : fixed_scale;
+    const int nfixed = mode == Q4_K_RSF_MODE_AWQ ?
+        (int) (sizeof(fixed_awq) / sizeof(fixed_awq[0])) :
+        (int) (sizeof(fixed_scale) / sizeof(fixed_scale[0]));
+    for (int i = 0; i < nfixed; ++i) {
+        q4_K_rsf_add_mul(pool, &n, cap, fixed[i], lo, hi);
+    }
+    if (base > 0.0f && isfinite(base)) {
+        for (int j = 0; j < QK_K/16; ++j) {
+            const float target = values[j];
+            if (!(target > 0.0f) || !isfinite(target)) {
+                continue;
+            }
+            const int code = MIN(15, MAX(1, nearest_int(target / base)));
+            q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) code), lo, hi);
+            if (code > 1) {
+                q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) (code - 1)), lo, hi);
+            }
+            if (code < 15) {
+                q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) (code + 1)), lo, hi);
+            }
+        }
+    }
+    return n;
+}
+
+static float q2_K_rsf_score(
+        const float * GGML_RESTRICT x,
+        const float * GGML_RESTRICT weights,
+        const float * GGML_RESTRICT scales,
+        const float * GGML_RESTRICT mins,
+        float d_block,
+        float m_block,
+        uint8_t * GGML_RESTRICT out_Ls,
+        uint8_t * GGML_RESTRICT out_Lm) {
+    d_block = q4_K_rsf_f16(d_block);
+    m_block = q4_K_rsf_f16(m_block);
+    if (!(d_block >= 0.0f) || !isfinite(d_block)) {
+        d_block = 0.0f;
+    }
+    if (!(m_block >= 0.0f) || !isfinite(m_block)) {
+        m_block = 0.0f;
+    }
+
+    uint8_t Ls[QK_K/16];
+    uint8_t Lm[QK_K/16];
+    float sub_err[QK_K/16];
+    float sub_weight[QK_K/16];
+    float err = 0.0f;
+    for (int j = 0; j < QK_K/16; ++j) {
+        const int ls = d_block > 0.0f ? MIN(15, MAX(0, nearest_int(scales[j] / d_block))) : 0;
+        const int lm = m_block > 0.0f ? MIN(15, MAX(0, nearest_int(mins[j] / m_block))) : 0;
+        Ls[j] = (uint8_t) ls;
+        Lm[j] = (uint8_t) lm;
+
+        const float d = d_block * (float) ls;
+        const float m = m_block * (float) lm;
+        float cur_err = 0.0f;
+        float cur_weight = 0.0f;
+        for (int ii = 0; ii < 16; ++ii) {
+            const int k = 16*j + ii;
+            float q = -m;
+            if (d > 0.0f) {
+                int l = nearest_int((x[k] + m) / d);
+                l = MAX(0, MIN(3, l));
+                q = d * (float) l - m;
+            }
+            const float diff = q - x[k];
+            const float w = weights[k] > 0.0f && isfinite(weights[k]) ? weights[k] : 1.0f;
+            const float e = w * diff * diff;
+            cur_err += e;
+            cur_weight += w;
+        }
+        sub_err[j] = cur_err;
+        sub_weight[j] = cur_weight;
+        err += cur_err;
+    }
+
+    if (out_Ls) {
+        memcpy(out_Ls, Ls, sizeof(Ls));
+    }
+    if (out_Lm) {
+        memcpy(out_Lm, Lm, sizeof(Lm));
+    }
+    return qk_K_rsf_tail_aware_score(err, sub_err, sub_weight, QK_K/16, 0.0f, 0.0f);
+}
+
+static void q2_K_rsf_write(
+        const float * GGML_RESTRICT x,
+        block_q2_K * GGML_RESTRICT y,
+        float d_block,
+        float m_block,
+        const uint8_t * GGML_RESTRICT Ls,
+        const uint8_t * GGML_RESTRICT Lm) {
+    d_block = q4_K_rsf_f16(d_block);
+    m_block = q4_K_rsf_f16(m_block);
+    y->d    = GGML_FP32_TO_FP16(d_block);
+    y->dmin = GGML_FP32_TO_FP16(m_block);
+
+    uint8_t L[QK_K];
+    memset(L, 0, sizeof(L));
+    for (int j = 0; j < QK_K/16; ++j) {
+        y->scales[j] = (Ls[j] & 0x0f) | ((Lm[j] & 0x0f) << 4);
+        const float d = d_block * (float) (Ls[j] & 0x0f);
+        const float m = m_block * (float) (Lm[j] & 0x0f);
+        if (!(d > 0.0f)) {
+            continue;
+        }
+        for (int ii = 0; ii < 16; ++ii) {
+            int l = nearest_int((x[16*j + ii] + m) / d);
+            L[16*j + ii] = MAX(0, MIN(3, l));
+        }
+    }
+
+    for (int j = 0; j < QK_K; j += 128) {
+        for (int l = 0; l < 32; ++l) {
+            y->qs[j/4 + l] = L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6);
+        }
+    }
+}
+
+static void quantize_row_q2_K_rsf_impl(const float * GGML_RESTRICT x, block_q2_K * GGML_RESTRICT y, int64_t n_per_row, const float * GGML_RESTRICT quant_weights, int mode) {
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb = n_per_row / QK_K;
+
+    uint8_t L[QK_K];
+    uint8_t Laux[16];
+    uint8_t Ls[QK_K/16];
+    uint8_t Lm[QK_K/16];
+    uint8_t best_Ls[QK_K/16];
+    uint8_t best_Lm[QK_K/16];
+    float weights[16];
+    float eval_weights[QK_K];
+    float qw_rel[16];
+    float sw[QK_K/16];
+    float mins[QK_K/16];
+    float scales[QK_K/16];
+
+    for (int i = 0; i < nb; ++i) {
+        float sumx2 = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            sumx2 += x[j]*x[j];
+        }
+        const float sigma2 = sumx2/QK_K;
+        const float av_x = sqrtf(sigma2);
+
+        for (int j = 0; j < QK_K/16; ++j) {
+            if (quant_weights) {
+                const float * GGML_RESTRICT qw = quant_weights + QK_K * i + 16*j;
+                if (mode == Q4_K_RSF_MODE_AWQ || mode == Q4_K_RSF_MODE_SMOOTH) {
+                    float sum_qw = 0.0f;
+                    for (int l = 0; l < 16; ++l) {
+                        const float qwv = qw[l] > 0.0f && isfinite(qw[l]) ? qw[l] : 1.0f;
+                        qw_rel[l] = qwv;
+                        sum_qw += qwv;
+                    }
+                    const float mean_qw = sum_qw > 0.0f ? sum_qw / 16.0f : 1.0f;
+                    for (int l = 0; l < 16; ++l) {
+                        float rel = MAX(0.0625f, MIN(16.0f, qw_rel[l] / mean_qw));
+                        if (mode == Q4_K_RSF_MODE_AWQ) {
+                            rel = MIN(32.0f, rel * sqrtf(rel));
+                            const float mag = av_x > 0.0f ? MIN(8.0f, fabsf(x[16*j + l]) / av_x) : 0.0f;
+                            rel *= 1.0f + 0.20f * mag;
+                        } else {
+                            rel = sqrtf(rel);
+                        }
+                        weights[l] = rel * sqrtf(sigma2 + x[16*j + l]*x[16*j + l]);
+                        eval_weights[16*j + l] = weights[l];
+                    }
+                } else {
+                    for (int l = 0; l < 16; ++l) {
+                        weights[l] = qw[l] * sqrtf(sigma2 + x[16*j + l]*x[16*j + l]);
+                        eval_weights[16*j + l] = weights[l];
+                    }
+                }
+            } else {
+                for (int l = 0; l < 16; ++l) {
+                    weights[l] = av_x + fabsf(x[16*j + l]);
+                    eval_weights[16*j + l] = weights[l];
+                }
+            }
+            float sumw = 0.0f;
+            for (int l = 0; l < 16; ++l) {
+                sumw += weights[l];
+            }
+            sw[j] = sumw;
+            const int nstep = mode == Q4_K_RSF_MODE_AWQ ? 64 : 36;
+            scales[j] = make_qkx3_quants(16, 3, x + 16*j, weights, L + 16*j, &mins[j], Laux, -0.9f, 0.05f, nstep, false);
+        }
+
+        float d_block = q4_K_rsf_f16(make_qp_quants(QK_K/16, 15, scales, Ls, sw));
+        float m_block = q4_K_rsf_f16(make_qp_quants(QK_K/16, 15, mins,   Lm, sw));
+        float best_d = d_block;
+        float best_m = m_block;
+        float best_err = q2_K_rsf_score(x, eval_weights, scales, mins, best_d, best_m, best_Ls, best_Lm);
+
+        float d_pool[64];
+        float m_pool[64];
+        const int nd = q2_K_rsf_make_mul_pool(d_pool, (int) (sizeof(d_pool) / sizeof(d_pool[0])), d_block, scales, mode);
+        const int nm = q2_K_rsf_make_mul_pool(m_pool, (int) (sizeof(m_pool) / sizeof(m_pool[0])), m_block, mins, mode);
+
+        uint8_t cand_Ls[QK_K/16];
+        uint8_t cand_Lm[QK_K/16];
+        for (int id = 0; id < nd; ++id) {
+            const float cand_d = q4_K_rsf_f16(d_block * d_pool[id]);
+            const float err = q2_K_rsf_score(x, eval_weights, scales, mins, cand_d, best_m, cand_Ls, cand_Lm);
+            if (err < best_err) {
+                best_err = err;
+                best_d = cand_d;
+                memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+                memcpy(best_Lm, cand_Lm, sizeof(best_Lm));
+            }
+        }
+        for (int im = 0; im < nm; ++im) {
+            const float cand_m = q4_K_rsf_f16(m_block * m_pool[im]);
+            const float err = q2_K_rsf_score(x, eval_weights, scales, mins, best_d, cand_m, cand_Ls, cand_Lm);
+            if (err < best_err) {
+                best_err = err;
+                best_m = cand_m;
+                memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+                memcpy(best_Lm, cand_Lm, sizeof(best_Lm));
+            }
+        }
+
+        static const float local_scale[] = { 0.968750f, 0.984375f, 1.0f, 1.015625f, 1.031250f };
+        for (int id = 0; id < (int) (sizeof(local_scale) / sizeof(local_scale[0])); ++id) {
+            for (int im = 0; im < (int) (sizeof(local_scale) / sizeof(local_scale[0])); ++im) {
+                const float cand_d = q4_K_rsf_f16(best_d * local_scale[id]);
+                const float cand_m = q4_K_rsf_f16(best_m * local_scale[im]);
+                const float err = q2_K_rsf_score(x, eval_weights, scales, mins, cand_d, cand_m, cand_Ls, cand_Lm);
+                if (err < best_err) {
+                    best_err = err;
+                    best_d = cand_d;
+                    best_m = cand_m;
+                    memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+                    memcpy(best_Lm, cand_Lm, sizeof(best_Lm));
+                }
+            }
+        }
+
+        q2_K_rsf_write(x, y + i, best_d, best_m, best_Ls, best_Lm);
+        x += QK_K;
+    }
+}
+
+size_t quantize_q2_K_rsf(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights, int32_t mode) {
+    size_t row_size = ggml_row_size(GGML_TYPE_Q2_K, n_per_row);
+    char * qrow = (char *) dst;
+    if (mode < Q4_K_RSF_MODE_SCALE || mode > Q4_K_RSF_MODE_SMOOTH) {
+        mode = Q4_K_RSF_MODE_SCALE;
+    }
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q2_K_rsf_impl(src, (block_q2_K *) qrow, n_per_row, quant_weights, mode);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+static int q3_K_rsf_make_mul_pool(
+        float * GGML_RESTRICT pool,
+        int cap,
+        float base,
+        const float * GGML_RESTRICT values,
+        int mode) {
+    int n = 0;
+    static const float fixed_scale[] = {
+        0.750000f, 0.812500f, 0.875000f, 0.906250f, 0.937500f,
+        0.953125f, 0.968750f, 0.984375f, 1.000000f, 1.015625f,
+        1.031250f, 1.046875f, 1.062500f, 1.093750f, 1.125000f,
+        1.187500f, 1.250000f,
+    };
+    const float lo = mode == Q4_K_RSF_MODE_AWQ ? 0.625f : 0.6875f;
+    const float hi = mode == Q4_K_RSF_MODE_AWQ ? 1.625f : 1.375f;
+    for (int i = 0; i < (int) (sizeof(fixed_scale) / sizeof(fixed_scale[0])); ++i) {
+        q4_K_rsf_add_mul(pool, &n, cap, fixed_scale[i], lo, hi);
+    }
+    if (base != 0.0f && isfinite(base)) {
+        for (int j = 0; j < QK_K/16; ++j) {
+            const float target = values[j];
+            if (target == 0.0f || !isfinite(target)) {
+                continue;
+            }
+            int code = nearest_int(target / base);
+            code = MAX(-32, MIN(31, code));
+            if (code != 0) {
+                q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) code), lo, hi);
+            }
+            if (code > -32 && code - 1 != 0) {
+                q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) (code - 1)), lo, hi);
+            }
+            if (code < 31 && code + 1 != 0) {
+                q4_K_rsf_add_mul(pool, &n, cap, target / (base * (float) (code + 1)), lo, hi);
+            }
+        }
+    }
+    return n;
+}
+
+static float q3_K_rsf_score(
+        const float * GGML_RESTRICT x,
+        const float * GGML_RESTRICT weights,
+        const float * GGML_RESTRICT scales,
+        float d_block,
+        uint8_t * GGML_RESTRICT out_Ls) {
+    d_block = q4_K_rsf_f16(d_block);
+    if (!isfinite(d_block)) {
+        d_block = 0.0f;
+    }
+
+    uint8_t Ls[QK_K/16];
+    float sub_err[QK_K/16];
+    float sub_weight[QK_K/16];
+    float err = 0.0f;
+    for (int j = 0; j < QK_K/16; ++j) {
+        const int sc = d_block != 0.0f ? MAX(-32, MIN(31, nearest_int(scales[j] / d_block))) : 0;
+        Ls[j] = (uint8_t) (sc + 32);
+
+        const float d = d_block * (float) sc;
+        float cur_err = 0.0f;
+        float cur_weight = 0.0f;
+        for (int ii = 0; ii < 16; ++ii) {
+            const int k = 16*j + ii;
+            float q = 0.0f;
+            if (d != 0.0f) {
+                int l = nearest_int(x[k] / d);
+                l = MAX(-4, MIN(3, l));
+                q = d * (float) l;
+            }
+            const float diff = q - x[k];
+            const float w = weights[k] > 0.0f && isfinite(weights[k]) ? weights[k] : 1.0f;
+            const float e = w * diff * diff;
+            cur_err += e;
+            cur_weight += w;
+        }
+        sub_err[j] = cur_err;
+        sub_weight[j] = cur_weight;
+        err += cur_err;
+    }
+
+    if (out_Ls) {
+        memcpy(out_Ls, Ls, sizeof(Ls));
+    }
+    return qk_K_rsf_tail_aware_score(err, sub_err, sub_weight, QK_K/16, 0.32f, 0.18f);
+}
+
+static void q3_K_rsf_write(
+        const float * GGML_RESTRICT x,
+        block_q3_K * GGML_RESTRICT y,
+        float d_block,
+        const uint8_t * GGML_RESTRICT Ls) {
+    d_block = q4_K_rsf_f16(d_block);
+    y->d = GGML_FP32_TO_FP16(d_block);
+
+    memset(y->scales, 0, 12);
+    for (int j = 0; j < QK_K/16; ++j) {
+        int l = Ls[j] & 0x3f;
+        if (j < 8) {
+            y->scales[j] = l & 0x0f;
+        } else {
+            y->scales[j-8] |= ((l & 0x0f) << 4);
+        }
+        l >>= 4;
+        y->scales[j%4 + 8] |= (l << (2*(j/4)));
+    }
+
+    int8_t L[QK_K];
+    memset(L, 0, sizeof(L));
+    for (int j = 0; j < QK_K/16; ++j) {
+        const int sc = (int) (Ls[j] & 0x3f) - 32;
+        const float d = d_block * (float) sc;
+        if (d == 0.0f) {
+            continue;
+        }
+        for (int ii = 0; ii < 16; ++ii) {
+            int l = nearest_int(x[16*j + ii] / d);
+            l = MAX(-4, MIN(3, l));
+            L[16*j + ii] = l + 4;
+        }
+    }
+
+    memset(y->hmask, 0, QK_K/8);
+    int m = 0;
+    uint8_t hm = 1;
+    for (int j = 0; j < QK_K; ++j) {
+        if (L[j] > 3) {
+            y->hmask[m] |= hm;
+            L[j] -= 4;
+        }
+        if (++m == QK_K/8) {
+            m = 0;
+            hm <<= 1;
+        }
+    }
+    for (int j = 0; j < QK_K; j += 128) {
+        for (int l = 0; l < 32; ++l) {
+            y->qs[j/4 + l] = L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6);
+        }
+    }
+}
+
+static void quantize_row_q3_K_rsf_impl(const float * GGML_RESTRICT x, block_q3_K * GGML_RESTRICT y, int64_t n_per_row, const float * GGML_RESTRICT quant_weights, int mode) {
+    assert(n_per_row % QK_K == 0);
+    const int nb = n_per_row / QK_K;
+
+    int8_t L[QK_K];
+    int8_t scale_L[QK_K/16];
+    uint8_t best_Ls[QK_K/16];
+    uint8_t cand_Ls[QK_K/16];
+    float weight[16];
+    float eval_weights[QK_K];
+    float qw_rel[16];
+    float sw[QK_K/16];
+    float scales[QK_K/16];
+
+    for (int i = 0; i < nb; ++i) {
+        float sumx2 = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            sumx2 += x[j]*x[j];
+        }
+        const float sigma2 = 2*sumx2/QK_K;
+        const float av_x = sqrtf(sigma2);
+
+        for (int j = 0; j < QK_K/16; ++j) {
+            if (quant_weights) {
+                const float * qw = quant_weights + QK_K * i + 16*j;
+                if (mode == Q4_K_RSF_MODE_AWQ || mode == Q4_K_RSF_MODE_SMOOTH) {
+                    float sum_qw = 0.0f;
+                    for (int l = 0; l < 16; ++l) {
+                        const float qwv = qw[l] > 0.0f && isfinite(qw[l]) ? qw[l] : 1.0f;
+                        qw_rel[l] = qwv;
+                        sum_qw += qwv;
+                    }
+                    const float mean_qw = sum_qw > 0.0f ? sum_qw / 16.0f : 1.0f;
+                    for (int l = 0; l < 16; ++l) {
+                        float rel = MAX(0.0625f, MIN(16.0f, qw_rel[l] / mean_qw));
+                        if (mode == Q4_K_RSF_MODE_AWQ) {
+                            rel = MIN(32.0f, rel * sqrtf(rel));
+                            const float mag = av_x > 0.0f ? MIN(8.0f, fabsf(x[16*j + l]) / av_x) : 0.0f;
+                            rel *= 1.0f + 0.20f * mag;
+                        } else {
+                            rel = sqrtf(rel);
+                        }
+                        weight[l] = rel * sqrtf(sigma2 + x[16*j + l]*x[16*j + l]);
+                        eval_weights[16*j + l] = weight[l];
+                    }
+                } else {
+                    for (int l = 0; l < 16; ++l) {
+                        weight[l] = qw[l] * sqrtf(sigma2 + x[16*j+l]*x[16*j+l]);
+                        eval_weights[16*j + l] = weight[l];
+                    }
+                }
+            } else {
+                for (int l = 0; l < 16; ++l) {
+                    weight[l] = x[16*j+l]*x[16*j+l];
+                    eval_weights[16*j + l] = weight[l];
+                }
+            }
+            float sumw = 0.0f;
+            for (int l = 0; l < 16; ++l) {
+                sumw += weight[l];
+            }
+            sw[j] = sumw;
+            scales[j] = make_qx_quants(16, 4, x + 16*j, L + 16*j, 1, weight);
+        }
+
+        float d_block = q4_K_rsf_f16(make_qx_quants(QK_K/16, 32, scales, scale_L, 1, sw));
+        float best_d = d_block;
+        float best_err = q3_K_rsf_score(x, eval_weights, scales, best_d, best_Ls);
+
+        float d_pool[64];
+        const int nd = q3_K_rsf_make_mul_pool(d_pool, (int) (sizeof(d_pool) / sizeof(d_pool[0])), d_block, scales, mode);
+        for (int id = 0; id < nd; ++id) {
+            const float cand_d = q4_K_rsf_f16(d_block * d_pool[id]);
+            const float err = q3_K_rsf_score(x, eval_weights, scales, cand_d, cand_Ls);
+            if (err < best_err) {
+                best_err = err;
+                best_d = cand_d;
+                memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+            }
+        }
+
+        static const float local_scale[] = { 0.968750f, 0.984375f, 1.0f, 1.015625f, 1.031250f };
+        for (int id = 0; id < (int) (sizeof(local_scale) / sizeof(local_scale[0])); ++id) {
+            const float cand_d = q4_K_rsf_f16(best_d * local_scale[id]);
+            const float err = q3_K_rsf_score(x, eval_weights, scales, cand_d, cand_Ls);
+            if (err < best_err) {
+                best_err = err;
+                best_d = cand_d;
+                memcpy(best_Ls, cand_Ls, sizeof(best_Ls));
+            }
+        }
+
+        q3_K_rsf_write(x, y + i, best_d, best_Ls);
+        x += QK_K;
+    }
+}
+
+size_t quantize_q3_K_rsf(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights, int32_t mode) {
+    size_t row_size = ggml_row_size(GGML_TYPE_Q3_K, n_per_row);
+    char * qrow = (char *) dst;
+    if (mode < Q4_K_RSF_MODE_SCALE || mode > Q4_K_RSF_MODE_SMOOTH) {
+        mode = Q4_K_RSF_MODE_SCALE;
+    }
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q3_K_rsf_impl(src, (block_q3_K *) qrow, n_per_row, quant_weights, mode);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
 // ====================== 5-bit (de)-quantization
 
 void quantize_row_q5_K_ref(const float * GGML_RESTRICT x, block_q5_K * GGML_RESTRICT y, int64_t k) {

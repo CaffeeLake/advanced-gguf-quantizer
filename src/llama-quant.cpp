@@ -1818,6 +1818,18 @@ static size_t llama_tensor_quantize_impl(
         tensor_scale > 0.0f &&
         std::fabs(tensor_scale - 1.0f) > 1e-12f;
     const float inv_tensor_scale = normalize_native_tensor_scale_cpu ? (1.0f / tensor_scale) : 1.0f;
+    const int qk_rsf_mode = params != nullptr && params->q4_k_rsf ? std::max<int>(1, params->q4_k_rsf_mode) : 0;
+    const bool use_qk_rsf_cpu =
+        qk_rsf_mode > 0 &&
+        (new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_Q3_K || new_type == GGML_TYPE_Q4_K);
+    auto quantize_k_rsf = [new_type, n_per_row, imatrix, qk_rsf_mode](const float * src, void * dst, int64_t rows) -> size_t {
+        switch (new_type) {
+            case GGML_TYPE_Q2_K: return quantize_q2_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
+            case GGML_TYPE_Q3_K: return quantize_q3_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
+            case GGML_TYPE_Q4_K: return quantize_q4_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
+            default:             return 0;
+        }
+    };
 
     if (nthread < 2 || new_type == GGML_TYPE_MXFP6_E2M3) {
         size_t new_size = 0;
@@ -1827,9 +1839,13 @@ static size_t llama_tensor_quantize_impl(
 	            for (float & v : scaled) {
 	                v *= inv_tensor_scale;
 	            }
-	            new_size = ggml_quantize_chunk(new_type, scaled.data(), new_data, 0, nrows, n_per_row, imatrix);
+	            new_size = use_qk_rsf_cpu
+                    ? quantize_k_rsf(scaled.data(), new_data, nrows)
+                    : ggml_quantize_chunk(new_type, scaled.data(), new_data, 0, nrows, n_per_row, imatrix);
 	        } else {
-	            new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
+	            new_size = use_qk_rsf_cpu
+                    ? quantize_k_rsf(f32_data, new_data, nrows)
+                    : ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
 	        }
         if (new_type != GGML_TYPE_MXFP6_E2M3 && !ggml_validate_row_data(new_type, new_data, new_size)) {
             throw std::runtime_error("quantized data validation failed");
@@ -1842,7 +1858,7 @@ static size_t llama_tensor_quantize_impl(
     size_t new_size = 0;
     bool valid = true;
 	    auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
-	            nrows, n_per_row, imatrix, row_size, normalize_native_tensor_scale_cpu, inv_tensor_scale]() {
+	            nrows, n_per_row, imatrix, row_size, normalize_native_tensor_scale_cpu, inv_tensor_scale, use_qk_rsf_cpu, quantize_k_rsf]() {
         const int64_t nrows_per_chunk = chunk_size / n_per_row;
         size_t local_size = 0;
         std::vector<float> scaled_chunk;
@@ -1869,9 +1885,14 @@ static size_t llama_tensor_quantize_impl(
                     scaled_chunk[i] *= inv_tensor_scale;
                 }
 	                void * dst_chunk = (char *) new_data + first_row * row_size;
-	                this_size = ggml_quantize_chunk(new_type, scaled_chunk.data(), dst_chunk, 0, this_nrow, n_per_row, imatrix);
+                    this_size = use_qk_rsf_cpu
+                        ? quantize_k_rsf(scaled_chunk.data(), dst_chunk, this_nrow)
+                        : ggml_quantize_chunk(new_type, scaled_chunk.data(), dst_chunk, 0, this_nrow, n_per_row, imatrix);
 	            } else {
-	                this_size = ggml_quantize_chunk(new_type, f32_data, new_data, first_row * n_per_row, this_nrow, n_per_row, imatrix);
+	                void * dst_chunk = (char *) new_data + first_row * row_size;
+                    this_size = use_qk_rsf_cpu
+                        ? quantize_k_rsf(f32_data + first_row * n_per_row, dst_chunk, this_nrow)
+                        : ggml_quantize_chunk(new_type, f32_data, new_data, first_row * n_per_row, this_nrow, n_per_row, imatrix);
 	            }
             local_size += this_size;
 
@@ -4201,6 +4222,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.mixed_format_imatrix_power  =*/ -1.0f,
         /*.mixed_format_imatrix_min    =*/ -1.0f,
         /*.mixed_format_imatrix_max    =*/ -1.0f,
+        /*.q4_k_rsf                    =*/ false,
+        /*.q4_k_rsf_mode               =*/ 0,
     };
 
     return result;
