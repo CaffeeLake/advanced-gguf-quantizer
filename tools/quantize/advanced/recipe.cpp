@@ -192,6 +192,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "base.threads") { r.base.threads = parse_int_value(value); return; }
     if (path == "base.output_tensor_type") { r.base.output_tensor_type = sanitize_tensor_type_token(value); return; }
     if (path == "base.token_embedding_type") { r.base.token_embedding_type = sanitize_tensor_type_token(value); return; }
+    if (path == "base.mtp_tensor_type") { r.base.mtp_tensor_type = sanitize_tensor_type_token(value); return; }
     if (path == "base.dry_run") { r.base.dry_run = parse_bool_value(value); return; }
     if (path == "base.allow_requantize") { r.base.allow_requantize = parse_bool_value(value); return; }
     if (path == "base.leave_output_tensor") { r.base.leave_output_tensor = parse_bool_value(value); return; }
@@ -682,6 +683,10 @@ std::vector<std::string> validate_recipe(const Recipe & recipe, bool require_io)
     };
     check_tensor_type("base.output_tensor_type", recipe.base.output_tensor_type);
     check_tensor_type("base.token_embedding_type", recipe.base.token_embedding_type);
+    check_tensor_type("base.mtp_tensor_type", recipe.base.mtp_tensor_type);
+    if (lower_copy(sanitize_tensor_type_token(recipe.base.mtp_tensor_type)) == "nvfp4") {
+        errors.push_back("base.mtp_tensor_type must not be NVFP4; leave it blank to preserve source MTP tensors, or use Q8_0/BF16");
+    }
     const bool advanced_precision_quant =
         quant_type_uses_nvfp4(recipe.base.ftype) ||
         quant_type_uses_mxfp6(recipe.base.ftype) ||
@@ -770,6 +775,7 @@ std::string dump_recipe_toml(const Recipe & r) {
     }
     dump_string(out, "output_tensor_type", r.base.output_tensor_type);
     dump_string(out, "token_embedding_type", r.base.token_embedding_type);
+    dump_string(out, "mtp_tensor_type", r.base.mtp_tensor_type);
     dump_bool(out, "allow_requantize", r.base.allow_requantize);
     dump_bool(out, "leave_output_tensor", r.base.leave_output_tensor);
     dump_bool(out, "pure", r.base.pure);
@@ -1294,6 +1300,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_pair("--prune-layers", r.model.prune_layers);
     push_pair("--output-tensor-type", sanitize_tensor_type_token(r.base.output_tensor_type));
     push_pair("--token-embedding-type", sanitize_tensor_type_token(r.base.token_embedding_type));
+    push_pair("--mtp-tensor-type", sanitize_tensor_type_token(r.base.mtp_tensor_type));
     for (const std::string & item : r.metadata.overrides) {
         push_pair("--override-kv", item);
     }

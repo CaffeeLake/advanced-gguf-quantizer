@@ -119,7 +119,7 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
 
 [[noreturn]] void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
-    printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
+    printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--mtp-tensor-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--patch-base]\n");
     printf("       [--nvfp4-fast-quantize] [--nvfp4-selector-kld] [--nvfp4-selector-auto-rescue] [--dry-run]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
@@ -142,6 +142,8 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      use this ggml_type for the output.weight tensor\n");
     printf("  --token-embedding-type ggml_type\n");
     printf("                                      use this ggml_type for the token embeddings tensor\n");
+    printf("  --mtp-tensor-type ggml_type\n");
+    printf("                                      use this ggml_type for MTP/NextN tensors; default preserves source type. NVFP4 is refused for MTP.\n");
     printf("  --tensor-type tensor_name=ggml_type\n");
     printf("                                      quantize this tensor to this ggml_type\n");
     printf("                                      this is an advanced option to selectively quantize tensors. may be specified multiple times.\n");

@@ -92,7 +92,9 @@ decision visible.
 
 MTP and NextN metadata and tensors must be preserved unless a recipe explicitly
 states a different policy. The inspect report should show whether MTP/NextN was
-present in the source and present in the output.
+present in the source and present in the output. Use `--mtp-tensor-type` or
+`base.mtp_tensor_type` for deliberate MTP conversion; release MTP blocks should
+use source precision, `Q8_0`, or `BF16`, not `NVFP4`.
 
 ## Validation
 

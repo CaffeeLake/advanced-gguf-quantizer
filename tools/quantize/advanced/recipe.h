@@ -59,6 +59,7 @@ struct Recipe {
         int threads = 0;
         std::string output_tensor_type;
         std::string token_embedding_type;
+        std::string mtp_tensor_type;
         bool dry_run = false;
         bool allow_requantize = false;
         bool leave_output_tensor = false;

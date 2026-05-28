@@ -7438,6 +7438,19 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--mtp-tensor-type") == 0) {
+            if (arg_idx < argc-1) {
+                params.mtp_tensor_type = parse_ggml_type(argv[++arg_idx]);
+                if (params.mtp_tensor_type == GGML_TYPE_COUNT) {
+                    usage(argv[0]);
+                }
+                if (params.mtp_tensor_type == GGML_TYPE_NVFP4) {
+                    fprintf(stderr, "%s: --mtp-tensor-type NVFP4 is refused; use Q8_0 or BF16 for MTP/NextN tensors\n", __func__);
+                    usage(argv[0]);
+                }
+            } else {
+                usage(argv[0]);
+            }
         } else if (strcmp(argv[arg_idx], "--tensor-type") == 0) {
             if (arg_idx == argc-1 || !parse_tensor_type(argv[++arg_idx], tensor_type_opts)) {
                 usage(argv[0]);

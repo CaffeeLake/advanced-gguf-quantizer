@@ -435,7 +435,10 @@ std::vector<tui::MenuOption> shell_options_menu_options(const ShellState & state
         options.push_back({ step("MXFP6 scale refinement", mxfp6_ready), "", "mxfp6" });
     }
     options.push_back({ step("Tensor rules", !state.recipe.tensor_overrides.entries.empty() || !state.recipe.tensor_overrides.files.empty()), "", "tensor-rules" });
-    options.push_back({ step("Standard quantize options", !state.recipe.base.output_tensor_type.empty() || !state.recipe.base.token_embedding_type.empty()), "", "standard" });
+    options.push_back({ step("Standard quantize options",
+                !state.recipe.base.output_tensor_type.empty() ||
+                !state.recipe.base.token_embedding_type.empty() ||
+                !state.recipe.base.mtp_tensor_type.empty()), "", "standard" });
     options.push_back({ "Save config", "", "save" });
     options.push_back({ "Back", "", "back" });
     return options;

@@ -1040,6 +1040,7 @@ def case_nvfp4_options_prompt_pages(session: PtySession, case_dir: Path) -> None
         [
             "output.weight tensor type",
             "token embedding tensor type",
+            "MTP/NextN tensor type",
             "leave output.weight unquantized",
             "measure embeddings/output as candidates",
             "token embedding candidate types",

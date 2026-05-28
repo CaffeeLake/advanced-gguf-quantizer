@@ -46,6 +46,11 @@ Core inputs:
 - `io.output`: final GGUF path.
 - `base.ftype`: llama.cpp base quantization type when using stock fallback
   behavior.
+- `base.output_tensor_type`, `base.token_embedding_type`: optional explicit
+  output/head and token embedding tensor types.
+- `base.mtp_tensor_type`: optional explicit MTP/NextN tensor type. Leave blank
+  to preserve the source MTP block. Use `Q8_0` or `BF16` for release MTP
+  artifacts; `NVFP4` is refused for MTP/NextN.
 - `target.precision_mode`: `nvfp4`, `mxfp6`, `nvfp4_mxfp6`, or
   `mxfp6-primary`.
 - `target.target_bpw`: final bits-per-weight goal for mixed allocation.

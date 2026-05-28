@@ -722,6 +722,26 @@ static tensor_category tensor_get_category(const std::string & tensor_name) {
     return tensor_category::OTHER;
 }
 
+static bool tensor_name_is_mtp(const llama_model & model, const std::string & tensor_name) {
+    if (tensor_name.find(".nextn.") != std::string::npos ||
+            tensor_name.find("mtp") != std::string::npos) {
+        return true;
+    }
+
+    const uint32_t n_nextn = model.hparams.nextn_predict_layers;
+    if (n_nextn == 0 || model.hparams.n_layer <= n_nextn) {
+        return false;
+    }
+
+    int il = -1;
+    if (sscanf(tensor_name.c_str(), "blk.%d.", &il) != 1 || il < 0) {
+        return false;
+    }
+
+    const uint32_t n_main = model.hparams.n_layer - n_nextn;
+    return (uint32_t) il >= n_main && (uint32_t) il < model.hparams.n_layer;
+}
+
 static bool llama_tensor_has_aux_scale_slot(const std::string & tensor_name) {
     if (tensor_name_match_token_embd(tensor_name.c_str()) || tensor_name_match_output_weight(tensor_name.c_str())) {
         return false;
@@ -811,6 +831,7 @@ struct tensor_metadata {
     std::string     name;
     ggml_type       target_type;
     tensor_category category;
+    bool            is_mtp = false;
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
@@ -830,6 +851,19 @@ struct tensor_metadata {
     float           mxfp6_e2m3_scale_mul = 1.0f;
     std::string     mxfp6_policy_name;
 };
+
+static ggml_type tensor_type_avoid_nvfp4_mtp(
+        const ggml_tensor * tensor,
+        const tensor_metadata & tm,
+        ggml_type target_type,
+        const char * source) {
+    if (tm.is_mtp && target_type == GGML_TYPE_NVFP4 && tensor->type != GGML_TYPE_NVFP4) {
+        LLAMA_LOG_WARN("%s: %-36s - refusing %s NVFP4 for MTP/NextN; preserving source type %s\n",
+                __func__, tensor->name, source, ggml_type_name(tensor->type));
+        return tensor->type;
+    }
+    return target_type;
+}
 
 //
 // dequantization
@@ -3041,6 +3075,7 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
     for (auto & tm : metadata) {
         tensor_category cat = tensor_get_category(tm.name);
         tm.category = cat;
+        tm.is_mtp = tensor_name_is_mtp(qs.model, tm.name);
 
         if (category_is_attn_v(cat)) {
             ++qs.n_attention_wv;
@@ -3297,7 +3332,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].allows_quantization &&
             params->output_tensor_type < GGML_TYPE_COUNT &&
             metadata[i].category == tensor_category::OUTPUT;
-        const bool explicit_category_type = explicit_token_type || explicit_output_type;
+        const bool explicit_mtp_type =
+            metadata[i].allows_quantization &&
+            metadata[i].is_mtp &&
+            params->mtp_tensor_type < GGML_TYPE_COUNT;
+        const bool protected_mtp_type = metadata[i].is_mtp;
+        const bool explicit_category_type = explicit_token_type || explicit_output_type || explicit_mtp_type || protected_mtp_type;
 
         const llama_model_loader::llama_tensor_weight * patch_weight =
             patch_ml ? patch_ml->get_weight(name.c_str()) : nullptr;
@@ -3306,7 +3346,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             patch_weight->tensor != nullptr &&
             ggml_are_same_shape(patch_weight->tensor, tensor);
 
-        if (manual_type != GGML_TYPE_COUNT) {
+        if (explicit_mtp_type) {
+            metadata[i].target_type = tensor_type_fallback(qs, tensor, params->mtp_tensor_type);
+            metadata[i].target_type = tensor_type_avoid_nvfp4_mtp(tensor, metadata[i], metadata[i].target_type, "--mtp-tensor-type");
+        } else if (metadata[i].is_mtp && manual_type == GGML_TYPE_NVFP4) {
+            metadata[i].target_type = tensor_type_avoid_nvfp4_mtp(tensor, metadata[i], manual_type, "manual");
+        } else if (metadata[i].is_mtp && manual_type == GGML_TYPE_COUNT) {
+            metadata[i].target_type = tensor->type;
+        } else if (manual_type != GGML_TYPE_COUNT) {
             metadata[i].target_type = tensor_type_fallback(qs, tensor, manual_type);
         } else if (explicit_token_type) {
             metadata[i].target_type = tensor_type_fallback(qs, tensor, params->token_embedding_type);
@@ -3319,6 +3366,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         } else {
             metadata[i].target_type = tensor->type;
         }
+        metadata[i].target_type = tensor_type_avoid_nvfp4_mtp(tensor, metadata[i], metadata[i].target_type, "selected");
         metadata[i].target_type = tensor_type_avoid_nvfp4_token_embedding(qs, tensor, metadata[i], metadata[i].target_type);
 
         if (params->imatrix) {
@@ -3372,6 +3420,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (!params->dry_run &&
             ml.use_mmap &&
             manual_type == GGML_TYPE_COUNT &&
+            !explicit_category_type &&
             tensor->type == GGML_TYPE_BF16 &&
             metadata[i].target_type == tensor->type &&
             metadata[i].allows_quantization &&
@@ -3536,6 +3585,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     << ",\"target_bytes\":" << dst_bytes
                     << ",\"split\":" << (params->keep_split ? tensors[i]->idx : 0)
                     << ",\"allows_quantization\":" << (tm.allows_quantization ? "true" : "false")
+                    << ",\"is_mtp\":" << (tm.is_mtp ? "true" : "false")
                     << ",\"copy_from_patch\":" << (tm.copy_from_patch ? "true" : "false")
                     << ",\"requires_imatrix\":" << (tm.requires_imatrix ? "true" : "false")
                     << ",\"has_nvfp4_aux\":" << (nvfp4_aux_tensors.find(tm.name) != nvfp4_aux_tensors.end() ? "true" : "false")
@@ -4120,6 +4170,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.ftype                       =*/ LLAMA_FTYPE_MOSTLY_Q8_0,
         /*.output_tensor_type          =*/ GGML_TYPE_COUNT,
         /*.token_embedding_type        =*/ GGML_TYPE_COUNT,
+        /*.mtp_tensor_type             =*/ GGML_TYPE_COUNT,
         /*.allow_requantize            =*/ false,
         /*.quantize_output_tensor      =*/ true,
         /*.only_copy                   =*/ false,
