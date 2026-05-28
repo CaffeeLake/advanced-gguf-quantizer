@@ -7431,7 +7431,7 @@ static bool nvfp4_selector_choose_policy(
     const std::string rescue_tensor_types_file = quantize_control_string("LLAMA_NVFP4_SELECTOR_RESCUE_TENSOR_TYPES_FILE");
     if (out_tensor_overrides) {
         out_tensor_overrides->clear();
-        if (nvfp4_selector_policy_is_rsf_family(*best_it)) {
+        if (out_name != "seed_keep" && !all_bindings.empty()) {
             out_tensor_overrides->reserve(out_tensor_overrides->size() + all_bindings.size());
             for (const auto & b : all_bindings) {
                 tensor_type_option opt;
@@ -7443,10 +7443,11 @@ static bool nvfp4_selector_choose_policy(
                 out_tensor_overrides->push_back(std::move(opt));
             }
             fprintf(stderr,
-                "%s: selector materialization added %zu exact NVFP4 RSF override(s) for policy=%s\n",
+                "%s: selector materialization added %zu exact NVFP4 override(s) for policy=%s%s\n",
                 __func__,
                 all_bindings.size(),
-                best_it->name.c_str());
+                best_it->name.c_str(),
+                nvfp4_selector_policy_is_rsf_family(*best_it) ? " (RSF)" : "");
         }
     }
     if (rescue_report_top > 0 || rescue_apply_top > 0) {
