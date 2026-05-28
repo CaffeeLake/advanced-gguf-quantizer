@@ -208,6 +208,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "calibration.ctx_size") { r.calibration.ctx_size = value; return; }
     if (path == "calibration.batch_size") { r.calibration.batch_size = value; return; }
     if (path == "calibration.ubatch_size") { r.calibration.ubatch_size = value; return; }
+    if (path == "calibration.n_gpu_layers") { r.calibration.n_gpu_layers = value; return; }
     if (path == "calibration.threads") { r.calibration.threads = value; return; }
     if (path == "calibration.threads_batch") { r.calibration.threads_batch = value; return; }
     if (path == "calibration.chunks") { r.calibration.chunks = value; return; }
@@ -787,6 +788,7 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "ctx_size", r.calibration.ctx_size);
     dump_string(out, "batch_size", r.calibration.batch_size);
     dump_string(out, "ubatch_size", r.calibration.ubatch_size);
+    dump_string(out, "n_gpu_layers", r.calibration.n_gpu_layers);
     dump_string(out, "threads", r.calibration.threads);
     dump_string(out, "threads_batch", r.calibration.threads_batch);
     dump_string(out, "chunks", r.calibration.chunks);

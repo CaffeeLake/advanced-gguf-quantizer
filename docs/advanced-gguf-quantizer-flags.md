@@ -57,6 +57,9 @@ Calibration:
 - `calibration.imatrix`: imatrix file used for activation-aware scaling.
 - `calibration.ctx_size`, `calibration.batch_size`, and
   `calibration.ubatch_size`: calibration shape.
+- `calibration.n_gpu_layers`: optional `llama-imatrix -ngl` value for imatrix
+  generation. Leave blank for the tool default, or use `auto`, `all`, or a
+  layer count when you deliberately want to control calibration offload.
 
 Evaluation:
 

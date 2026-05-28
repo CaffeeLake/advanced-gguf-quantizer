@@ -81,6 +81,7 @@ struct Recipe {
         std::string ctx_size;
         std::string batch_size = "2048";
         std::string ubatch_size = "1024";
+        std::string n_gpu_layers;
         std::string threads;
         std::string threads_batch;
         std::string chunks;

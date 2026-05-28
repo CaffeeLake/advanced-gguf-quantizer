@@ -29,6 +29,7 @@ Recipe fields:
 - `calibration.ctx_size`
 - `calibration.batch_size`
 - `calibration.ubatch_size`
+- `calibration.n_gpu_layers`
 
 You can print the matching command from a recipe:
 

@@ -735,6 +735,7 @@ static std::string imatrix_command_shell(const bq::Recipe & recipe) {
     const std::string ctx_size = recipe.calibration.ctx_size;
     const std::string batch_size = recipe.calibration.batch_size;
     const std::string ubatch_size = recipe.calibration.ubatch_size.empty() ? batch_size : recipe.calibration.ubatch_size;
+    const std::string n_gpu_layers = recipe.calibration.n_gpu_layers;
     std::vector<std::string> args;
     args.push_back(recipe.calibration.imatrix_bin.empty() ? "llama-imatrix" : recipe.calibration.imatrix_bin);
     args.push_back("-m");
@@ -762,6 +763,10 @@ static std::string imatrix_command_shell(const bq::Recipe & recipe) {
     if (!ubatch_size.empty()) {
         args.push_back("-ub");
         args.push_back(ubatch_size);
+    }
+    if (!n_gpu_layers.empty()) {
+        args.push_back("-ngl");
+        args.push_back(n_gpu_layers);
     }
     if (!recipe.calibration.chunks.empty()) {
         args.push_back("--chunks");
@@ -2621,6 +2626,8 @@ private:
 };
 
 static std::string shell_prompt_command(const bq::tui::TerminalCapabilities & caps, const std::string & prefix = "") {
+    bq::tui::print(std::cout, bq::tui::render_branded_header(bq::shell_product(), caps));
+    bq::tui::print(std::cout, bq::tui::render_section_header("Command", "", caps));
     bq::tui::InputPrompt input;
     input.label = "Command";
     input.value = prefix;
@@ -2723,6 +2730,63 @@ static void shell_begin_page(const ShellState & state, const std::string & title
     shell_clear(caps);
     shell_print_status(state, caps);
     bq::tui::print(std::cout, bq::tui::render_section_header(title, "", caps));
+}
+
+static std::string shell_prompt_on_page(
+        const ShellState & state,
+        const std::string & title,
+        const std::string & label,
+        const std::string & fallback = "") {
+    shell_begin_page(state, title);
+    return prompt(label, fallback);
+}
+
+static double shell_prompt_double_on_page(
+        const ShellState & state,
+        const std::string & title,
+        const std::string & label,
+        double fallback) {
+    std::ostringstream ss;
+    ss << std::setprecision(10) << fallback;
+    const std::string value = shell_prompt_on_page(state, title, label, ss.str());
+    if (value.empty()) {
+        return fallback;
+    }
+    return std::stod(value);
+}
+
+static int shell_prompt_int_on_page(
+        const ShellState & state,
+        const std::string & title,
+        const std::string & label,
+        int fallback) {
+    const std::string value = shell_prompt_on_page(state, title, label, std::to_string(fallback));
+    if (value.empty()) {
+        return fallback;
+    }
+    return std::stoi(value);
+}
+
+static bool shell_prompt_bool_on_page(
+        const ShellState & state,
+        const std::string & title,
+        const std::string & label,
+        bool fallback) {
+    while (true) {
+        const std::string value = shell_prompt_on_page(state, title, label + " (y/n)", fallback ? "y" : "n");
+        if (value.empty()) {
+            return fallback;
+        }
+        const char c = (char) std::tolower((unsigned char) value.front());
+        if (c == 'y' || c == '1' || c == 't') {
+            return true;
+        }
+        if (c == 'n' || c == '0' || c == 'f') {
+            return false;
+        }
+        std::cout << " Enter Y or N. ESC to cancel.\n";
+        shell_pause(bq::tui::detect_terminal(stdout));
+    }
 }
 
 static bool shell_handle_command(ShellState & state, std::string line, const bq::tui::TerminalCapabilities & caps);
@@ -3742,15 +3806,15 @@ static void shell_print_project_overview(const ShellState & state);
 
 
 static void shell_record_metrics(ShellState & state) {
-    shell_begin_page(state, "Project > Evaluation and Best Candidates > Record Metrics");
-    state.project_path = prompt("project path", state.project_path.empty() ? default_project_path() : state.project_path);
-    const std::string variant = prompt("variant id", state.variant);
-    const std::string ppl = prompt("PPL", "");
-    const std::string mean_kld = prompt("mean KLD", "");
-    const std::string p99_kld = prompt("p99 KLD", "");
-    const std::string p999_kld = prompt("p999 KLD", "");
-    const std::string max_kld = prompt("max KLD", "");
-    const std::string bpw = prompt("BPW", "");
+    const std::string title = "Project > Evaluation and Best Candidates > Record Metrics";
+    state.project_path = shell_prompt_on_page(state, title, "project path", state.project_path.empty() ? default_project_path() : state.project_path);
+    const std::string variant = shell_prompt_on_page(state, title, "variant id", state.variant);
+    const std::string ppl = shell_prompt_on_page(state, title, "PPL", "");
+    const std::string mean_kld = shell_prompt_on_page(state, title, "mean KLD", "");
+    const std::string p99_kld = shell_prompt_on_page(state, title, "p99 KLD", "");
+    const std::string p999_kld = shell_prompt_on_page(state, title, "p999 KLD", "");
+    const std::string max_kld = shell_prompt_on_page(state, title, "max KLD", "");
+    const std::string bpw = shell_prompt_on_page(state, title, "BPW", "");
     auto metric_value = [](const std::string & value) {
         return value.empty() ? std::string("null") : value;
     };
@@ -3779,9 +3843,9 @@ static std::string default_metrics_export_path(const std::string & project_path)
 
 static void shell_project_best(ShellState & state, std::string metrics_path = {}) {
     if (metrics_path.empty()) {
-        shell_begin_page(state, "Project > Evaluation and Best Candidates");
-        state.project_path = prompt("project path", state.project_path.empty() ? default_project_path() : state.project_path);
-        metrics_path = prompt("metrics export path", default_metrics_export_path(state.project_path));
+        const std::string title = "Project > Evaluation and Best Candidates";
+        state.project_path = shell_prompt_on_page(state, title, "project path", state.project_path.empty() ? default_project_path() : state.project_path);
+        metrics_path = shell_prompt_on_page(state, title, "metrics export path", default_metrics_export_path(state.project_path));
         std::ofstream out(metrics_path);
         if (!out) {
             throw std::runtime_error("failed to write " + metrics_path);
@@ -3812,6 +3876,7 @@ static void shell_project_best(ShellState & state, std::string metrics_path = {}
 
 static void shell_inspect_model(ShellState & state, std::string model = {}) {
     if (model.empty()) {
+        shell_begin_page(state, "Inspect GGUF");
         model = prompt("GGUF path", !state.output_model.empty() ? state.output_model : state.input_model);
     }
     if (model.empty()) {
@@ -4309,17 +4374,20 @@ static void shell_configure_kld_files(ShellState & state) {
         if (!corpus.empty()) {
             state.recipe.evaluation.corpus = corpus;
         }
-        state.recipe.evaluation.kld_base = prompt("KLD base output", default_kld_base_path(state.recipe));
+        const std::string title = choice == 1 ?
+            "Project > Options > Quality Inputs > Make KLD Base" :
+            "Project > Options > Quality Inputs > Eval Bundle";
+        state.recipe.evaluation.kld_base = shell_prompt_on_page(state, title, "KLD base output", default_kld_base_path(state.recipe));
         std::error_code ec;
         const auto free_bytes = std::filesystem::space(std::filesystem::path(state.recipe.evaluation.kld_base).parent_path().empty() ?
                 std::filesystem::path(".") : std::filesystem::path(state.recipe.evaluation.kld_base).parent_path(), ec).available;
         if (!ec) {
             std::cout << "available disk near KLD output: " << mib_string(free_bytes) << " MiB\n";
         }
-        state.recipe.evaluation.perplexity_bin = prompt("perplexity executable", state.recipe.evaluation.perplexity_bin);
+        state.recipe.evaluation.perplexity_bin = shell_prompt_on_page(state, title, "perplexity executable", state.recipe.evaluation.perplexity_bin);
         state.recipe.selector.kld = state.recipe.evaluation.kld_base;
         if (choice == 4) {
-            state.recipe.evaluation.bundle = prompt("eval bundle path", state.recipe.evaluation.bundle);
+            state.recipe.evaluation.bundle = shell_prompt_on_page(state, title, "eval bundle path", state.recipe.evaluation.bundle);
         }
         const std::string command = kld_base_command_shell(state.recipe);
         if (!command.empty()) {
@@ -4345,16 +4413,18 @@ static void shell_configure_kld_files(ShellState & state) {
         if (!corpus.empty()) {
             state.recipe.calibration.corpus = corpus;
         }
-        state.recipe.calibration.imatrix = prompt("imatrix output", default_imatrix_path(state.recipe));
-        state.recipe.calibration.imatrix_bin = prompt("llama-imatrix executable", state.recipe.calibration.imatrix_bin);
+        const std::string title = "Project > Options > Quality Inputs > Make Imatrix";
+        state.recipe.calibration.imatrix = shell_prompt_on_page(state, title, "imatrix output", default_imatrix_path(state.recipe));
+        state.recipe.calibration.imatrix_bin = shell_prompt_on_page(state, title, "llama-imatrix executable", state.recipe.calibration.imatrix_bin);
         const std::string default_threads = std::to_string(state.recipe.base.threads > 0 ? state.recipe.base.threads : default_worker_threads());
-        state.recipe.calibration.threads = prompt("CPU threads", state.recipe.calibration.threads.empty() ? default_threads : state.recipe.calibration.threads);
-        state.recipe.calibration.threads_batch = prompt("CPU batch/collector threads", state.recipe.calibration.threads_batch.empty() ? state.recipe.calibration.threads : state.recipe.calibration.threads_batch);
-        state.recipe.calibration.ctx_size = prompt("imatrix context size", state.recipe.calibration.ctx_size);
-        state.recipe.calibration.batch_size = prompt("imatrix batch size", state.recipe.calibration.batch_size);
-        state.recipe.calibration.ubatch_size = prompt("imatrix ubatch size", state.recipe.calibration.ubatch_size);
-        state.recipe.calibration.chunks = prompt("chunks to process (blank = full corpus)", state.recipe.calibration.chunks);
-        state.recipe.calibration.extra_args = prompt("extra llama-imatrix args", state.recipe.calibration.extra_args);
+        state.recipe.calibration.threads = shell_prompt_on_page(state, title, "CPU threads", state.recipe.calibration.threads.empty() ? default_threads : state.recipe.calibration.threads);
+        state.recipe.calibration.threads_batch = shell_prompt_on_page(state, title, "CPU batch/collector threads", state.recipe.calibration.threads_batch.empty() ? state.recipe.calibration.threads : state.recipe.calibration.threads_batch);
+        state.recipe.calibration.ctx_size = shell_prompt_on_page(state, title, "imatrix context size", state.recipe.calibration.ctx_size);
+        state.recipe.calibration.batch_size = shell_prompt_on_page(state, title, "imatrix batch size", state.recipe.calibration.batch_size);
+        state.recipe.calibration.ubatch_size = shell_prompt_on_page(state, title, "imatrix ubatch size", state.recipe.calibration.ubatch_size);
+        state.recipe.calibration.n_gpu_layers = shell_prompt_on_page(state, title, "imatrix GPU layers (auto/all/N)", state.recipe.calibration.n_gpu_layers);
+        state.recipe.calibration.chunks = shell_prompt_on_page(state, title, "chunks to process (blank = full corpus)", state.recipe.calibration.chunks);
+        state.recipe.calibration.extra_args = shell_prompt_on_page(state, title, "extra llama-imatrix args", state.recipe.calibration.extra_args);
         const std::string command = imatrix_command_shell(state.recipe);
         if (!command.empty()) {
             std::cout << "\nimatrix command:\n  " << command << "\n";
@@ -4406,14 +4476,17 @@ static void shell_configure_target_budget(ShellState & state) {
     const std::vector<int> vram_values = { 8, 12, 16, 24, 32, 0, 0 };
     int vram_gb = vram_values[vram_idx];
     if (vram_idx == 5) {
-        shell_begin_page(state, "Project > Options > Target BPW / VRAM");
-        vram_gb = prompt_int("Custom VRAM target in GB", state.recipe.target.vram_gb > 0 ? state.recipe.target.vram_gb : 24);
+        vram_gb = shell_prompt_int_on_page(
+            state,
+            "Project > Options > Target BPW / VRAM",
+            "Custom VRAM target in GB",
+            state.recipe.target.vram_gb > 0 ? state.recipe.target.vram_gb : 24);
     }
 
-    shell_begin_page(state, "Project > Options > Target BPW / VRAM");
-    const double target_bpw = prompt_double("Target final average BPW (0 = derive from VRAM)", state.recipe.target.target_bpw);
-    const double kv_cache_gib = prompt_double("KV/cache reserve GiB", state.recipe.target.kv_cache_gib);
-    const double activation_headroom_gib = prompt_double("activation/headroom reserve GiB", state.recipe.target.activation_headroom_gib);
+    const std::string title = "Project > Options > Target BPW / VRAM";
+    const double target_bpw = shell_prompt_double_on_page(state, title, "Target final average BPW (0 = derive from VRAM)", state.recipe.target.target_bpw);
+    const double kv_cache_gib = shell_prompt_double_on_page(state, title, "KV/cache reserve GiB", state.recipe.target.kv_cache_gib);
+    const double activation_headroom_gib = shell_prompt_double_on_page(state, title, "activation/headroom reserve GiB", state.recipe.target.activation_headroom_gib);
 
     const bq::Recipe::Io io = state.recipe.io;
     const bq::Recipe::Base base = state.recipe.base;
@@ -4466,9 +4539,9 @@ static void shell_configure_target_budget(ShellState & state) {
 }
 
 static void shell_configure_nvfp4_46_autotune(ShellState & state) {
-    shell_begin_page(state, "Project > Options > NVFP4 4/6 and Autotune");
-    state.recipe.nvfp4.preset = prompt("NVFP4 preset", state.recipe.nvfp4.preset);
-    state.recipe.nvfp4.cfg = prompt("raw NVFP4 cfg override", state.recipe.nvfp4.cfg);
+    const std::string title = "Project > Options > NVFP4 4/6 and Autotune";
+    state.recipe.nvfp4.preset = shell_prompt_on_page(state, title, "NVFP4 preset", state.recipe.nvfp4.preset);
+    state.recipe.nvfp4.cfg = shell_prompt_on_page(state, title, "raw NVFP4 cfg override", state.recipe.nvfp4.cfg);
     const int mode = shell_submenu_select(state, "Project > Options > NVFP4 4/6 > Lane Selection", {
         "Adaptive",
         "Force 4-bit lanes",
@@ -4486,18 +4559,21 @@ static void shell_configure_nvfp4_46_autotune(ShellState & state) {
     } else if (mode == 2) {
         state.recipe.nvfp4.four_six.choose46 = "force_m6";
     }
-    state.recipe.nvfp4.four_six.refit_iters = prompt("4/6 refit iterations", state.recipe.nvfp4.four_six.refit_iters);
-    state.recipe.nvfp4.four_six.compand = prompt("4/6 companding enabled (0/1)", state.recipe.nvfp4.four_six.compand);
-    state.recipe.nvfp4.four_six.cap6 = prompt("6-bit lane cap", state.recipe.nvfp4.four_six.cap6);
-    state.recipe.nvfp4.four_six.cap4 = prompt("4-bit lane cap", state.recipe.nvfp4.four_six.cap4);
-    state.recipe.nvfp4.correction_denom = prompt("NVFP4 scale correction denominator", state.recipe.nvfp4.correction_denom);
-    state.recipe.nvfp4.input_scale_policy = prompt("input scale policy", state.recipe.nvfp4.input_scale_policy);
-    state.recipe.nvfp4.autotune.max_blocks = prompt("autotune max sample blocks", state.recipe.nvfp4.autotune.max_blocks);
-    state.recipe.nvfp4.autotune.threads = prompt("autotune CPU threads", state.recipe.nvfp4.autotune.threads);
-    state.recipe.nvfp4.calibration_families = split_type_csv(prompt(
+    const std::string params_title = "Project > Options > NVFP4 4/6 and Autotune > Parameters";
+    state.recipe.nvfp4.four_six.refit_iters = shell_prompt_on_page(state, params_title, "4/6 refit iterations", state.recipe.nvfp4.four_six.refit_iters);
+    state.recipe.nvfp4.four_six.compand = shell_prompt_on_page(state, params_title, "4/6 companding enabled (0/1)", state.recipe.nvfp4.four_six.compand);
+    state.recipe.nvfp4.four_six.cap6 = shell_prompt_on_page(state, params_title, "6-bit lane cap", state.recipe.nvfp4.four_six.cap6);
+    state.recipe.nvfp4.four_six.cap4 = shell_prompt_on_page(state, params_title, "4-bit lane cap", state.recipe.nvfp4.four_six.cap4);
+    state.recipe.nvfp4.correction_denom = shell_prompt_on_page(state, params_title, "NVFP4 scale correction denominator", state.recipe.nvfp4.correction_denom);
+    state.recipe.nvfp4.input_scale_policy = shell_prompt_on_page(state, params_title, "input scale policy", state.recipe.nvfp4.input_scale_policy);
+    state.recipe.nvfp4.autotune.max_blocks = shell_prompt_on_page(state, params_title, "autotune max sample blocks", state.recipe.nvfp4.autotune.max_blocks);
+    state.recipe.nvfp4.autotune.threads = shell_prompt_on_page(state, params_title, "autotune CPU threads", state.recipe.nvfp4.autotune.threads);
+    state.recipe.nvfp4.calibration_families = split_type_csv(shell_prompt_on_page(
+        state,
+        params_title,
         "calibration/search families",
         join_type_csv(state.recipe.nvfp4.calibration_families)));
-    state.recipe.nvfp4.scale_tie = prompt("scale/group tie policy", state.recipe.nvfp4.scale_tie);
+    state.recipe.nvfp4.scale_tie = shell_prompt_on_page(state, params_title, "scale/group tie policy", state.recipe.nvfp4.scale_tie);
     shell_remember_recipe(state, state.last_recipe, state.recipe);
     state.status = "NVFP4 autotune updated";
 }
@@ -4639,14 +4715,18 @@ static void shell_configure_native_techniques(ShellState & state) {
             state.recipe.nvfp4.scale_tie = grouped ? "none" : "qkv_gate_up_expert";
         } else if (choice == 12) {
             state.recipe.autotune.policy_set = "manual";
-            shell_begin_page(state, "Project > Options > Native Technique Families > Manual");
-            state.recipe.stock_ftype.technique_candidates = split_type_csv(prompt(
+            const std::string title = "Project > Options > Native Technique Families > Manual";
+            state.recipe.stock_ftype.technique_candidates = split_type_csv(shell_prompt_on_page(
+                state,
+                title,
                 "technique candidates",
                 join_type_csv(state.recipe.stock_ftype.technique_candidates)));
-            state.recipe.nvfp4.calibration_families = split_type_csv(prompt(
+            state.recipe.nvfp4.calibration_families = split_type_csv(shell_prompt_on_page(
+                state,
+                title,
                 "calibration/search families",
                 join_type_csv(state.recipe.nvfp4.calibration_families)));
-            state.recipe.nvfp4.scale_tie = prompt("scale/group tie policy", state.recipe.nvfp4.scale_tie);
+            state.recipe.nvfp4.scale_tie = shell_prompt_on_page(state, title, "scale/group tie policy", state.recipe.nvfp4.scale_tie);
         }
     }
 }
@@ -4687,82 +4767,82 @@ static void shell_configure_candidate_search(ShellState & state) {
         return;
     }
 
-    shell_begin_page(state, "Project > Options > Candidate Search");
+    const std::string title = "Project > Options > Candidate Search";
     state.recipe.autotune.enabled = false;
-    state.recipe.selector.kld = prompt("KLD base file", state.recipe.selector.kld.empty() ? state.recipe.evaluation.kld_base : state.recipe.selector.kld);
-    state.recipe.selector.checkpoint_model = prompt("candidate search checkpoint GGUF", state.recipe.selector.checkpoint_model);
-    state.recipe.selector.cache_dir = prompt("checkpoint cache directory", state.recipe.selector.cache_dir);
-    state.recipe.selector.skip_file = prompt("skip remaining tuning request file", state.recipe.selector.skip_file);
-    state.recipe.selector.effort = prompt("effort label", state.recipe.selector.effort);
-    state.recipe.selector.chunks = prompt("KLD chunks to score", state.recipe.selector.chunks);
-    state.recipe.selector.chunk_start = prompt("KLD chunk start", state.recipe.selector.chunk_start);
-    state.recipe.selector.holdout_chunks = prompt("validation chunks", state.recipe.selector.holdout_chunks);
-    state.recipe.selector.holdout_start = prompt("validation start", state.recipe.selector.holdout_start);
-    state.recipe.selector.stagea_sample_blocks = prompt("stage A sample blocks", state.recipe.selector.stagea_sample_blocks);
-    state.recipe.selector.stagea_max_policies = prompt("stage A max policies", state.recipe.selector.stagea_max_policies);
-    state.recipe.selector.refine_top = prompt("refine top policies", state.recipe.selector.refine_top);
-    state.recipe.selector.refine_budget = prompt("refine budget", state.recipe.selector.refine_budget);
-    state.recipe.selector.survey_top = prompt("survey top tensors", state.recipe.selector.survey_top);
-    state.recipe.selector.survey_sample_blocks = prompt("survey sample blocks", state.recipe.selector.survey_sample_blocks);
-    state.recipe.selector.max_tensors = prompt("max tensors to search", state.recipe.selector.max_tensors);
-    state.recipe.selector.eval_top = prompt("full PPL/KLD candidates", state.recipe.selector.eval_top);
-    state.recipe.selector.eval_chunks = prompt("full PPL/KLD chunks", state.recipe.selector.eval_chunks);
-    state.recipe.selector.n_seq = prompt("eval sequences", state.recipe.selector.n_seq);
-    state.recipe.selector.policy_threads = prompt("policy search threads", state.recipe.selector.policy_threads);
-    state.recipe.selector.threads = prompt("selector threads", state.recipe.selector.threads);
-    state.recipe.selector.kld_threads = prompt("PPL/KLD host reduction threads", state.recipe.selector.kld_threads.empty() ? state.recipe.selector.threads : state.recipe.selector.kld_threads);
-    state.recipe.selector.keep_checkpoint = prompt_bool("keep generated checkpoint", state.recipe.selector.keep_checkpoint);
-    state.recipe.selector.require_runtime_cache = prompt_bool("require resident tensor cache", state.recipe.selector.require_runtime_cache);
-    state.recipe.selector.trace = prompt_bool("write selector trace", state.recipe.selector.trace);
-    state.recipe.selector.only = prompt_bool("selector only, no output write", state.recipe.selector.only);
+    state.recipe.selector.kld = shell_prompt_on_page(state, title, "KLD base file", state.recipe.selector.kld.empty() ? state.recipe.evaluation.kld_base : state.recipe.selector.kld);
+    state.recipe.selector.checkpoint_model = shell_prompt_on_page(state, title, "candidate search checkpoint GGUF", state.recipe.selector.checkpoint_model);
+    state.recipe.selector.cache_dir = shell_prompt_on_page(state, title, "checkpoint cache directory", state.recipe.selector.cache_dir);
+    state.recipe.selector.skip_file = shell_prompt_on_page(state, title, "skip remaining tuning request file", state.recipe.selector.skip_file);
+    state.recipe.selector.effort = shell_prompt_on_page(state, title, "effort label", state.recipe.selector.effort);
+    state.recipe.selector.chunks = shell_prompt_on_page(state, title, "KLD chunks to score", state.recipe.selector.chunks);
+    state.recipe.selector.chunk_start = shell_prompt_on_page(state, title, "KLD chunk start", state.recipe.selector.chunk_start);
+    state.recipe.selector.holdout_chunks = shell_prompt_on_page(state, title, "validation chunks", state.recipe.selector.holdout_chunks);
+    state.recipe.selector.holdout_start = shell_prompt_on_page(state, title, "validation start", state.recipe.selector.holdout_start);
+    state.recipe.selector.stagea_sample_blocks = shell_prompt_on_page(state, title, "stage A sample blocks", state.recipe.selector.stagea_sample_blocks);
+    state.recipe.selector.stagea_max_policies = shell_prompt_on_page(state, title, "stage A max policies", state.recipe.selector.stagea_max_policies);
+    state.recipe.selector.refine_top = shell_prompt_on_page(state, title, "refine top policies", state.recipe.selector.refine_top);
+    state.recipe.selector.refine_budget = shell_prompt_on_page(state, title, "refine budget", state.recipe.selector.refine_budget);
+    state.recipe.selector.survey_top = shell_prompt_on_page(state, title, "survey top tensors", state.recipe.selector.survey_top);
+    state.recipe.selector.survey_sample_blocks = shell_prompt_on_page(state, title, "survey sample blocks", state.recipe.selector.survey_sample_blocks);
+    state.recipe.selector.max_tensors = shell_prompt_on_page(state, title, "max tensors to search", state.recipe.selector.max_tensors);
+    state.recipe.selector.eval_top = shell_prompt_on_page(state, title, "full PPL/KLD candidates", state.recipe.selector.eval_top);
+    state.recipe.selector.eval_chunks = shell_prompt_on_page(state, title, "full PPL/KLD chunks", state.recipe.selector.eval_chunks);
+    state.recipe.selector.n_seq = shell_prompt_on_page(state, title, "eval sequences", state.recipe.selector.n_seq);
+    state.recipe.selector.policy_threads = shell_prompt_on_page(state, title, "policy search threads", state.recipe.selector.policy_threads);
+    state.recipe.selector.threads = shell_prompt_on_page(state, title, "selector threads", state.recipe.selector.threads);
+    state.recipe.selector.kld_threads = shell_prompt_on_page(state, title, "PPL/KLD host reduction threads", state.recipe.selector.kld_threads.empty() ? state.recipe.selector.threads : state.recipe.selector.kld_threads);
+    state.recipe.selector.keep_checkpoint = shell_prompt_bool_on_page(state, title, "keep generated checkpoint", state.recipe.selector.keep_checkpoint);
+    state.recipe.selector.require_runtime_cache = shell_prompt_bool_on_page(state, title, "require resident tensor cache", state.recipe.selector.require_runtime_cache);
+    state.recipe.selector.trace = shell_prompt_bool_on_page(state, title, "write selector trace", state.recipe.selector.trace);
+    state.recipe.selector.only = shell_prompt_bool_on_page(state, title, "selector only, no output write", state.recipe.selector.only);
     shell_remember_recipe(state, state.last_recipe, state.recipe);
     state.status = "Candidate search updated";
 }
 
 static void shell_configure_quality_gates(ShellState & state) {
-    shell_begin_page(state, "Project > Options > PPL/KLD Scoring");
-    state.recipe.selector.ranking.kld_penalty = prompt("mean KLD penalty", state.recipe.selector.ranking.kld_penalty);
-    state.recipe.selector.ranking.p99_penalty = prompt("p99 KLD penalty", state.recipe.selector.ranking.p99_penalty);
-    state.recipe.selector.ranking.p999_penalty = prompt("p999 KLD penalty", state.recipe.selector.ranking.p999_penalty);
-    state.recipe.selector.ranking.max_kld_penalty = prompt("max KLD penalty", state.recipe.selector.ranking.max_kld_penalty);
-    state.recipe.selector.ranking.kld_threshold = prompt("mean KLD max delta", state.recipe.selector.ranking.kld_threshold);
-    state.recipe.selector.ranking.p99_threshold = prompt("p99 KLD max delta", state.recipe.selector.ranking.p99_threshold);
-    state.recipe.selector.ranking.p999_threshold = prompt("p999 KLD max delta", state.recipe.selector.ranking.p999_threshold);
-    state.recipe.selector.ranking.max_kld_threshold = prompt("max KLD max delta", state.recipe.selector.ranking.max_kld_threshold);
-    state.recipe.selector.ranking.kld_hard_gate = prompt_bool("hard gate mean KLD", state.recipe.selector.ranking.kld_hard_gate);
-    state.recipe.selector.ranking.p99_hard_gate = prompt_bool("hard gate p99 KLD", state.recipe.selector.ranking.p99_hard_gate);
-    state.recipe.selector.ranking.p999_hard_gate = prompt_bool("hard gate p999 KLD", state.recipe.selector.ranking.p999_hard_gate);
-    state.recipe.selector.ranking.max_kld_hard_gate = prompt_bool("hard gate max KLD", state.recipe.selector.ranking.max_kld_hard_gate);
+    const std::string title = "Project > Options > PPL/KLD Scoring";
+    state.recipe.selector.ranking.kld_penalty = shell_prompt_on_page(state, title, "mean KLD penalty", state.recipe.selector.ranking.kld_penalty);
+    state.recipe.selector.ranking.p99_penalty = shell_prompt_on_page(state, title, "p99 KLD penalty", state.recipe.selector.ranking.p99_penalty);
+    state.recipe.selector.ranking.p999_penalty = shell_prompt_on_page(state, title, "p999 KLD penalty", state.recipe.selector.ranking.p999_penalty);
+    state.recipe.selector.ranking.max_kld_penalty = shell_prompt_on_page(state, title, "max KLD penalty", state.recipe.selector.ranking.max_kld_penalty);
+    state.recipe.selector.ranking.kld_threshold = shell_prompt_on_page(state, title, "mean KLD max delta", state.recipe.selector.ranking.kld_threshold);
+    state.recipe.selector.ranking.p99_threshold = shell_prompt_on_page(state, title, "p99 KLD max delta", state.recipe.selector.ranking.p99_threshold);
+    state.recipe.selector.ranking.p999_threshold = shell_prompt_on_page(state, title, "p999 KLD max delta", state.recipe.selector.ranking.p999_threshold);
+    state.recipe.selector.ranking.max_kld_threshold = shell_prompt_on_page(state, title, "max KLD max delta", state.recipe.selector.ranking.max_kld_threshold);
+    state.recipe.selector.ranking.kld_hard_gate = shell_prompt_bool_on_page(state, title, "hard gate mean KLD", state.recipe.selector.ranking.kld_hard_gate);
+    state.recipe.selector.ranking.p99_hard_gate = shell_prompt_bool_on_page(state, title, "hard gate p99 KLD", state.recipe.selector.ranking.p99_hard_gate);
+    state.recipe.selector.ranking.p999_hard_gate = shell_prompt_bool_on_page(state, title, "hard gate p999 KLD", state.recipe.selector.ranking.p999_hard_gate);
+    state.recipe.selector.ranking.max_kld_hard_gate = shell_prompt_bool_on_page(state, title, "hard gate max KLD", state.recipe.selector.ranking.max_kld_hard_gate);
     shell_remember_recipe(state, state.last_recipe, state.recipe);
     state.status = "PPL/KLD scoring updated";
 }
 
 static void shell_configure_edit_existing_gguf(ShellState & state) {
-    shell_begin_page(state, "Project > Options > Edit Existing GGUF");
-    state.recipe.rescue.enabled = prompt_bool("enable Edit Existing GGUF pass", state.recipe.rescue.enabled);
-    state.recipe.rescue.type = prompt("edit quant type", state.recipe.rescue.type);
-    state.recipe.rescue.top = prompt("tensors to edit", state.recipe.rescue.top);
-    state.recipe.rescue.report_top = prompt("report top tensors", state.recipe.rescue.report_top);
-    state.recipe.rescue.budget_mb = prompt("edit budget MiB", state.recipe.rescue.budget_mb);
-    state.recipe.rescue.bf16_budget_mb = prompt("BF16 edit budget MiB", state.recipe.rescue.bf16_budget_mb);
-    state.recipe.rescue.class_limit = prompt("per-class edit limit", state.recipe.rescue.class_limit);
-    state.recipe.rescue.nvfp4_top = prompt("NVFP4 retest top", state.recipe.rescue.nvfp4_top);
-    state.recipe.rescue.sample_blocks = prompt("edit sample blocks", state.recipe.rescue.sample_blocks);
-    state.recipe.rescue.coarse_max_blocks = prompt("edit coarse max blocks", state.recipe.rescue.coarse_max_blocks);
-    state.recipe.rescue.refine_max_blocks = prompt("edit refine max blocks", state.recipe.rescue.refine_max_blocks);
-    state.recipe.rescue.guard_max_blocks = prompt("edit guard max blocks", state.recipe.rescue.guard_max_blocks);
-    state.recipe.rescue.report = prompt("edit report file", state.recipe.rescue.report);
-    state.recipe.rescue.tensor_types = prompt("edit tensor type overrides", state.recipe.rescue.tensor_types);
+    const std::string title = "Project > Options > Edit Existing GGUF";
+    state.recipe.rescue.enabled = shell_prompt_bool_on_page(state, title, "enable Edit Existing GGUF pass", state.recipe.rescue.enabled);
+    state.recipe.rescue.type = shell_prompt_on_page(state, title, "edit quant type", state.recipe.rescue.type);
+    state.recipe.rescue.top = shell_prompt_on_page(state, title, "tensors to edit", state.recipe.rescue.top);
+    state.recipe.rescue.report_top = shell_prompt_on_page(state, title, "report top tensors", state.recipe.rescue.report_top);
+    state.recipe.rescue.budget_mb = shell_prompt_on_page(state, title, "edit budget MiB", state.recipe.rescue.budget_mb);
+    state.recipe.rescue.bf16_budget_mb = shell_prompt_on_page(state, title, "BF16 edit budget MiB", state.recipe.rescue.bf16_budget_mb);
+    state.recipe.rescue.class_limit = shell_prompt_on_page(state, title, "per-class edit limit", state.recipe.rescue.class_limit);
+    state.recipe.rescue.nvfp4_top = shell_prompt_on_page(state, title, "NVFP4 retest top", state.recipe.rescue.nvfp4_top);
+    state.recipe.rescue.sample_blocks = shell_prompt_on_page(state, title, "edit sample blocks", state.recipe.rescue.sample_blocks);
+    state.recipe.rescue.coarse_max_blocks = shell_prompt_on_page(state, title, "edit coarse max blocks", state.recipe.rescue.coarse_max_blocks);
+    state.recipe.rescue.refine_max_blocks = shell_prompt_on_page(state, title, "edit refine max blocks", state.recipe.rescue.refine_max_blocks);
+    state.recipe.rescue.guard_max_blocks = shell_prompt_on_page(state, title, "edit guard max blocks", state.recipe.rescue.guard_max_blocks);
+    state.recipe.rescue.report = shell_prompt_on_page(state, title, "edit report file", state.recipe.rescue.report);
+    state.recipe.rescue.tensor_types = shell_prompt_on_page(state, title, "edit tensor type overrides", state.recipe.rescue.tensor_types);
     shell_remember_recipe(state, state.last_recipe, state.recipe);
     state.status = "Edit Existing GGUF updated";
 }
 
 static void shell_configure_mxfp6_scale_refine(ShellState & state) {
-    shell_begin_page(state, "Project > Options > MXFP6 Scale Refinement");
-    state.recipe.mxfp6.tensor_scale = prompt("MXFP6 tensor scale mode", state.recipe.mxfp6.tensor_scale);
-    state.recipe.mxfp6.min_savings_bytes = prompt("MXFP6 min savings bytes", state.recipe.mxfp6.min_savings_bytes);
-    state.recipe.mxfp6.selector_scale_top = prompt("scale-refine tensor count", state.recipe.mxfp6.selector_scale_top);
-    state.recipe.mxfp6.selector_scale_candidates = prompt("scale candidates", state.recipe.mxfp6.selector_scale_candidates);
+    const std::string title = "Project > Options > MXFP6 Scale Refinement";
+    state.recipe.mxfp6.tensor_scale = shell_prompt_on_page(state, title, "MXFP6 tensor scale mode", state.recipe.mxfp6.tensor_scale);
+    state.recipe.mxfp6.min_savings_bytes = shell_prompt_on_page(state, title, "MXFP6 min savings bytes", state.recipe.mxfp6.min_savings_bytes);
+    state.recipe.mxfp6.selector_scale_top = shell_prompt_on_page(state, title, "scale-refine tensor count", state.recipe.mxfp6.selector_scale_top);
+    state.recipe.mxfp6.selector_scale_candidates = shell_prompt_on_page(state, title, "scale candidates", state.recipe.mxfp6.selector_scale_candidates);
     shell_remember_recipe(state, state.last_recipe, state.recipe);
     state.status = "MXFP6 scale refinement updated";
 }
@@ -4777,39 +4857,47 @@ static void shell_configure_standard_quantize_options(ShellState & state) {
         return;
     }
 
-    shell_begin_page(state, "Project > Options > Standard Quantize Options");
-    state.recipe.base.output_tensor_type = sanitize_tensor_type_token(prompt("output.weight tensor type", state.recipe.base.output_tensor_type));
-    state.recipe.base.token_embedding_type = sanitize_tensor_type_token(prompt("token embedding tensor type", state.recipe.base.token_embedding_type));
-    state.recipe.base.leave_output_tensor = prompt_bool("leave output.weight unquantized", state.recipe.base.leave_output_tensor);
-    state.recipe.stock_ftype.sweep_tensor_policy = prompt_bool(
+    const std::string title = "Project > Options > Standard Quantize Options";
+    state.recipe.base.output_tensor_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "output.weight tensor type", state.recipe.base.output_tensor_type));
+    state.recipe.base.token_embedding_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "token embedding tensor type", state.recipe.base.token_embedding_type));
+    state.recipe.base.leave_output_tensor = shell_prompt_bool_on_page(state, title, "leave output.weight unquantized", state.recipe.base.leave_output_tensor);
+    state.recipe.stock_ftype.sweep_tensor_policy = shell_prompt_bool_on_page(
+        state,
+        title,
         "measure embeddings/output as candidates",
         state.recipe.stock_ftype.sweep_tensor_policy || state.recipe.stock_ftype.sweep_sensitive_tensors);
     state.recipe.stock_ftype.sweep_sensitive_tensors = state.recipe.stock_ftype.sweep_tensor_policy;
-    state.recipe.stock_ftype.token_embedding_candidates = split_type_csv(prompt(
+    state.recipe.stock_ftype.token_embedding_candidates = split_type_csv(shell_prompt_on_page(
+        state,
+        title,
         "token embedding candidate types",
         join_type_csv(state.recipe.stock_ftype.token_embedding_candidates)));
-    state.recipe.stock_ftype.output_tensor_candidates = split_type_csv(prompt(
+    state.recipe.stock_ftype.output_tensor_candidates = split_type_csv(shell_prompt_on_page(
+        state,
+        title,
         "output tensor candidate types",
         join_type_csv(state.recipe.stock_ftype.output_tensor_candidates)));
-    state.recipe.stock_ftype.min_quant_savings_mib = prompt_double("minimum tensor savings MiB before quantizing", state.recipe.stock_ftype.min_quant_savings_mib);
-    state.recipe.stock_ftype.technique_candidates = split_type_csv(prompt(
+    state.recipe.stock_ftype.min_quant_savings_mib = shell_prompt_double_on_page(state, title, "minimum tensor savings MiB before quantizing", state.recipe.stock_ftype.min_quant_savings_mib);
+    state.recipe.stock_ftype.technique_candidates = split_type_csv(shell_prompt_on_page(
+        state,
+        title,
         "technique candidates",
         join_type_csv(state.recipe.stock_ftype.technique_candidates)));
-    state.recipe.base.allow_requantize = prompt_bool("allow requantizing already-quantized tensors", state.recipe.base.allow_requantize);
-    state.recipe.base.pure = prompt_bool("pure mode, no built-in type mixtures", state.recipe.base.pure);
-    state.recipe.base.copy_only = prompt_bool("copy only, do not quantize", state.recipe.base.copy_only);
-    state.recipe.io.keep_split = prompt_bool("keep input split/shard layout", state.recipe.io.keep_split);
-    state.recipe.model.prune_layers = prompt("prune layers CSV", state.recipe.model.prune_layers);
+    state.recipe.base.allow_requantize = shell_prompt_bool_on_page(state, title, "allow requantizing already-quantized tensors", state.recipe.base.allow_requantize);
+    state.recipe.base.pure = shell_prompt_bool_on_page(state, title, "pure mode, no built-in type mixtures", state.recipe.base.pure);
+    state.recipe.base.copy_only = shell_prompt_bool_on_page(state, title, "copy only, do not quantize", state.recipe.base.copy_only);
+    state.recipe.io.keep_split = shell_prompt_bool_on_page(state, title, "keep input split/shard layout", state.recipe.io.keep_split);
+    state.recipe.model.prune_layers = shell_prompt_on_page(state, title, "prune layers CSV", state.recipe.model.prune_layers);
 
-    const std::string kv_override = prompt("add metadata override KEY=TYPE:VALUE", "");
+    const std::string kv_override = shell_prompt_on_page(state, title, "add metadata override KEY=TYPE:VALUE", "");
     if (!kv_override.empty()) {
         state.recipe.metadata.overrides.push_back(kv_override);
     }
-    const std::string tensor_file = prompt("add tensor type override file", "");
+    const std::string tensor_file = shell_prompt_on_page(state, title, "add tensor type override file", "");
     if (!tensor_file.empty()) {
         state.recipe.tensor_overrides.files.push_back(tensor_file);
     }
-    const std::string tensor_entry = prompt("add tensor override tensor=type", "");
+    const std::string tensor_entry = shell_prompt_on_page(state, title, "add tensor override tensor=type", "");
     if (!tensor_entry.empty()) {
         state.recipe.tensor_overrides.entries.push_back(tensor_entry);
     }
@@ -4833,11 +4921,13 @@ static void shell_tensor_rules(ShellState & state) {
         if (choice == 0) {
             shell_inspect_model(state, state.input_model);
         } else if (choice == 1) {
+            shell_begin_page(state, "Project > Options > Tensor Rules > Add Override");
             const std::string entry = prompt("tensor=type");
             if (!entry.empty()) {
                 state.recipe.tensor_overrides.entries.push_back(entry);
             }
         } else if (choice == 2) {
+            shell_begin_page(state, "Project > Options > Tensor Rules > Add Override File");
             const std::string file = prompt("tensor override file");
             if (!file.empty()) {
                 state.recipe.tensor_overrides.files.push_back(file);
@@ -5266,6 +5356,7 @@ static void shell_evaluation_menu(ShellState & state) {
         } else if (action == 1) {
             shell_project_best(state);
         } else if (action == 2) {
+            shell_begin_page(state, "Project > Evaluation and Best Candidates > Generate Candidates");
             const std::string out_dir = prompt("candidate output directory", "advanced-gguf-candidates");
             std::vector<std::string> owned = { state.last_recipe, "--output-dir", out_dir };
             std::vector<char *> args;
@@ -5479,6 +5570,9 @@ static bool shell_handle_command(ShellState & state, std::string line, const bq:
         return true;
     }
     if (command == "/config" || command == "/recipe") {
+        if (words.size() <= 1) {
+            shell_begin_page(state, "Command > Load Configuration");
+        }
         const std::string path = words.size() > 1 ? words[1] : prompt("configuration file", state.last_recipe);
         shell_load_recipe(state, path);
         std::cout << "loaded " << path << "\n";
@@ -5487,6 +5581,9 @@ static bool shell_handle_command(ShellState & state, std::string line, const bq:
     if (command == "/model") {
         const std::string old_input = state.input_model;
         const bool output_was_auto = output_model_is_auto_default(old_input, state.output_model, shell_active_quant_type(state));
+        if (words.size() <= 1) {
+            shell_begin_page(state, "Command > Set Model");
+        }
         state.input_model = words.size() > 1 ? words[1] : prompt("input GGUF", state.input_model);
         if (!state.input_model.empty() && output_was_auto) {
             state.output_model = default_output_model_path(state.input_model, shell_active_quant_type(state));
@@ -5499,6 +5596,9 @@ static bool shell_handle_command(ShellState & state, std::string line, const bq:
         return true;
     }
     if (command == "/output") {
+        if (words.size() <= 1) {
+            shell_begin_page(state, "Command > Set Output");
+        }
         state.output_model = words.size() > 1 ? words[1] : prompt("output GGUF", state.output_model);
         shell_sync_recipe_paths(state);
         if (state.have_recipe) {
@@ -5528,6 +5628,7 @@ static bool shell_handle_command(ShellState & state, std::string line, const bq:
         if (words.size() > 1) {
             owned.assign(words.begin() + 1, words.end());
         } else {
+            shell_begin_page(state, "Command > What-If Sensitivity");
             owned.push_back(prompt("sensitivity report path"));
         }
         std::vector<char *> args;
@@ -5538,6 +5639,9 @@ static bool shell_handle_command(ShellState & state, std::string line, const bq:
         return true;
     }
     if (command == "/candidates") {
+        if (words.size() <= 1) {
+            shell_begin_page(state, "Command > Generate Candidates");
+        }
         const std::string out_dir = words.size() > 1 ? words[1] : prompt("candidate output dir", "advanced-gguf-candidates");
         std::vector<std::string> owned = { state.last_recipe, "--output-dir", out_dir };
         std::vector<char *> args;
