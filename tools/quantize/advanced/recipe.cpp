@@ -1037,26 +1037,30 @@ void apply_master_autotune(Recipe & r) {
     }
 
     if (fast) {
-        assign_if_empty(r.selector.chunks, "2");
-        assign_if_empty(r.selector.holdout_chunks, "0");
-        assign_if_empty(r.selector.stagea_sample_blocks, "512");
-        assign_if_empty(r.selector.stagea_max_policies, "8");
-        assign_if_empty(r.selector.refine_top, "4");
-        assign_if_empty(r.selector.refine_budget, "16");
-        assign_if_empty(r.selector.survey_top, "8");
-        assign_if_empty(r.selector.survey_sample_blocks, "512");
+        assign_if_empty(r.selector.chunks, "32");
+        assign_if_empty(r.selector.holdout_chunks, "16");
+        assign_if_empty(r.selector.stagea_sample_blocks, "2048");
+        assign_if_empty(r.selector.stagea_max_policies, "0");
+        assign_if_empty(r.selector.refine_top, "12");
+        assign_if_empty(r.selector.refine_budget, "96");
+        assign_if_empty(r.selector.survey_top, "48");
+        assign_if_empty(r.selector.survey_sample_blocks, "2048");
         assign_if_empty(r.selector.max_tensors, "0");
-        assign_if_empty(r.selector.eval_top, "2");
-        assign_if_empty(r.selector.eval_chunks, "2");
-        assign_if_empty(r.selector.n_seq, "1");
-        assign_if_empty(r.selector.ranking.kld_penalty, "1.0");
-        assign_if_empty(r.selector.ranking.p99_penalty, "0.35");
-        assign_if_empty(r.selector.ranking.p999_penalty, "0.15");
-        assign_if_empty(r.selector.ranking.max_kld_penalty, "0.05");
+        assign_if_empty(r.selector.eval_top, "16");
+        assign_if_empty(r.selector.eval_chunks, "32");
+        assign_if_empty(r.selector.n_seq, "2");
+        assign_if_empty(r.selector.ranking.kld_penalty, "4.0");
+        assign_if_empty(r.selector.ranking.p99_penalty, "1.5");
+        assign_if_empty(r.selector.ranking.p999_penalty, "0.75");
+        assign_if_empty(r.selector.ranking.max_kld_penalty, "0.10");
+        r.selector.ranking.kld_hard_gate = false;
+        r.selector.ranking.p99_hard_gate = false;
+        r.selector.ranking.p999_hard_gate = false;
+        r.selector.ranking.max_kld_hard_gate = false;
         if (uses_nvfp4) {
-            assign_if_empty(r.nvfp4.autotune.max_blocks, "4096");
+            assign_if_empty(r.nvfp4.autotune.max_blocks, "8192");
             assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
-            assign_if_empty(r.nvfp4.four_six.refit_iters, "4");
+            assign_if_empty(r.nvfp4.four_six.refit_iters, "8");
             assign_if_empty(r.nvfp4.four_six.compand, "1");
             assign_if_empty(r.nvfp4.four_six.cap6, "448");
             assign_if_empty(r.nvfp4.four_six.cap4, "256");
@@ -1076,31 +1080,33 @@ void apply_master_autotune(Recipe & r) {
 
     const bool balanced = r.autotune.mode == "balanced";
     assign_if_empty(r.selector.chunks, balanced ? "32" : "96");
-    assign_if_empty(r.selector.holdout_chunks, balanced ? "8" : "32");
-    assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "8192" : "16384");
+    assign_if_empty(r.selector.holdout_chunks, balanced ? "16" : "32");
+    assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "2048" : "16384");
     assign_if_empty(r.selector.stagea_max_policies, "0");
     assign_if_empty(r.selector.refine_top, balanced ? "12" : "16");
     assign_if_empty(r.selector.refine_budget, balanced ? "96" : "128");
-    assign_if_empty(r.selector.survey_top, balanced ? "16" : "24");
-    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "8192" : "16384");
+    assign_if_empty(r.selector.survey_top, balanced ? "48" : "24");
+    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "2048" : "16384");
     assign_if_empty(r.selector.max_tensors, "0");
-    assign_if_empty(r.selector.eval_top, balanced ? "6" : "8");
+    assign_if_empty(r.selector.eval_top, balanced ? "16" : "8");
     assign_if_empty(r.selector.eval_chunks, balanced ? "32" : "96");
-    assign_if_empty(r.selector.n_seq, "4");
+    assign_if_empty(r.selector.n_seq, balanced ? "2" : "4");
 
     if (uses_nvfp4) {
-        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "32768" : "65536");
+        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "8192" : "65536");
         assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
         assign_if_empty(r.nvfp4.four_six.refit_iters, "16");
         assign_if_empty(r.nvfp4.four_six.compand, "1");
         assign_if_empty(r.nvfp4.four_six.cap6, "448");
         assign_if_empty(r.nvfp4.four_six.cap4, "224");
-        assign_if_empty(r.selector.ranking.kld_penalty, "12.0");
-        assign_if_empty(r.selector.ranking.p99_penalty, "7.0");
-        assign_if_empty(r.selector.ranking.p999_penalty, "2.0");
-        assign_if_empty(r.selector.ranking.max_kld_penalty, "0.04");
-        r.selector.ranking.p99_hard_gate = true;
-        r.selector.ranking.p999_hard_gate = true;
+        assign_if_empty(r.selector.ranking.kld_penalty, balanced ? "4.0" : "12.0");
+        assign_if_empty(r.selector.ranking.p99_penalty, balanced ? "1.5" : "7.0");
+        assign_if_empty(r.selector.ranking.p999_penalty, balanced ? "0.75" : "2.0");
+        assign_if_empty(r.selector.ranking.max_kld_penalty, balanced ? "0.10" : "0.04");
+        r.selector.ranking.kld_hard_gate = false;
+        r.selector.ranking.p99_hard_gate = !balanced;
+        r.selector.ranking.p999_hard_gate = !balanced;
+        r.selector.ranking.max_kld_hard_gate = false;
     } else if (uses_mxfp6) {
         assign_if_empty(r.selector.ranking.kld_penalty, "8.0");
         assign_if_empty(r.selector.ranking.p99_penalty, "4.0");
@@ -1216,11 +1222,15 @@ Recipe default_recipe(const std::string & profile) {
         r.base.ftype = "NVFP4";
         r.base.output_tensor_type = "Q6_K";
         r.base.token_embedding_type = "NVFP4";
-        apply_real_best_defaults(r);
-        r.selector.ranking.kld_penalty = "12.0";
-        r.selector.ranking.p99_penalty = "7.0";
-        r.selector.ranking.p999_penalty = "2.0";
-        r.selector.ranking.max_kld_penalty = "0.04";
+        r.autotune.enabled = true;
+        r.autotune.mode = "balanced";
+        r.autotune.objective = "kld-first";
+        r.autotune.evidence = "real-ppl-kld";
+        r.autotune.require_kld = true;
+        r.autotune.require_corpus = true;
+        r.autotune.require_imatrix = true;
+        r.autotune.allow_diagnostic = false;
+        apply_master_autotune(r);
         r.rescue.type.clear();
         r.nv4mx6.policy.clear();
         r.mxfp6 = {};
@@ -1228,7 +1238,7 @@ Recipe default_recipe(const std::string & profile) {
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "NVFP4" };
         r.stock_ftype.output_tensor_candidates = { "Q6_K" };
-        r.stock_ftype.rationale = "Quality-first default: local NVFP4 keeps token embeddings NVFP4 and stores separate output.weight as Q6_K.";
+        r.stock_ftype.rationale = "Default NVFP4 RSF search: deep real-artifact selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
     } else if (profile == "nvfp4-fast" || profile == "nvfp4-minimal" || profile == "fast") {
         r.target.precision_mode = "NVFP4";
         r.base.ftype = "NVFP4";
@@ -1242,7 +1252,7 @@ Recipe default_recipe(const std::string & profile) {
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "NVFP4" };
         r.stock_ftype.output_tensor_candidates = { "Q6_K" };
-        r.stock_ftype.rationale = "Fast real-artifact default: compact NVFP4 autotune/selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
+        r.stock_ftype.rationale = "Fast-compatible NVFP4 default: deep RSF selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
     } else if (profile == "q8_0") {
         r.target.precision_mode = "Q8_0";
         r.base.ftype = "Q8_0";

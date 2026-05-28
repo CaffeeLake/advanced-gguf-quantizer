@@ -556,16 +556,24 @@ static void apply_search_effort_preset(bq::Recipe & recipe, const std::string & 
     }
     recipe.stock_ftype.sweep_tensor_policy = true;
     recipe.stock_ftype.sweep_sensitive_tensors = true;
-    if (fast) {
-        recipe.selector.ranking.kld_penalty = "1.0";
-        recipe.selector.ranking.p99_penalty = "0.35";
-        recipe.selector.ranking.p999_penalty = "0.15";
-        recipe.selector.ranking.max_kld_penalty = "0.05";
+    if (fast || effort == "balanced" || effort == "real-best") {
+        recipe.selector.ranking.kld_penalty = "4.0";
+        recipe.selector.ranking.p99_penalty = "1.5";
+        recipe.selector.ranking.p999_penalty = "0.75";
+        recipe.selector.ranking.max_kld_penalty = "0.10";
+        recipe.selector.ranking.kld_hard_gate = false;
+        recipe.selector.ranking.p99_hard_gate = false;
+        recipe.selector.ranking.p999_hard_gate = false;
+        recipe.selector.ranking.max_kld_hard_gate = false;
     } else {
-        set_if_empty(recipe.selector.ranking.kld_penalty, "12.0");
-        set_if_empty(recipe.selector.ranking.p99_penalty, "7.0");
-        set_if_empty(recipe.selector.ranking.p999_penalty, "2.0");
-        set_if_empty(recipe.selector.ranking.max_kld_penalty, "0.04");
+        recipe.selector.ranking.kld_penalty = "12.0";
+        recipe.selector.ranking.p99_penalty = "7.0";
+        recipe.selector.ranking.p999_penalty = "2.0";
+        recipe.selector.ranking.max_kld_penalty = "0.04";
+        recipe.selector.ranking.kld_hard_gate = false;
+        recipe.selector.ranking.p99_hard_gate = true;
+        recipe.selector.ranking.p999_hard_gate = true;
+        recipe.selector.ranking.max_kld_hard_gate = false;
     }
     set_if_empty(recipe.mxfp6.min_savings_bytes, "2097152");
     bq::apply_master_autotune(recipe);
@@ -4723,7 +4731,7 @@ static void shell_configure_candidate_search(ShellState & state) {
     const int effort = shell_submenu_select(state, "Candidate Search - current " + current_mode + " / " + current_effort, {
         "Select native technique families",
         "Keep current search settings",
-        "Fast smoke - minimal tuning, no required KLD/imatrix",
+        "Default RSF - deep search, no required KLD/imatrix",
         "Balanced quality - real KLD-first, smaller search",
         "Full quality - real KLD-first, broad search",
         "Advanced low-level knobs",

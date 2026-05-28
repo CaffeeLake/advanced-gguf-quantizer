@@ -181,6 +181,13 @@ available, scored by the same full PPL/KLD selector machinery as other NVFP4
 policies. Adaptive four-over-six remains the default NVFP4 encoder path for
 these variants and the base policies they extend.
 
+The default NVFP4 RSF selector budget is the deeper real-artifact search used
+for current production candidates: 32 search chunks, 16 holdout chunks, 48
+survey policies, 16 measured candidates, 32 measured KLD chunks per subset,
+2-way selector eval batching, and a 96-policy refinement budget. Use explicit
+selector fields only when intentionally running a smaller diagnostic or a
+larger full-best sweep.
+
 ## Best Candidate Reports
 
 Use `best` for non-dominated candidate sets. Internally this is Pareto-style

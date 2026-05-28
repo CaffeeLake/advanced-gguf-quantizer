@@ -187,7 +187,7 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --nvfp4-autotune-max-blocks N / --nvfp4-autotune-threads N\n");
     printf("                                      set CUDA NVFP4 encoder autotune sample cap and worker count.\n");
     printf("  --nvfp4-fast-quantize\n");
-    printf("                                      use a compact real-artifact NVFP4 selector/autotune budget.\n");
+    printf("                                      use the default deep NVFP4 RSF selector/autotune budget.\n");
     printf("  --nvfp4-selector-rsf-mode tensor|slice|expert|group / --nvfp4-selector-no-rsf\n");
     printf("                                      set refined scale fit (RSF) granularity, or disable default RSF selector variants for diagnostics.\n");
     printf("  --nvfp4-selector-rsf-report file.txt\n");
@@ -233,9 +233,9 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --nvfp4-selector-skip-remaining\n");
     printf("                                      skip optional selector tuning now and use the best available policy.\n");
     printf("  --nvfp4-selector-chunks N / --nvfp4-selector-chunk-start N\n");
-    printf("                                      KLD chunks used for the selector search. defaults: 4 chunks from 0.\n");
+    printf("                                      KLD chunks used for the selector search. defaults: 32 chunks from 0.\n");
     printf("  --nvfp4-selector-holdout-chunks N / --nvfp4-selector-holdout-start N\n");
-    printf("                                      independent KLD holdout chunks for selector ranking. defaults: 2 after search chunks.\n");
+    printf("                                      independent KLD holdout chunks for selector ranking. defaults: 16 after search chunks.\n");
     printf("  --nvfp4-selector-stagea-sample-blocks N\n");
     printf("                                      NVFP4 blocks sampled per tensor during coarse selector policy ranking.\n");
     printf("  --nvfp4-selector-stagea-max-policies N\n");
@@ -259,9 +259,9 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --nvfp4-selector-only\n");
     printf("                                      run selector analysis and exit without writing a final model.\n");
     printf("  --nvfp4-selector-eval-top N / --nvfp4-selector-eval-chunks N\n");
-    printf("                                      number of policies/chunks used for KLD full PPL/KLD evaluation.\n");
+    printf("                                      number of policies/chunks used for KLD full PPL/KLD evaluation. defaults: 16/32.\n");
     printf("  --nvfp4-selector-n-seq N\n");
-    printf("                                      sequence count used during selector KLD full PPL/KLD evaluation. default: 4.\n");
+    printf("                                      sequence count used during selector KLD full PPL/KLD evaluation. default: 2.\n");
     printf("  --nvfp4-selector-eval-batch N\n");
     printf("                                      token batch size used during selector KLD eval; values below ctx exercise multi-batch KLD.\n");
     printf("  --nvfp4-selector-n-gpu-layers N\n");

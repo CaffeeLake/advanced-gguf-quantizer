@@ -4714,8 +4714,8 @@ static std::vector<int> nvfp4_selector_refit_candidates_for_class(
 }
 
 static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(const std::vector<nvfp4_selector_policy> & ranked) {
-    const int refine_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_TOP", 2));
-    const int refine_budget = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", 10));
+    const int refine_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_TOP", 12));
+    const int refine_budget = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", 96));
     if (refine_budget <= 0 || ranked.empty()) {
         return {};
     }
@@ -5128,7 +5128,7 @@ static bool nvfp4_selector_choose_policy(
     };
     update_full_quant_eta("selector-setup", true);
 
-    const int eval_top = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_TOP", 6));
+    const int eval_top = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_TOP", 16));
     const bool want_measured_eval_requested = eval_top > 0;
     const bool want_measured_eval = want_measured_eval_requested && quantize_control_i64("LLAMA_NVFP4_SELECTOR_ENABLE_EVAL", 0) != 0;
     const bool require_runtime_cache = quantize_control_i64("LLAMA_NVFP4_SELECTOR_REQUIRE_RUNTIME_CACHE", 0) != 0;
@@ -5386,7 +5386,7 @@ static bool nvfp4_selector_choose_policy(
         double sum_abs = 0.0;
         double max_abs = 0.0;
         int64_t count = 0;
-        const int64_t stagea_default_sample_blocks = want_measured_eval ? 8192 : 0;
+        const int64_t stagea_default_sample_blocks = want_measured_eval ? 2048 : 0;
         const int64_t stagea_sample_blocks = std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", stagea_default_sample_blocks));
         policy.proxy_rejected = false;
         if (binding_indices.empty()) {
@@ -5873,8 +5873,8 @@ static bool nvfp4_selector_choose_policy(
 
     std::sort(policies.begin(), policies.end(), nvfp4_selector_policy_proxy_less);
 
-    const int survey_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", 6));
-    const int64_t survey_sample_blocks = std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", 1024));
+    const int survey_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", 48));
+    const int64_t survey_sample_blocks = std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", 2048));
     const bool dedup_survey = NVFP4_SELECTOR_DEDUP_SURVEY_DEFAULT;
     std::vector<size_t> survey_policy_indices;
     survey_policy_indices.reserve((size_t) survey_top + 1);
@@ -6068,13 +6068,13 @@ static bool nvfp4_selector_choose_policy(
         update_full_quant_eta(skip_remaining_tuning ? "selector-skipping-to-final-materialization" : "selector-proxy-only", true);
     }
     const int32_t stageb_eval_chunk_budget =
-        (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", 4);
+        (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", 32);
     const nvfp4_selector_kld_subset kld_budget = nvfp4_selector_make_kld_budget_subset(kld, stageb_eval_chunk_budget);
     const std::unique_ptr<nvfp4_selector_kld_subset> holdout_budget =
         (kld_holdout != nullptr)
         ? std::make_unique<nvfp4_selector_kld_subset>(nvfp4_selector_make_kld_budget_subset(*kld_holdout, stageb_eval_chunk_budget))
         : nullptr;
-    int selector_n_seq = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_N_SEQ", 4));
+    int selector_n_seq = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_N_SEQ", 2));
     const nvfp4_selector_logits_budget logits_budget = nvfp4_selector_default_logits_budget();
     const double max_logits_gib = std::max(NVFP4_SELECTOR_LOGITS_MIN_GIB, logits_budget.max_gib);
     const double logits_gib_per_seq =
@@ -8943,21 +8943,26 @@ int llama_quantize(int argc, char ** argv) {
         }
     };
     if (cli_nvfp4_fast_quantize) {
-        add_selector_controls_default("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", "4096");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "512");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "8");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_AWQ_TOP", "3");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_TOP", "4");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", "16");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "8");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", "512");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_HOLDOUT_CHUNKS", "0");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "2");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", "2");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_N_SEQ", "1");
+        add_selector_controls_default("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", "8192");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_N_CHUNKS", "32");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "2048");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "0");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_AWQ_TOP", "12");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_TOP", "12");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", "96");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "48");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", "2048");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_HOLDOUT_CHUNKS", "16");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "16");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", "32");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_N_SEQ", "2");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", "4.0");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", "1.5");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", "0.75");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", "0.10");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_TOP", "0");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_REPORT_TOP", "0");
-        fprintf(stderr, "llama_quantize: fast quantize minimal autotuning enabled\n");
+        fprintf(stderr, "llama_quantize: NVFP4 fast quantize using deep RSF selector defaults\n");
     }
     if (!selector_skip_policies_cli.empty()) {
         add_selector_controls("LLAMA_NVFP4_SELECTOR_SKIP_POLICIES", selector_skip_policies_cli.c_str());
@@ -9246,17 +9251,17 @@ int llama_quantize(int argc, char ** argv) {
 
     if (selector_enabled) {
         const int32_t selector_chunk_start = (int32_t) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_CHUNK_START", 0));
-        const int32_t selector_n_chunks = (int32_t) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_N_CHUNKS", 4));
-        const int32_t selector_holdout_chunks = (int32_t) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_HOLDOUT_CHUNKS", 2));
+        const int32_t selector_n_chunks = (int32_t) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_N_CHUNKS", 32));
+        const int32_t selector_holdout_chunks = (int32_t) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_HOLDOUT_CHUNKS", 16));
         const int32_t selector_holdout_start = (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_HOLDOUT_START", selector_chunk_start + selector_n_chunks);
         selector_rank_cfg.kld_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_KLD_THRESHOLD", -1.0);
         selector_rank_cfg.p99_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P99_THRESHOLD", -1.0);
         selector_rank_cfg.p999_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P999_THRESHOLD", -1.0);
         selector_rank_cfg.max_kld_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_THRESHOLD", -1.0);
-        selector_rank_cfg.kld_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", 0.0);
-        selector_rank_cfg.p99_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", 0.0);
-        selector_rank_cfg.p999_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", 0.0);
-        selector_rank_cfg.max_kld_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", 0.0);
+        selector_rank_cfg.kld_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", 4.0);
+        selector_rank_cfg.p99_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", 1.5);
+        selector_rank_cfg.p999_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", 0.75);
+        selector_rank_cfg.max_kld_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", 0.10);
         selector_rank_cfg.holdout_weight = SELECTOR_HOLDOUT_WEIGHT;
         selector_rank_cfg.kld_hard_gate = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RANK_KLD_HARD_GATE", 0) != 0;
         selector_rank_cfg.p99_hard_gate = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RANK_P99_HARD_GATE", 0) != 0;
