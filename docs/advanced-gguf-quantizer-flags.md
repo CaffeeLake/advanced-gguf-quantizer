@@ -154,17 +154,20 @@ overall evidence.
 
 ## Native NVFP4 Candidate Families
 
-`nvfp4_rsf` enables NVFP4 refined scale fit (RSF) variants for the active
-NVFP4 selector policies: each tensor can refine its tensor scale while the
+NVFP4 refined scale fit (RSF) variants are part of the normal NVFP4 selector
+candidate set by default: each tensor can refine its tensor scale while the
 existing per-16 block fit remains imatrix-weighted. The local refinement uses
 calibration weights, and final ranking still comes from the normal PPL/KLD
-selector machinery. This is a modifier on the normal candidate set, not a
-standalone policy lane. Enable it through native candidate lists or directly:
+selector machinery. RSF is a modifier on the normal candidate set, not a
+standalone policy lane. Set the granularity or report path directly:
 
 ```bash
-./build/bin/llama-quantize ... --nvfp4-selector-rsf --nvfp4-selector-rsf-mode tensor \
+./build/bin/llama-quantize ... --nvfp4-selector-rsf-mode tensor \
   --nvfp4-selector-rsf-report runs/model/rsf-report.txt
 ```
+
+Use `--nvfp4-selector-no-rsf` only for diagnostic comparisons that intentionally
+remove the default RSF variants from the selector candidate set.
 
 Recipe files can set the RSF granularity explicitly:
 

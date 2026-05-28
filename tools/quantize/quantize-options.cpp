@@ -188,8 +188,8 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      set CUDA NVFP4 encoder autotune sample cap and worker count.\n");
     printf("  --nvfp4-fast-quantize\n");
     printf("                                      use a compact real-artifact NVFP4 selector/autotune budget.\n");
-    printf("  --nvfp4-selector-rsf / --nvfp4-selector-rsf-mode tensor|slice|expert|group\n");
-    printf("                                      add refined scale fit (RSF) variants for each NVFP4 selector policy.\n");
+    printf("  --nvfp4-selector-rsf-mode tensor|slice|expert|group / --nvfp4-selector-no-rsf\n");
+    printf("                                      set refined scale fit (RSF) granularity, or disable default RSF selector variants for diagnostics.\n");
     printf("  --nvfp4-selector-rsf-report file.txt\n");
     printf("                                      write the RSF policy summary, tensor rows, and scale-multiplier histograms.\n");
     printf("  --mxfp6_e2m3-tensor-scale on|off\n");

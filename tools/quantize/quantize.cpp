@@ -4297,11 +4297,9 @@ static bool nvfp4_selector_cfg_equal(const nvfp4_cuda_runtime_cfg & a, const nvf
 static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
         const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr,
         const std::string & recipe_policy_name = {},
-        bool include_rsf = false) {
+        bool include_rsf = true) {
     std::vector<nvfp4_selector_policy> out;
-    const bool recipe_requested_rsf =
-        recipe_cfg != nullptr && nvfp4_cfg_has_rsf(*recipe_cfg);
-    const bool emit_rsf = include_rsf || recipe_requested_rsf;
+    const bool emit_rsf = include_rsf;
     int rsf_mode = recipe_cfg != nullptr ? nvfp4_cfg_rsf_mode(*recipe_cfg) : NVFP4_CUDA_RSF_MODE_TENSOR;
     const std::string rsf_mode_control = quantize_control_string("LLAMA_NVFP4_SELECTOR_RSF_MODE");
     if (!rsf_mode_control.empty() && !nvfp4_parse_rsf_mode(rsf_mode_control.c_str(), rsf_mode)) {
@@ -5071,6 +5069,7 @@ static bool nvfp4_selector_choose_policy(
     int32_t nvfp4_input_scale_policy,
     int32_t selector_eval_batch_override,
     int32_t nvfp4_autotune_threads,
+    bool include_rsf,
     nvfp4_cuda_runtime_cfg & out_cfg,
     std::string & out_name,
         bool * out_kept_seed,
@@ -5702,9 +5701,6 @@ static bool nvfp4_selector_choose_policy(
         return true;
     };
 
-    const bool include_rsf =
-        quantize_control_i64("LLAMA_NVFP4_SELECTOR_INCLUDE_RSF", 0) != 0 ||
-        (recipe_cfg != nullptr && nvfp4_cfg_has_rsf(*recipe_cfg));
     auto policies = nvfp4_selector_default_policies(recipe_cfg, recipe_policy_name, include_rsf);
     const bool has_expert_bindings = std::any_of(all_bindings.begin(), all_bindings.end(), [](const nvfp4_selector_binding & b) {
         return b.name.find(".ffn_gate_exps.weight") != std::string::npos ||
@@ -5882,6 +5878,67 @@ static bool nvfp4_selector_choose_policy(
     const bool dedup_survey = NVFP4_SELECTOR_DEDUP_SURVEY_DEFAULT;
     std::vector<size_t> survey_policy_indices;
     survey_policy_indices.reserve((size_t) survey_top + 1);
+    auto append_policy_index = [&](std::vector<size_t> & indices, size_t idx) {
+        if (idx >= policies.size()) {
+            return false;
+        }
+        if (policies[idx].proxy_rejected || !std::isfinite(policies[idx].proxy_score)) {
+            return false;
+        }
+        if (selector_policy_skipped(policies[idx])) {
+            return false;
+        }
+        if (std::find(indices.begin(), indices.end(), idx) != indices.end()) {
+            return false;
+        }
+        indices.push_back(idx);
+        return true;
+    };
+    auto find_rsf_companion_index = [&](const nvfp4_selector_policy & policy) -> size_t {
+        const bool want_rsf = !nvfp4_selector_policy_is_rsf_family(policy);
+        const std::string base = nvfp4_selector_rsf_base_policy_name(policy.name);
+        for (size_t i = 0; i < policies.size(); ++i) {
+            const bool is_rsf = nvfp4_selector_policy_is_rsf_family(policies[i]);
+            if (is_rsf != want_rsf) {
+                continue;
+            }
+            if (nvfp4_selector_rsf_base_policy_name(policies[i].name) == base) {
+                return i;
+            }
+        }
+        return SIZE_MAX;
+    };
+    auto append_rsf_companions = [&](std::vector<size_t> & indices, const char * phase) {
+        const size_t original_size = indices.size();
+        size_t added = 0;
+        for (size_t pos = 0; pos < original_size; ++pos) {
+            const size_t companion = find_rsf_companion_index(policies[indices[pos]]);
+            if (companion == SIZE_MAX) {
+                continue;
+            }
+            if (append_policy_index(indices, companion)) {
+                ++added;
+            }
+        }
+        if (added > 0) {
+            fprintf(stderr,
+                "%s: selector added %zu RSF/base companion policy candidate(s) for measured %s\n",
+                __func__,
+                added,
+                phase != nullptr ? phase : "ranking");
+        }
+    };
+    auto stable_sort_rsf_pairs = [&](std::vector<size_t> & indices) {
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            const std::string abase = nvfp4_selector_rsf_base_policy_name(policies[a].name);
+            const std::string bbase = nvfp4_selector_rsf_base_policy_name(policies[b].name);
+            if (abase == bbase) {
+                return !nvfp4_selector_policy_is_rsf_family(policies[a]) &&
+                       nvfp4_selector_policy_is_rsf_family(policies[b]);
+            }
+            return false;
+        });
+    };
     size_t survey_dedup_skipped = 0;
     for (size_t i = 0; i < policies.size() && survey_policy_indices.size() < (size_t) survey_top; ++i) {
         if (policies[i].proxy_rejected || !std::isfinite(policies[i].proxy_score)) {
@@ -5914,6 +5971,8 @@ static bool nvfp4_selector_choose_policy(
             break;
         }
     }
+    append_rsf_companions(survey_policy_indices, "survey");
+    stable_sort_rsf_pairs(survey_policy_indices);
     if (dedup_survey && survey_dedup_skipped > 0) {
         fprintf(stderr,
             "%s: selector skipped %zu proxy-equivalent policies before full-tensor survey\n",
@@ -5977,34 +6036,12 @@ static bool nvfp4_selector_choose_policy(
     }
     for (size_t i = 0; i < policies.size(); ++i) {
         if (policies[i].name == "baseline") {
-            if (!selector_policy_skipped(policies[i]) &&
-                    std::find(eval_policy_indices.begin(), eval_policy_indices.end(), i) == eval_policy_indices.end()) {
-                eval_policy_indices.push_back(i);
-            }
+            append_policy_index(eval_policy_indices, i);
             break;
         }
     }
-    for (size_t pos = 0; pos < eval_policy_indices.size(); ++pos) {
-        const nvfp4_selector_policy & policy = policies[eval_policy_indices[pos]];
-        if (!nvfp4_selector_policy_is_rsf_family(policy)) {
-            continue;
-        }
-        const nvfp4_selector_policy * base_policy = nvfp4_selector_find_rsf_base_policy(policies, policy);
-        if (base_policy == nullptr || selector_policy_skipped(*base_policy)) {
-            continue;
-        }
-        const size_t base_idx = (size_t) (base_policy - static_cast<const nvfp4_selector_policy *>(policies.data()));
-        if (std::find(eval_policy_indices.begin(), eval_policy_indices.end(), base_idx) == eval_policy_indices.end()) {
-            eval_policy_indices.push_back(base_idx);
-        }
-    }
-    std::stable_sort(eval_policy_indices.begin(), eval_policy_indices.end(), [&](size_t a, size_t b) {
-        const std::string abase = nvfp4_selector_rsf_base_policy_name(policies[a].name);
-        const std::string bbase = nvfp4_selector_rsf_base_policy_name(policies[b].name);
-        if (policies[a].name == bbase && policies[b].name != abase) return true;
-        if (policies[b].name == abase && policies[a].name != bbase) return false;
-        return false;
-    });
+    append_rsf_companions(eval_policy_indices, "eval");
+    stable_sort_rsf_pairs(eval_policy_indices);
     if (dedup_eval && eval_dedup_skipped > 0) {
         fprintf(stderr,
             "%s: selector skipped %zu proxy-equivalent policies before full PPL/KLD eval\n",
@@ -8238,6 +8275,7 @@ int llama_quantize(int argc, char ** argv) {
     int32_t cli_nvfp4_autotune_threads = 0;
     int32_t selector_kld_threads_override = 0;
     bool cli_nvfp4_fast_quantize = false;
+    bool cli_nvfp4_selector_include_rsf = true;
     bool selector_skip_remaining = false;
     std::string selector_skip_file;
     std::string selector_skip_policies_cli;
@@ -8356,7 +8394,9 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--nvfp4-fast-quantize") == 0) {
             cli_nvfp4_fast_quantize = true;
         } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rsf") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_INCLUDE_RSF", "1");
+            cli_nvfp4_selector_include_rsf = true;
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-no-rsf") == 0) {
+            cli_nvfp4_selector_include_rsf = false;
         } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rsf-mode") == 0) {
             if (arg_idx < argc-1) {
                 int rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR;
@@ -8364,7 +8404,6 @@ int llama_quantize(int argc, char ** argv) {
                 if (!nvfp4_parse_rsf_mode(value, rsf_mode)) {
                     usage(argv[0]);
                 }
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_INCLUDE_RSF", "1");
                 add_selector_controls("LLAMA_NVFP4_SELECTOR_RSF_MODE", nvfp4_rsf_mode_name(rsf_mode));
             } else {
                 usage(argv[0]);
@@ -9195,12 +9234,13 @@ int llama_quantize(int argc, char ** argv) {
             cli_nvfp4_cfg_valid ? &cli_nvfp4_cfg : nullptr,
             cli_nvfp4_policy_name,
             params.nvfp4_input_scale_policy,
-	            selector_eval_batch_override,
-                cli_nvfp4_autotune_threads,
-	            out_cfg,
-	            out_policy_name,
-                out_kept_seed,
-	            out_overrides);
+            selector_eval_batch_override,
+            cli_nvfp4_autotune_threads,
+            cli_nvfp4_selector_include_rsf,
+            out_cfg,
+            out_policy_name,
+            out_kept_seed,
+            out_overrides);
 	    };
 
     if (selector_enabled) {

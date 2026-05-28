@@ -1309,21 +1309,6 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
             args.push_back(flag);
         }
     };
-    auto has_token = [](const std::vector<std::string> & values, const char * token) {
-        const std::string want = lower_copy(trim(token));
-        for (std::string value : values) {
-            value = lower_copy(trim(value));
-            std::replace(value.begin(), value.end(), '-', '_');
-            if (value == want) {
-                return true;
-            }
-        }
-        return false;
-    };
-    const bool wants_nvfp4_rsf =
-        has_token(r.stock_ftype.technique_candidates, "nvfp4_rsf") ||
-        has_token(r.nvfp4.calibration_families, "nvfp4_rsf");
-
     push_bool("--allow-requantize", r.base.allow_requantize);
     push_bool("--leave-output-tensor", r.base.leave_output_tensor);
     push_bool("--pure", r.base.pure);
@@ -1367,10 +1352,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--nvfp4-input-scale-policy", r.nvfp4.input_scale_policy);
         push_pair("--nvfp4-autotune-max-blocks", r.nvfp4.autotune.max_blocks);
         push_pair("--nvfp4-autotune-threads", r.nvfp4.autotune.threads);
-        push_bool("--nvfp4-selector-rsf", wants_nvfp4_rsf);
-        if (wants_nvfp4_rsf) {
-            push_pair("--nvfp4-selector-rsf-mode", r.nvfp4.rsf.mode);
-        }
+        push_pair("--nvfp4-selector-rsf-mode", r.nvfp4.rsf.mode);
     }
 
     const bool uses_mxfp6_controls =
