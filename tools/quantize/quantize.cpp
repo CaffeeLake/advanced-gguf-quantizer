@@ -6535,6 +6535,7 @@ static bool nvfp4_selector_choose_policy(
     nvfp4_selector_derived_metrics baseline_eval;
     nvfp4_selector_derived_metrics baseline_holdout_eval;
     bool has_holdout_eval = false;
+    bool stageb_runtime_decoded = false;
     auto apply_rsf_holdout_guard = [&](nvfp4_selector_policy & policy) {
         if (!nvfp4_selector_policy_is_rsf_family(policy)) {
             return;
@@ -6639,6 +6640,7 @@ static bool nvfp4_selector_choose_policy(
                 restore_all();
                 return false;
             }
+            stageb_runtime_decoded = true;
             baseline_eval = nvfp4_selector_derive_metrics(baseline_km);
 
             if (holdout_budget && holdout_budget->n_chunk > 0) {
@@ -6647,6 +6649,7 @@ static bool nvfp4_selector_choose_policy(
                     restore_all();
                     return false;
                 }
+                stageb_runtime_decoded = true;
                 baseline_holdout_eval = nvfp4_selector_derive_metrics(baseline_holdout_km);
                 has_holdout_eval = baseline_holdout_eval.ok;
             }
@@ -7037,6 +7040,7 @@ static bool nvfp4_selector_choose_policy(
                 restore_all();
                 return false;
             }
+            stageb_runtime_decoded = true;
             policy.measured = nvfp4_selector_derive_metrics(km);
             if (holdout_budget && has_holdout_eval) {
                 nvfp4_selector_kld_metrics km_holdout;
@@ -7044,6 +7048,7 @@ static bool nvfp4_selector_choose_policy(
                     restore_all();
                     return false;
                 }
+                stageb_runtime_decoded = true;
                 policy.measured_holdout = nvfp4_selector_derive_metrics(km_holdout);
                 policy.has_holdout = policy.measured_holdout.ok;
             }
@@ -7335,6 +7340,7 @@ static bool nvfp4_selector_choose_policy(
                     restore_all();
                     return false;
                 }
+                stageb_runtime_decoded = true;
                 sensitivity_base = nvfp4_selector_derive_metrics(base_km);
             }
 
@@ -7453,6 +7459,7 @@ static bool nvfp4_selector_choose_policy(
                                 restore_all();
                                 return false;
                             }
+                            stageb_runtime_decoded = true;
                             const nvfp4_selector_derived_metrics dm = nvfp4_selector_derive_metrics(km);
                             const double utility = dm.ok
                                 ? nvfp4_selector_measured_score(dm, nullptr, rank_cfg)
@@ -7541,6 +7548,7 @@ static bool nvfp4_selector_choose_policy(
                         restore_all();
                         return false;
                     }
+                    stageb_runtime_decoded = true;
                     const nvfp4_selector_derived_metrics dm = nvfp4_selector_derive_metrics(km);
                     const double utility = dm.ok
                         ? nvfp4_selector_measured_score(dm, nullptr, rank_cfg)
@@ -7680,15 +7688,14 @@ static bool nvfp4_selector_choose_policy(
             if (choice.policy == nullptr) {
                 continue;
             }
-            tensor_policy_map[choice.tensor] = choice.policy;
             ++policy_counts[choice.policy->name];
             total_gain += choice.gain;
         }
-        if (!tensor_policy_map.empty()) {
+        if (!choices.empty()) {
             fprintf(stderr,
-                "%s: selector tensor policy map switched %zu/%zu tensor(s) from global policy=%s proxy_gain_sum=%.6f max=%d\n",
+                "%s: selector tensor policy map candidates=%zu/%zu from global policy=%s proxy_gain_sum=%.6f max=%d\n",
                 __func__,
-                tensor_policy_map.size(),
+                choices.size(),
                 all_bindings.size(),
                 best_it->name.c_str(),
                 total_gain,
@@ -7718,7 +7725,8 @@ static bool nvfp4_selector_choose_policy(
                 double sum_abs = 0.0;
                 double max_abs = 0.0;
                 int64_t count = 0;
-                if (!nvfp4_selector_quantize_binding(
+                bool direct_applied = false;
+                if (nvfp4_selector_quantize_binding(
                         b,
                         policy.cfg,
                         nthread,
@@ -7729,8 +7737,27 @@ static bool nvfp4_selector_choose_policy(
                         count,
                         0,
                         0,
-                        false) || count <= 0) {
-                    return false;
+                        true) && count > 0) {
+                    direct_applied = true;
+                } else {
+                    sum_sq = 0.0;
+                    sum_abs = 0.0;
+                    max_abs = 0.0;
+                    count = 0;
+                    if (!nvfp4_selector_quantize_binding(
+                            b,
+                            policy.cfg,
+                            nthread,
+                            b.working_target_bytes,
+                            sum_sq,
+                            sum_abs,
+                            max_abs,
+                            count,
+                            0,
+                            0,
+                            false) || count <= 0) {
+                        return false;
+                    }
                 }
 
                 float header_weight_scale = 1.0f;
@@ -7750,38 +7777,96 @@ static bool nvfp4_selector_choose_policy(
                             b.target_input_scale_nbytes)) {
                     return false;
                 }
-                (void) header_weight_scale;
-                (void) header_input_scale;
+                if (direct_applied) {
+                    return ggml_cuda_nvfp4_tensor_set_header_scales(
+                        b.target, header_weight_scale, header_input_scale, nullptr);
+                }
                 return quantize_tensor_copy_in(
                     b.target, b.working_target_bytes.data(), b.target_nbytes);
             };
 
-            bool map_patch_ok = true;
-            restore_all();
-            for (auto & b : all_bindings) {
-                const nvfp4_selector_policy * materialize_policy = &*best_it;
-                const auto mit = tensor_policy_map.find(b.name);
-                if (mit != tensor_policy_map.end() && mit->second != nullptr) {
-                    materialize_policy = mit->second;
+            if (!stageb_runtime_decoded && kld_budget.n_chunk > 0) {
+                nvfp4_selector_kld_subset warmup_budget = kld_budget;
+                warmup_budget.n_chunk = std::min<int32_t>(warmup_budget.n_chunk, 1);
+                nvfp4_selector_kld_metrics warmup_km;
+                fprintf(stderr,
+                    "%s: selector tensor policy map warming runtime before CUDA tensor patching chunks=%d\n",
+                    __func__,
+                    warmup_budget.n_chunk);
+                if (!nvfp4_selector_eval_kld_subset(
+                        lctx,
+                        warmup_budget,
+                        params.n_batch,
+                        warmup_km,
+                        false,
+                        "selector tensor policy map warmup")) {
+                    restore_all();
+                    return false;
                 }
-                if (!apply_tensor_policy_patch(b, *materialize_policy)) {
-                    fprintf(stderr,
-                        "%s: selector tensor policy map failed to patch tensor=%s policy=%s; disabling map\n",
-                        __func__,
-                        b.name.c_str(),
-                        materialize_policy->name.c_str());
-                    map_patch_ok = false;
-                    break;
+                stageb_runtime_decoded = true;
+            }
+
+            auto build_prefix_map = [&](size_t prefix_count) {
+                std::unordered_map<std::string, const nvfp4_selector_policy *> out;
+                for (size_t i = 0; i < prefix_count && i < choices.size(); ++i) {
+                    if (choices[i].policy != nullptr) {
+                        out[choices[i].tensor] = choices[i].policy;
+                    }
+                }
+                return out;
+            };
+
+            std::vector<size_t> prefix_counts;
+            for (const size_t n : { (size_t) 1, (size_t) 2, (size_t) 4, (size_t) 8, (size_t) 16, choices.size() }) {
+                const size_t capped = std::min(n, choices.size());
+                if (capped > 0 && std::find(prefix_counts.begin(), prefix_counts.end(), capped) == prefix_counts.end()) {
+                    prefix_counts.push_back(capped);
                 }
             }
 
-            bool map_keep = false;
-            if (map_patch_ok) {
+            bool have_best_map = false;
+            double best_map_score = std::numeric_limits<double>::infinity();
+            size_t best_map_prefix = 0;
+            nvfp4_selector_derived_metrics best_map_dm;
+            std::unordered_map<std::string, const nvfp4_selector_policy *> best_map;
+
+            for (const size_t prefix_count : prefix_counts) {
+                const auto prefix_map = build_prefix_map(prefix_count);
+                bool map_patch_ok = true;
+                const auto patch_t0 = std::chrono::steady_clock::now();
+                for (auto & b : all_bindings) {
+                    const nvfp4_selector_policy * materialize_policy = &*best_it;
+                    const auto mit = prefix_map.find(b.name);
+                    if (mit != prefix_map.end() && mit->second != nullptr) {
+                        materialize_policy = mit->second;
+                    }
+                    if (!apply_tensor_policy_patch(b, *materialize_policy)) {
+                        fprintf(stderr,
+                            "%s: selector tensor policy map failed to patch tensor=%s policy=%s prefix=%zu; disabling prefix\n",
+                            __func__,
+                            b.name.c_str(),
+                            materialize_policy->name.c_str(),
+                            prefix_count);
+                        map_patch_ok = false;
+                        break;
+                    }
+                }
+                if (!map_patch_ok) {
+                    continue;
+                }
+                const auto patch_t1 = std::chrono::steady_clock::now();
+                fprintf(stderr,
+                    "%s: selector tensor policy map patched prefix=%zu/%zu seconds=%.3f\n",
+                    __func__,
+                    prefix_count,
+                    choices.size(),
+                    std::chrono::duration<double>(patch_t1 - patch_t0).count());
                 nvfp4_selector_kld_metrics map_km;
                 if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, map_km, true)) {
                     restore_all();
                     return false;
                 }
+                stageb_runtime_decoded = true;
                 const nvfp4_selector_derived_metrics map_dm =
                     nvfp4_selector_derive_metrics(map_km);
                 const nvfp4_selector_metric_rank map_rank =
@@ -7799,20 +7884,43 @@ static bool nvfp4_selector_choose_policy(
                     map_dm.ok &&
                     best_it->measured.ok &&
                     nvfp4_selector_compare_one(map_dm, best_it->measured, rank_cfg) < 0;
-                map_keep = map_rank.pass && (score_better || metrics_better);
+                const bool map_keep = map_rank.pass && (score_better || metrics_better);
                 fprintf(stderr,
-                    "%s: selector tensor policy map measured_score=%.6f pass=%s keep=%s base_policy=%s switches=%zu %s\n",
+                    "%s: selector tensor policy map prefix=%zu measured_score=%.6f pass=%s keep=%s base_policy=%s switches=%zu %s\n",
                     __func__,
+                    prefix_count,
                     map_rank.score,
                     map_rank.pass ? "yes" : "no",
                     map_keep ? "yes" : "no",
                     best_it->name.c_str(),
-                    tensor_policy_map.size(),
+                    prefix_map.size(),
                     nvfp4_selector_format_metrics("search", map_dm).c_str());
+                if (map_keep) {
+                    const bool better_than_current =
+                        !have_best_map ||
+                        nvfp4_selector_compare_measured_score(map_rank.score, best_map_score) < 0 ||
+                        (map_rank.score == best_map_score &&
+                         nvfp4_selector_compare_one(map_dm, best_map_dm, rank_cfg) < 0);
+                    if (better_than_current) {
+                        have_best_map = true;
+                        best_map_score = map_rank.score;
+                        best_map_prefix = prefix_count;
+                        best_map_dm = map_dm;
+                        best_map = prefix_map;
+                    }
+                }
             }
-            restore_all();
 
-            if (!map_keep) {
+            if (have_best_map) {
+                tensor_policy_map = std::move(best_map);
+                fprintf(stderr,
+                    "%s: selector tensor policy map selected prefix=%zu/%zu measured_score=%.6f %s\n",
+                    __func__,
+                    best_map_prefix,
+                    choices.size(),
+                    best_map_score,
+                    nvfp4_selector_format_metrics("search", best_map_dm).c_str());
+            } else {
                 tensor_policy_map.clear();
                 fprintf(stderr,
                     "%s: selector tensor policy map disabled after measured KLD guard\n",
