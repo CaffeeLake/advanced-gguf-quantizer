@@ -34,7 +34,7 @@ Recipe fields:
 You can print the matching command from a recipe:
 
 ```bash
-./build/bin/llama-quantize imatrix-command recipes/model.toml
+./build/bin/advanced-gguf-quantizer imatrix-command recipes/model.toml
 ```
 
 ## Saved-Logit KLD Base
@@ -45,7 +45,7 @@ model. Quality mode compares candidate runtime logits against this base.
 Print the matching command:
 
 ```bash
-./build/bin/llama-quantize kld-command recipes/model.toml
+./build/bin/advanced-gguf-quantizer kld-command recipes/model.toml
 ```
 
 Equivalent direct form:

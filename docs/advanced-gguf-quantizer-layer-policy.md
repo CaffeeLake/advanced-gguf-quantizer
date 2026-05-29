@@ -16,8 +16,8 @@ extra bits only where evidence justifies them.
 - Do not silently turn a tied token embedding into an output fallback type.
 - Use `MXFP6_E2M3` only when a recipe or candidate assignment selects it.
 - Keep output/head choices explicit in the recipe and report.
-- Treat fallback types such as `Q8_0`, `Q6_K`, `Q4_0`, `BF16`, and `F16` as
-  budgeted policy choices, not hidden defaults.
+- Treat fallback types such as `MXFP6_E2M3`, `Q4_K`, `Q6_K`, `Q8_0`, `BF16`,
+  and `F16` as budgeted policy choices, not hidden defaults.
 
 MXFP6_E2M3 is experimental and unsupported by NVIDIA and llama.cpp. Future
 official support may use a different format, so mixed or MXFP6-primary GGUFs

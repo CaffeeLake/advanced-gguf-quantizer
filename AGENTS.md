@@ -58,8 +58,9 @@ features unless the maintainer explicitly asks for them.
 - Keep output/head policy explicit and conservative.
 - Treat MXFP6_E2M3 as experimental and unsupported by NVIDIA and llama.cpp; do
   not remove the compatibility warning from docs or the TUI.
-- Treat quality, correctness, and reproducibility as more important than speed
-  claims.
+- Treat NVFP4 as the speed-first format. Quality, correctness, and
+  reproducibility still require full evidence; speed claims require separate,
+  quiet-GPU benchmarks rather than assumptions.
 - Make frequent commits for meaningful checkpoints when operating as an agent.
 
 ## Build
@@ -126,19 +127,20 @@ the full suite if the change touches shared runtime behavior.
 Use recipes and projects for serious work:
 
 ```bash
-./build/bin/llama-quantize recipe init --profile nvfp4_mxfp6 --output recipe.toml
-./build/bin/llama-quantize recipe validate recipe.toml
-./build/bin/llama-quantize plan recipe.toml
-./build/bin/llama-quantize run recipe.toml --project runs/model --yes
+./build/bin/advanced-gguf-quantizer recipe init --profile nvfp4_mxfp6 --output recipe.toml
+./build/bin/advanced-gguf-quantizer recipe validate recipe.toml
+./build/bin/advanced-gguf-quantizer plan recipe.toml
+./build/bin/advanced-gguf-quantizer run recipe.toml --project runs/model --yes
 ```
 
 Use `plan` and `recipe validate` for inspection. Use `run` when the user wants a
 real model artifact. Do not use fake quantization passes as a substitute for a
 real artifact run.
 
-For saved-logit KLD base generation, use `llama-quantize kld-command` and run
-the printed command as-is. It should only name the reference GGUF, evaluation
-corpus, and output KLD base; do not add runtime-shape or scheduling overrides.
+For saved-logit KLD base generation, use
+`advanced-gguf-quantizer kld-command` and run the printed command as-is. It
+should only name the reference GGUF, evaluation corpus, and output KLD base; do
+not add runtime-shape or scheduling overrides.
 
 Every production run should preserve:
 
@@ -152,6 +154,33 @@ Every production run should preserve:
 - `checkpoint-key.json`;
 - quantization report;
 - validation smoke script.
+
+## NVFP4 Candidate Policy
+
+RSF is part of the normal NVFP4 candidate path by default. Do not hide RSF or
+other product behavior behind environment variables; expose it through recipes,
+project fields, or CLI flags.
+
+Speed-aware tensor type candidates are also part of the main selector path, not
+a post-hoc repair-only workflow. The selector should first try NVFP4/RSF
+tensor-local repair; only tensors where NVFP4 still has high local error should
+move to fallback types.
+
+Useful flags:
+
+- `--nvfp4-selector-candidate-types Q4_K,Q6_K,Q8_0`
+- `--nvfp4-selector-candidate-fraction F`
+- `--nvfp4-selector-candidate-top N`
+- `--nvfp4-selector-candidate-budget-mb N`
+- `--nvfp4-selector-candidate-class-limit N`
+- `--nvfp4-selector-candidate-report file.csv`
+- `--nvfp4-selector-candidate-tensor-types file.txt`
+
+With `--nvfp4-fast-quantize`, the default cap is the worst 10% of NVFP4-error
+candidate tensors. Mixed NVFP4/MXFP6 runs should prefer
+`MXFP6_E2M3,Q4_K,Q6_K,Q8_0` so MXFP6 can win before Q4_K when the mixed format
+is available. Do not run `llama-bench` inside quantization; benchmark final
+artifacts separately on a quiet GPU.
 
 ## Quality Evidence
 
@@ -208,8 +237,9 @@ where applicable:
 - output and token-embedding policy.
 
 Use the documented mixed policies rather than scattered tensor-name exceptions.
-Fallback types such as `Q8_0`, `Q6_K`, `Q4_0`, `BF16`, and `F16` are valid
-when recipe policy or repair/edit workflows require them.
+Main-path fallback candidates such as `MXFP6_E2M3`, `Q4_K`, `Q6_K`, `Q8_0`,
+`BF16`, and `F16` are valid when recipe policy, speed-aware candidate search,
+or repair/edit workflows require them.
 
 ## Performance And Resource Discipline
 

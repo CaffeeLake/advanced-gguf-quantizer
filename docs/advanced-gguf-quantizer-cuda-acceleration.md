@@ -69,7 +69,7 @@ After CUDA or runtime changes, build and run cheap checks first:
 ```bash
 cmake --build build --target llama-quantize advanced-gguf-quantizer llama-imatrix llama-perplexity -j 20
 ./build/bin/llama-quantize inspect models/source-bf16.gguf
-./build/bin/llama-quantize plan recipes/model.toml
+./build/bin/advanced-gguf-quantizer plan recipes/model.toml
 ```
 
 For quality claims, follow with a real run, `llama-completion` smoke test, and

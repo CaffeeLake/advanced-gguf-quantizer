@@ -7,36 +7,38 @@ reproducible and resumable.
 
 ## Commands
 
-- `llama-quantize recipe init --profile NAME --output recipe.toml`
+- `advanced-gguf-quantizer recipe init --profile NAME --output recipe.toml`
   creates a starting recipe.
-- `llama-quantize recipe validate recipe.toml`
+- `advanced-gguf-quantizer recipe validate recipe.toml`
   checks required fields and incompatible settings.
-- `llama-quantize plan recipe.toml`
+- `advanced-gguf-quantizer plan recipe.toml`
   prints the planned run without writing a GGUF.
-- `llama-quantize run recipe.toml --project DIR --yes`
+- `advanced-gguf-quantizer run recipe.toml --project DIR --yes`
   writes the quantized GGUF and run artifacts.
 - `llama-quantize inspect model.gguf`
   reports tensor types, scale tensors, metadata, MTP/NextN status, and output
   policy.
-- `llama-quantize candidates recipe.toml`
+- `advanced-gguf-quantizer candidates recipe.toml`
   expands a recipe into candidate recipes or candidate records.
-- `llama-quantize best metrics.jsonl --real-ppl-kld --quality-only`
+- `advanced-gguf-quantizer best metrics.jsonl --real-ppl-kld --quality-only`
   reports non-dominated candidates from real PPL/KLD metrics.
-- `llama-quantize what-if sensitivity.jsonl --tensor NAME`
+- `advanced-gguf-quantizer what-if sensitivity.jsonl --tensor NAME`
   inspects exact sensitivity rows from runs that produced them.
-- `llama-quantize kld-command recipe.toml`
+- `advanced-gguf-quantizer kld-command recipe.toml`
   prints the `llama-perplexity` command for a saved-logit KLD base.
-- `llama-quantize imatrix-command recipe.toml`
+- `advanced-gguf-quantizer imatrix-command recipe.toml`
   prints the `llama-imatrix` command for calibration.
 
-The helper binary `advanced-gguf-quantizer` accepts the same advanced
-subcommands while the command surface is consolidated under `llama-quantize`.
+`advanced-gguf-quantizer` owns the recipe/project/report helper surface.
+`llama-quantize` is the retained model-writing engine used by `run` and remains
+available for direct quantization and GGUF inspection.
 
 ## No Fake Production Runs
 
 For model-production requests, use `run`. Use `plan`, `recipe validate`, and
 `inspect` only for no-write inspection. Fast mode is still a real quantization
-run with a smaller search budget.
+run; it now uses the default full-evidence NVFP4 RSF search and caps
+speed-aware tensor type candidates instead of replacing the whole model.
 
 ## Recipe Fields
 
@@ -75,9 +77,9 @@ Evaluation:
   `llama-perplexity` executable.
 
 Saved-logit KLD base generation is intentionally minimal. Use the command
-printed by `llama-quantize kld-command`; it should contain only the reference
-model, evaluation corpus, and saved-logit output path. Let `llama-perplexity`
-use its defaults for runtime shape and scheduling.
+printed by `advanced-gguf-quantizer kld-command`; it should contain only the
+reference model, evaluation corpus, and saved-logit output path. Let
+`llama-perplexity` use its defaults for runtime shape and scheduling.
 
 Runtime and memory:
 
@@ -229,7 +231,7 @@ on every selected objective and strictly better on at least one.
 Recommended quality report:
 
 ```bash
-./build/bin/llama-quantize best runs/model/metrics.jsonl \
+./build/bin/advanced-gguf-quantizer best runs/model/metrics.jsonl \
   --real-ppl-kld \
   --quality-only \
   --report runs/model/best-report.json
@@ -257,8 +259,8 @@ Budget and fallback controls:
 - `target.vram_gb`: optional runtime memory budget.
 - `mixed.nvfp4_budget_bias`: favors more or fewer NVFP4 assignments.
 - `mixed.quality_margin`: acceptable measured loss for a demotion.
-- `mixed.fallback_types`: allowed fallback types such as `Q8_0`, `Q6_K`,
-  `Q4_0`, `BF16`, and `F16`.
+- `mixed.fallback_types`: allowed fallback types such as `MXFP6_E2M3`, `Q4_K`,
+  `Q6_K`, `Q8_0`, `BF16`, and `F16`.
 - `layer_policy.output_type`: separate output/head policy.
 - `layer_policy.embedding_type`: token embedding policy.
 
@@ -349,8 +351,8 @@ Before expensive runs:
 
 ```bash
 ./build/bin/llama-quantize inspect models/source-bf16.gguf
-./build/bin/llama-quantize recipe validate recipes/model.toml
-./build/bin/llama-quantize plan recipes/model.toml
+./build/bin/advanced-gguf-quantizer recipe validate recipes/model.toml
+./build/bin/advanced-gguf-quantizer plan recipes/model.toml
 ```
 
 After a run:

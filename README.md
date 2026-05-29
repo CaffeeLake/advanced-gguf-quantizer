@@ -75,7 +75,7 @@ Inspect the source GGUF:
 Create a starting recipe:
 
 ```bash
-./build/bin/llama-quantize recipe init --profile nvfp4 --output recipes/model.toml
+./build/bin/advanced-gguf-quantizer recipe init --profile nvfp4 --output recipes/model.toml
 ```
 
 Edit the recipe fields for your files:
@@ -111,20 +111,20 @@ Generate an imatrix:
 Generate a saved-logit KLD base:
 
 ```bash
-./build/bin/llama-quantize kld-command recipes/model.toml
+./build/bin/advanced-gguf-quantizer kld-command recipes/model.toml
 ```
 
 Inspect the planned command without writing a model:
 
 ```bash
-./build/bin/llama-quantize recipe validate recipes/model.toml
-./build/bin/llama-quantize plan recipes/model.toml
+./build/bin/advanced-gguf-quantizer recipe validate recipes/model.toml
+./build/bin/advanced-gguf-quantizer plan recipes/model.toml
 ```
 
 Run real quantization:
 
 ```bash
-./build/bin/llama-quantize run recipes/model.toml --project runs/model --yes
+./build/bin/advanced-gguf-quantizer run recipes/model.toml --project runs/model --yes
 ```
 
 Inspect and test the result:
@@ -139,22 +139,22 @@ Inspect and test the result:
 Compact Qwen-style dense or MTP model:
 
 ```bash
-./build/bin/llama-quantize recipe init --profile nvfp4_mxfp6 --output recipes/qwen.toml
-./build/bin/llama-quantize run recipes/qwen.toml --project runs/qwen --yes
+./build/bin/advanced-gguf-quantizer recipe init --profile nvfp4_mxfp6 --output recipes/qwen.toml
+./build/bin/advanced-gguf-quantizer run recipes/qwen.toml --project runs/qwen --yes
 ```
 
 Quality-first MoE model:
 
 ```bash
-./build/bin/llama-quantize recipe init --profile mxfp6-primary --output recipes/moe.toml
-./build/bin/llama-quantize run recipes/moe.toml --project runs/moe --yes
+./build/bin/advanced-gguf-quantizer recipe init --profile mxfp6-primary --output recipes/moe.toml
+./build/bin/advanced-gguf-quantizer run recipes/moe.toml --project runs/moe --yes
 ```
 
 Repair or edit an existing GGUF:
 
 ```bash
-./build/bin/llama-quantize recipe init --profile repair --output recipes/repair.toml
-./build/bin/llama-quantize run recipes/repair.toml --project runs/repair --yes
+./build/bin/advanced-gguf-quantizer recipe init --profile repair --output recipes/repair.toml
+./build/bin/advanced-gguf-quantizer run recipes/repair.toml --project runs/repair --yes
 ```
 
 Use `plan` to inspect a recipe. For model production, launch `run`; it writes
@@ -176,8 +176,9 @@ or models where NVFP4-only error is high.  MXFP6 is still experimental.
 - use MXFP6 as the primary target and demote selected tensors to NVFP4 to increase speed
 and reduce model size, when measured quality loss is acceptable.
 
-Fallback types such as `Q8_0`, `Q6_K`, `Q4_0`, `BF16`, and `F16` remain
-available for tensor policy, output/head handling, exclusions, and repair.
+Fallback types such as `MXFP6_E2M3`, `Q4_K`, `Q6_K`, `Q8_0`, `BF16`, and
+`F16` remain available for tensor policy, speed-aware candidate assignment,
+output/head handling, exclusions, and repair.
 
 ## Documentation
 

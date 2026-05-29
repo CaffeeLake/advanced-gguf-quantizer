@@ -6,9 +6,10 @@ common mistakes.
 
 ## Operating Principles
 
-- Use `llama-quantize` as the main command.
-- Use `advanced-gguf-quantizer` only when calling an advanced helper subcommand
-  directly.
+- Use `advanced-gguf-quantizer` for recipe, project, plan, run, candidates,
+  best-report, imatrix-command, and kld-command workflows.
+- Use `llama-quantize` as the direct model-writing engine and for GGUF
+  inspection.
 - Start from local GGUF files.
 - Put every serious run in a project directory.
 - Prefer recipes over ad hoc command lines.
@@ -28,7 +29,7 @@ common mistakes.
 3. Create or load a recipe:
 
    ```bash
-   ./build/bin/llama-quantize recipe init --profile nvfp4_mxfp6 --output recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer recipe init --profile nvfp4_mxfp6 --output recipes/model.toml
    ```
 
 4. Fill in source, output, calibration, imatrix, evaluation, KLD, target BPW,
@@ -37,7 +38,7 @@ common mistakes.
 6. Generate missing KLD evidence with the command from:
 
    ```bash
-   ./build/bin/llama-quantize kld-command recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer kld-command recipes/model.toml
    ```
 
    Use that command exactly for saved-logit KLD bases. It should only name the
@@ -47,14 +48,14 @@ common mistakes.
 7. Validate and inspect:
 
    ```bash
-   ./build/bin/llama-quantize recipe validate recipes/model.toml
-   ./build/bin/llama-quantize plan recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer recipe validate recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer plan recipes/model.toml
    ```
 
 8. Run:
 
    ```bash
-   ./build/bin/llama-quantize run recipes/model.toml --project runs/model --yes
+   ./build/bin/advanced-gguf-quantizer run recipes/model.toml --project runs/model --yes
    ```
 
 9. Inspect and smoke-test the output:
@@ -154,6 +155,15 @@ The active MXFP6-only refinement is tensor-scale selection over
 MXFP6 tensor scale around the E8M0 block-scale representation, not NVFP4
 four-over-six or FP8 cap policies.
 
+For NVFP4 quality mode, RSF is part of the normal candidate path by default.
+The main selector may also consider speed-aware tensor type candidates for the
+worst NVFP4-error tensors. This is not a separate repair pass. NVFP4/RSF
+tensor-local repair is tried first; fallback types such as `Q4_K`, `Q6_K`,
+`Q8_0`, and, in mixed runs, `MXFP6_E2M3` should only be applied when NVFP4
+still has high tensor-local error. The default fast path caps this at the worst
+10% of NVFP4 candidate tensors via `--nvfp4-selector-candidate-fraction 0.10`.
+Do not run benchmarks during quantization; benchmark final artifacts separately.
+
 ## Quality Rules
 
 - Treat PPL as a guardrail, not the whole objective.
@@ -198,7 +208,7 @@ Use best-candidate reports to compare non-dominated candidates. The report uses
 Pareto-style selection internally:
 
 ```bash
-./build/bin/llama-quantize best runs/model/metrics.jsonl \
+./build/bin/advanced-gguf-quantizer best runs/model/metrics.jsonl \
   --real-ppl-kld \
   --quality-only \
   --report runs/model/best-report.json

@@ -11,7 +11,10 @@ quantized model in this repository.
 ## Core Rules
 
 - Use local GGUF files as inputs.
-- Use `llama-quantize` as the primary command.
+- Use `advanced-gguf-quantizer` for recipe, project, plan, run, candidates,
+  best-report, imatrix-command, and kld-command workflows.
+- Use `llama-quantize` as the direct model-writing engine and for GGUF
+  inspection.
 - Use recipes and project directories for serious runs.
 - Use `plan` and `recipe validate` for inspection.
 - Use `run` for artifact-producing requests.
@@ -33,14 +36,14 @@ quantized model in this repository.
 3. Create a recipe if one is missing:
 
    ```bash
-   ./build/bin/llama-quantize recipe init --profile nvfp4_mxfp6 --output recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer recipe init --profile nvfp4_mxfp6 --output recipes/model.toml
    ```
 
 4. Generate missing imatrix and KLD commands from the recipe:
 
    ```bash
-   ./build/bin/llama-quantize imatrix-command recipes/model.toml
-   ./build/bin/llama-quantize kld-command recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer imatrix-command recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer kld-command recipes/model.toml
    ```
 
    For saved-logit KLD bases, run the printed KLD command as-is. Do not add
@@ -50,14 +53,14 @@ quantized model in this repository.
 5. Validate:
 
    ```bash
-   ./build/bin/llama-quantize recipe validate recipes/model.toml
-   ./build/bin/llama-quantize plan recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer recipe validate recipes/model.toml
+   ./build/bin/advanced-gguf-quantizer plan recipes/model.toml
    ```
 
 6. Start the real run:
 
    ```bash
-   ./build/bin/llama-quantize run recipes/model.toml --project runs/model --yes
+   ./build/bin/advanced-gguf-quantizer run recipes/model.toml --project runs/model --yes
    ```
 
 7. Inspect and smoke-test:
@@ -89,7 +92,7 @@ Quality mode should use:
 Useful command:
 
 ```bash
-./build/bin/llama-quantize best runs/model/metrics.jsonl \
+./build/bin/advanced-gguf-quantizer best runs/model/metrics.jsonl \
   --real-ppl-kld \
   --quality-only \
   --report runs/model/best-report.json
@@ -102,7 +105,13 @@ Useful command:
 - Use `nvfp4_mxfp6` when MXFP6 should improve selected NVFP4 tensors.
 - Use `mxfp6-primary` when MXFP6 is the default and NVFP4 is used only where
   measured loss is acceptable.
-- Keep fallback types explicit: `Q8_0`, `Q6_K`, `Q4_0`, `BF16`, and `F16`.
+- Keep fallback types explicit: `MXFP6_E2M3`, `Q4_K`, `Q6_K`, `Q8_0`, `BF16`,
+  and `F16`.
+- For NVFP4 quality mode, RSF is tried first. Speed-aware tensor type
+  candidates are capped to the worst NVFP4-error tensors, defaulting to the
+  worst 10% with `--nvfp4-selector-candidate-fraction 0.10`.
+- Do not run benchmarks inside quantization. Use static speed penalties during
+  candidate search and benchmark final artifacts separately.
 
 MXFP6_E2M3 is experimental and unsupported by NVIDIA and llama.cpp. If official
 MXFP6 support appears later, the official format may differ and GGUFs made here
