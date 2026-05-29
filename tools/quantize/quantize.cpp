@@ -9266,23 +9266,24 @@ int llama_quantize(int argc, char ** argv) {
         }
     };
     if (cli_nvfp4_fast_quantize) {
-        add_selector_controls_default("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", "8192");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_N_CHUNKS", "32");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "2048");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RSF_DEPTH", "deeper");
+        add_selector_controls_default("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", "32768");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_N_CHUNKS", "96");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "8192");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "0");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_AWQ_TOP", "12");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_TOP", "12");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", "96");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "48");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", "2048");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_HOLDOUT_CHUNKS", "16");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "16");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", "32");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_TOP", "24");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", "192");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "64");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", "8192");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_HOLDOUT_CHUNKS", "48");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "24");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_CHUNKS", "96");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_N_SEQ", "2");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", "4.0");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", "1.5");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", "0.75");
-        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", "0.10");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", "3.0");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", "1.5");
+        add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", "0.35");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_TOP", "0");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_REPORT_TOP", "0");
         fprintf(stderr, "llama_quantize: NVFP4 fast quantize using deep RSF selector defaults\n");
