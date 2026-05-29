@@ -9310,7 +9310,7 @@ int llama_quantize(int argc, char ** argv) {
     };
     if (cli_nvfp4_fast_quantize) {
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RSF_DEPTH", "exhaustive");
-        add_selector_controls_default("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", "65536");
+        add_selector_controls_default("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", "131072");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_N_CHUNKS", "2147483647");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "16384");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "0");

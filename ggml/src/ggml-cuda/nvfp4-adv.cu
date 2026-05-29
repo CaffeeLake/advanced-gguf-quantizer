@@ -260,7 +260,7 @@ static inline int nvfp4_cuda_rsf_depth(const nvfp4_cuda_runtime_cfg * cfg) {
 
 static inline int64_t nvfp4_cuda_rsf_coarse_cap(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 4096;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 8192;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 2048;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 1024;
         default:                              return 512;
@@ -269,7 +269,7 @@ static inline int64_t nvfp4_cuda_rsf_coarse_cap(int depth) {
 
 static inline int64_t nvfp4_cuda_rsf_refine_cap(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 131072;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 262144;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 65536;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 32768;
         default:                              return NVFP4_AUTOTUNE_MAX_SAMPLE_BLOCKS;
@@ -278,7 +278,7 @@ static inline int64_t nvfp4_cuda_rsf_refine_cap(int depth) {
 
 static inline int nvfp4_cuda_rsf_coarse_topk(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 80;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 128;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 64;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 40;
         default:                              return 24;
@@ -287,7 +287,7 @@ static inline int nvfp4_cuda_rsf_coarse_topk(int depth) {
 
 static inline int nvfp4_cuda_rsf_analytic_pool_size(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 160;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 256;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 112;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 72;
         default:                              return NVFP4_RSF_ANALYTIC_POOL_SIZE;
@@ -296,7 +296,7 @@ static inline int nvfp4_cuda_rsf_analytic_pool_size(int depth) {
 
 static inline int nvfp4_cuda_rsf_analytic_top_subblocks(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 2048;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 4096;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 1024;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 512;
         default:                              return NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS;
@@ -305,7 +305,7 @@ static inline int nvfp4_cuda_rsf_analytic_top_subblocks(int depth) {
 
 static inline int nvfp4_cuda_rsf_code_radius(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 6;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 8;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 5;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 4;
         default:                              return 3;
@@ -314,7 +314,7 @@ static inline int nvfp4_cuda_rsf_code_radius(int depth) {
 
 static inline int nvfp4_cuda_rsf_joint_top_scales(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 24;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 32;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 20;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 14;
         default:                              return NVFP4_RSF_JOINT_TOP_SCALES;
@@ -323,7 +323,7 @@ static inline int nvfp4_cuda_rsf_joint_top_scales(int depth) {
 
 static inline int nvfp4_cuda_rsf_joint_top_ab(int depth) {
     switch (depth) {
-        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 24;
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 32;
         case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 20;
         case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 14;
         default:                              return NVFP4_RSF_JOINT_TOP_AB;

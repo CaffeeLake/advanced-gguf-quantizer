@@ -184,9 +184,10 @@ these variants and the base policies they extend.
 
 The default NVFP4 RSF selector budget is the full-evidence real-artifact search
 used for current production candidates: all available KLD chunks, exhaustive
-RSF depth, 64 survey policies, 24 measured candidates, 2-way selector eval
-batching, and a 192-policy refinement budget. Use explicit selector fields only
-when intentionally running a smaller diagnostic or a targeted reproduction.
+RSF depth with a 131k-block tensor sample cap, 64 survey policies, 24 measured
+candidates, 2-way selector eval batching, and a 192-policy refinement budget.
+Use explicit selector fields only when intentionally running a smaller
+diagnostic or a targeted reproduction.
 
 For targeted diagnostics, `--nvfp4-selector-include-policy name` and
 `--nvfp4-selector-include-policies a,b` limit selector work to exact policy
