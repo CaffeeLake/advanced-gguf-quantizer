@@ -4297,12 +4297,23 @@ static bool nvfp4_selector_cfg_equal(const nvfp4_cuda_runtime_cfg & a, const nvf
         a.cap_m4 == b.cap_m4;
 }
 
-static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
-        const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr,
-        const std::string & recipe_policy_name = {},
-        bool include_rsf = true) {
-    std::vector<nvfp4_selector_policy> out;
-    const bool emit_rsf = include_rsf;
+static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_without_rsf(nvfp4_cuda_runtime_cfg cfg) {
+    cfg.reserved_i32 &= ~(NVFP4_CUDA_FLAG_RSF | NVFP4_CUDA_RSF_MODE_MASK);
+    return cfg;
+}
+
+static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_with_rsf(nvfp4_cuda_runtime_cfg cfg, int rsf_mode) {
+    cfg.reserved_i32 |= NVFP4_CUDA_FLAG_RSF;
+    nvfp4_cfg_set_rsf_mode(cfg, rsf_mode);
+    return cfg;
+}
+
+static bool nvfp4_selector_policy_name_has_rsf(const std::string & name) {
+    return (name.size() >= 4 && name.compare(name.size() - 4, 4, "_rsf") == 0) ||
+           name.find("_rsf_") != std::string::npos;
+}
+
+static int nvfp4_selector_effective_rsf_mode(const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr) {
     int rsf_mode = recipe_cfg != nullptr ? nvfp4_cfg_rsf_mode(*recipe_cfg) : NVFP4_CUDA_RSF_MODE_TENSOR;
     const std::string rsf_mode_control = quantize_control_string("LLAMA_NVFP4_SELECTOR_RSF_MODE");
     if (!rsf_mode_control.empty() && !nvfp4_parse_rsf_mode(rsf_mode_control.c_str(), rsf_mode)) {
@@ -4312,6 +4323,16 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
             rsf_mode_control.c_str());
         rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR;
     }
+    return rsf_mode;
+}
+
+static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
+        const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr,
+        const std::string & recipe_policy_name = {},
+        bool include_rsf = true) {
+    std::vector<nvfp4_selector_policy> out;
+    const bool emit_rsf = include_rsf;
+    const int rsf_mode = nvfp4_selector_effective_rsf_mode(recipe_cfg);
     auto push = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
         for (const auto & existing : out) {
             if (nvfp4_selector_cfg_equal(existing.cfg, cfg)) {
@@ -4328,12 +4349,10 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
         return name + "_rsf";
     };
     auto push_family = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
-        cfg.reserved_i32 &= ~(NVFP4_CUDA_FLAG_RSF | NVFP4_CUDA_RSF_MODE_MASK);
+        cfg = nvfp4_selector_cfg_without_rsf(cfg);
         push(name, cfg);
         if (emit_rsf) {
-            cfg.reserved_i32 |= NVFP4_CUDA_FLAG_RSF;
-            nvfp4_cfg_set_rsf_mode(cfg, rsf_mode);
-            push(rsf_name(name), cfg);
+            push(rsf_name(name), nvfp4_selector_cfg_with_rsf(cfg, rsf_mode));
         }
     };
     if (recipe_cfg != nullptr) {
@@ -4352,7 +4371,7 @@ static bool nvfp4_selector_policy_is_awq_tail(const std::string & name) {
 
 static bool nvfp4_selector_policy_is_rsf_family(const nvfp4_selector_policy & policy) {
     return nvfp4_cfg_has_rsf(policy.cfg) ||
-           (policy.name.size() >= 4 && policy.name.compare(policy.name.size() - 4, 4, "_rsf") == 0);
+           nvfp4_selector_policy_name_has_rsf(policy.name);
 }
 
 static bool nvfp4_selector_ends_with(const std::string & value, const std::string & suffix) {
@@ -4721,7 +4740,10 @@ static std::vector<int> nvfp4_selector_refit_candidates_for_class(
     return out;
 }
 
-static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(const std::vector<nvfp4_selector_policy> & ranked) {
+static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(
+        const std::vector<nvfp4_selector_policy> & ranked,
+        bool include_rsf = true,
+        int rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR) {
     const int refine_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_TOP", 12));
     const int refine_budget = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", 96));
     if (refine_budget <= 0 || ranked.empty()) {
@@ -4731,14 +4753,20 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(const s
     std::vector<nvfp4_selector_policy> out;
     for (int i = 0; i < refine_top && i < (int) ranked.size() && (int) out.size() < refine_budget; ++i) {
         const auto & seed = ranked[(size_t) i];
+        const std::string base_name = nvfp4_selector_rsf_base_policy_name(seed.name);
         auto add = [&](const std::string & suffix, nvfp4_cuda_runtime_cfg cfg) {
             if ((int) out.size() >= refine_budget) {
                 return;
             }
+            cfg = nvfp4_selector_cfg_without_rsf(cfg);
             cfg.refit_iters = std::max(2, std::min(24, cfg.refit_iters));
             cfg.cap_m6 = std::clamp(cfg.cap_m6, 256.0f, 512.0f);
             cfg.cap_m4 = std::clamp(cfg.cap_m4, 160.0f, 320.0f);
-            nvfp4_selector_push_policy_unique(out, seed.name + suffix, cfg);
+            const std::string name = base_name + suffix;
+            nvfp4_selector_push_policy_unique(out, name, cfg);
+            if (include_rsf && (int) out.size() < refine_budget) {
+                nvfp4_selector_push_policy_unique(out, name + "_rsf", nvfp4_selector_cfg_with_rsf(cfg, rsf_mode));
+            }
         };
 
         nvfp4_cuda_runtime_cfg cfg = seed.cfg;
@@ -4820,17 +4848,24 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_rescue_policies(
     const nvfp4_cuda_runtime_cfg & base_cfg,
     nvfp4_selector_tensor_class cls) {
     std::vector<nvfp4_selector_policy> out;
-    nvfp4_selector_push_policy_unique(out, "rescue_base", base_cfg);
+    const int rsf_mode = nvfp4_selector_effective_rsf_mode(&base_cfg);
+    nvfp4_selector_push_policy_unique(out, "rescue_base", nvfp4_selector_cfg_without_rsf(base_cfg));
+    nvfp4_selector_push_policy_unique(out, "rescue_base_rsf",
+        nvfp4_selector_cfg_with_rsf(nvfp4_selector_cfg_without_rsf(base_cfg), rsf_mode));
 
     const int rescue_budget = (int) std::max<int64_t>(8, SELECTOR_RESCUE_NVFP4_POLICY_BUDGET);
     auto add = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
         if ((int) out.size() >= rescue_budget) {
             return;
         }
+        cfg = nvfp4_selector_cfg_without_rsf(cfg);
         cfg.refit_iters = std::max(2, std::min(32, cfg.refit_iters));
         cfg.cap_m6 = std::clamp(cfg.cap_m6, 256.0f, 544.0f);
         cfg.cap_m4 = std::clamp(cfg.cap_m4, 160.0f, 352.0f);
         nvfp4_selector_push_policy_unique(out, name, cfg);
+        if ((int) out.size() < rescue_budget) {
+            nvfp4_selector_push_policy_unique(out, name + "_rsf", nvfp4_selector_cfg_with_rsf(cfg, rsf_mode));
+        }
     };
 
     const auto cap_pairs = nvfp4_selector_cap_pairs_for_class(cls, base_cfg);
@@ -5709,6 +5744,7 @@ static bool nvfp4_selector_choose_policy(
         return true;
     };
 
+    const int selector_rsf_mode = nvfp4_selector_effective_rsf_mode(recipe_cfg);
     auto policies = nvfp4_selector_default_policies(recipe_cfg, recipe_policy_name, include_rsf);
     const bool has_expert_bindings = std::any_of(all_bindings.begin(), all_bindings.end(), [](const nvfp4_selector_binding & b) {
         return b.name.find(".ffn_gate_exps.weight") != std::string::npos ||
@@ -5840,7 +5876,7 @@ static bool nvfp4_selector_choose_policy(
     std::sort(policies.begin(), policies.end(), nvfp4_selector_policy_proxy_less);
 
     if (!skip_remaining_tuning) {
-        auto refined = nvfp4_selector_refine_policies(policies);
+        auto refined = nvfp4_selector_refine_policies(policies, include_rsf, selector_rsf_mode);
         for (size_t policy_idx = 0; policy_idx < refined.size(); ++policy_idx) {
             auto & policy = refined[policy_idx];
             if (selector_policy_excluded_by_include(policy)) {
