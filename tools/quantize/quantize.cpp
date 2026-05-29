@@ -134,10 +134,20 @@ static int nvfp4_cfg_rsf_mode(const nvfp4_cuda_runtime_cfg & cfg) {
     return (cfg.reserved_i32 & NVFP4_CUDA_RSF_MODE_MASK) >> NVFP4_CUDA_RSF_MODE_SHIFT;
 }
 
+static int nvfp4_cfg_rsf_depth(const nvfp4_cuda_runtime_cfg & cfg) {
+    return (cfg.reserved_i32 & NVFP4_CUDA_RSF_DEPTH_MASK) >> NVFP4_CUDA_RSF_DEPTH_SHIFT;
+}
+
 static void nvfp4_cfg_set_rsf_mode(nvfp4_cuda_runtime_cfg & cfg, int mode) {
     mode = std::max((int) NVFP4_CUDA_RSF_MODE_TENSOR, std::min((int) NVFP4_CUDA_RSF_MODE_GROUP, mode));
     cfg.reserved_i32 &= ~NVFP4_CUDA_RSF_MODE_MASK;
     cfg.reserved_i32 |= mode << NVFP4_CUDA_RSF_MODE_SHIFT;
+}
+
+static void nvfp4_cfg_set_rsf_depth(nvfp4_cuda_runtime_cfg & cfg, int depth) {
+    depth = std::max((int) NVFP4_CUDA_RSF_DEPTH_NORMAL, std::min((int) NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE, depth));
+    cfg.reserved_i32 &= ~NVFP4_CUDA_RSF_DEPTH_MASK;
+    cfg.reserved_i32 |= depth << NVFP4_CUDA_RSF_DEPTH_SHIFT;
 }
 
 static const char * nvfp4_rsf_mode_name(int mode) {
@@ -168,6 +178,39 @@ static bool nvfp4_parse_rsf_mode(const char * value, int & out) {
     }
     if (striequals(value, "group")) {
         out = NVFP4_CUDA_RSF_MODE_GROUP;
+        return true;
+    }
+    return false;
+}
+
+static const char * nvfp4_rsf_depth_name(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_NORMAL:     return "normal";
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return "deep";
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return "deeper";
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return "exhaustive";
+    }
+    return "normal";
+}
+
+static bool nvfp4_parse_rsf_depth(const char * value, int & out) {
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    if (striequals(value, "normal") || striequals(value, "default")) {
+        out = NVFP4_CUDA_RSF_DEPTH_NORMAL;
+        return true;
+    }
+    if (striequals(value, "deep")) {
+        out = NVFP4_CUDA_RSF_DEPTH_DEEP;
+        return true;
+    }
+    if (striequals(value, "deeper")) {
+        out = NVFP4_CUDA_RSF_DEPTH_DEEPER;
+        return true;
+    }
+    if (striequals(value, "exhaustive") || striequals(value, "max")) {
+        out = NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE;
         return true;
     }
     return false;
@@ -4298,13 +4341,14 @@ static bool nvfp4_selector_cfg_equal(const nvfp4_cuda_runtime_cfg & a, const nvf
 }
 
 static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_without_rsf(nvfp4_cuda_runtime_cfg cfg) {
-    cfg.reserved_i32 &= ~(NVFP4_CUDA_FLAG_RSF | NVFP4_CUDA_RSF_MODE_MASK);
+    cfg.reserved_i32 &= ~(NVFP4_CUDA_FLAG_RSF | NVFP4_CUDA_RSF_MODE_MASK | NVFP4_CUDA_RSF_DEPTH_MASK);
     return cfg;
 }
 
-static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_with_rsf(nvfp4_cuda_runtime_cfg cfg, int rsf_mode) {
+static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_with_rsf(nvfp4_cuda_runtime_cfg cfg, int rsf_mode, int rsf_depth) {
     cfg.reserved_i32 |= NVFP4_CUDA_FLAG_RSF;
     nvfp4_cfg_set_rsf_mode(cfg, rsf_mode);
+    nvfp4_cfg_set_rsf_depth(cfg, rsf_depth);
     return cfg;
 }
 
@@ -4326,6 +4370,21 @@ static int nvfp4_selector_effective_rsf_mode(const nvfp4_cuda_runtime_cfg * reci
     return rsf_mode;
 }
 
+static int nvfp4_selector_effective_rsf_depth(const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr) {
+    int rsf_depth = recipe_cfg != nullptr && nvfp4_cfg_has_rsf(*recipe_cfg)
+        ? nvfp4_cfg_rsf_depth(*recipe_cfg)
+        : NVFP4_CUDA_RSF_DEPTH_DEEPER;
+    const std::string rsf_depth_control = quantize_control_string("LLAMA_NVFP4_SELECTOR_RSF_DEPTH");
+    if (!rsf_depth_control.empty() && !nvfp4_parse_rsf_depth(rsf_depth_control.c_str(), rsf_depth)) {
+        fprintf(stderr,
+            "%s: invalid NVFP4 RSF depth '%s'; using deeper\n",
+            __func__,
+            rsf_depth_control.c_str());
+        rsf_depth = NVFP4_CUDA_RSF_DEPTH_DEEPER;
+    }
+    return rsf_depth;
+}
+
 static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
         const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr,
         const std::string & recipe_policy_name = {},
@@ -4333,6 +4392,7 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
     std::vector<nvfp4_selector_policy> out;
     const bool emit_rsf = include_rsf;
     const int rsf_mode = nvfp4_selector_effective_rsf_mode(recipe_cfg);
+    const int rsf_depth = nvfp4_selector_effective_rsf_depth(recipe_cfg);
     auto push = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
         for (const auto & existing : out) {
             if (nvfp4_selector_cfg_equal(existing.cfg, cfg)) {
@@ -4352,7 +4412,7 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
         cfg = nvfp4_selector_cfg_without_rsf(cfg);
         push(name, cfg);
         if (emit_rsf) {
-            push(rsf_name(name), nvfp4_selector_cfg_with_rsf(cfg, rsf_mode));
+            push(rsf_name(name), nvfp4_selector_cfg_with_rsf(cfg, rsf_mode, rsf_depth));
         }
     };
     if (recipe_cfg != nullptr) {
@@ -4743,7 +4803,8 @@ static std::vector<int> nvfp4_selector_refit_candidates_for_class(
 static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(
         const std::vector<nvfp4_selector_policy> & ranked,
         bool include_rsf = true,
-        int rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR) {
+        int rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR,
+        int rsf_depth = NVFP4_CUDA_RSF_DEPTH_DEEPER) {
     const int refine_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_TOP", 12));
     const int refine_budget = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", 96));
     if (refine_budget <= 0 || ranked.empty()) {
@@ -4765,7 +4826,7 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(
             const std::string name = base_name + suffix;
             nvfp4_selector_push_policy_unique(out, name, cfg);
             if (include_rsf && (int) out.size() < refine_budget) {
-                nvfp4_selector_push_policy_unique(out, name + "_rsf", nvfp4_selector_cfg_with_rsf(cfg, rsf_mode));
+                nvfp4_selector_push_policy_unique(out, name + "_rsf", nvfp4_selector_cfg_with_rsf(cfg, rsf_mode, rsf_depth));
             }
         };
 
@@ -4849,9 +4910,10 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_rescue_policies(
     nvfp4_selector_tensor_class cls) {
     std::vector<nvfp4_selector_policy> out;
     const int rsf_mode = nvfp4_selector_effective_rsf_mode(&base_cfg);
+    const int rsf_depth = nvfp4_selector_effective_rsf_depth(&base_cfg);
     nvfp4_selector_push_policy_unique(out, "rescue_base", nvfp4_selector_cfg_without_rsf(base_cfg));
     nvfp4_selector_push_policy_unique(out, "rescue_base_rsf",
-        nvfp4_selector_cfg_with_rsf(nvfp4_selector_cfg_without_rsf(base_cfg), rsf_mode));
+        nvfp4_selector_cfg_with_rsf(nvfp4_selector_cfg_without_rsf(base_cfg), rsf_mode, rsf_depth));
 
     const int rescue_budget = (int) std::max<int64_t>(8, SELECTOR_RESCUE_NVFP4_POLICY_BUDGET);
     auto add = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
@@ -4864,7 +4926,7 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_rescue_policies(
         cfg.cap_m4 = std::clamp(cfg.cap_m4, 160.0f, 352.0f);
         nvfp4_selector_push_policy_unique(out, name, cfg);
         if ((int) out.size() < rescue_budget) {
-            nvfp4_selector_push_policy_unique(out, name + "_rsf", nvfp4_selector_cfg_with_rsf(cfg, rsf_mode));
+            nvfp4_selector_push_policy_unique(out, name + "_rsf", nvfp4_selector_cfg_with_rsf(cfg, rsf_mode, rsf_depth));
         }
     };
 
@@ -5745,6 +5807,7 @@ static bool nvfp4_selector_choose_policy(
     };
 
     const int selector_rsf_mode = nvfp4_selector_effective_rsf_mode(recipe_cfg);
+    const int selector_rsf_depth = nvfp4_selector_effective_rsf_depth(recipe_cfg);
     auto policies = nvfp4_selector_default_policies(recipe_cfg, recipe_policy_name, include_rsf);
     const bool has_expert_bindings = std::any_of(all_bindings.begin(), all_bindings.end(), [](const nvfp4_selector_binding & b) {
         return b.name.find(".ffn_gate_exps.weight") != std::string::npos ||
@@ -5876,7 +5939,7 @@ static bool nvfp4_selector_choose_policy(
     std::sort(policies.begin(), policies.end(), nvfp4_selector_policy_proxy_less);
 
     if (!skip_remaining_tuning) {
-        auto refined = nvfp4_selector_refine_policies(policies, include_rsf, selector_rsf_mode);
+        auto refined = nvfp4_selector_refine_policies(policies, include_rsf, selector_rsf_mode, selector_rsf_depth);
         for (size_t policy_idx = 0; policy_idx < refined.size(); ++policy_idx) {
             auto & policy = refined[policy_idx];
             if (selector_policy_excluded_by_include(policy)) {
@@ -8633,6 +8696,17 @@ int llama_quantize(int argc, char ** argv) {
                     usage(argv[0]);
                 }
                 add_selector_controls("LLAMA_NVFP4_SELECTOR_RSF_MODE", nvfp4_rsf_mode_name(rsf_mode));
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rsf-depth") == 0) {
+            if (arg_idx < argc-1) {
+                int rsf_depth = NVFP4_CUDA_RSF_DEPTH_DEEPER;
+                const char * value = argv[++arg_idx];
+                if (!nvfp4_parse_rsf_depth(value, rsf_depth)) {
+                    usage(argv[0]);
+                }
+                add_selector_controls("LLAMA_NVFP4_SELECTOR_RSF_DEPTH", nvfp4_rsf_depth_name(rsf_depth));
             } else {
                 usage(argv[0]);
             }

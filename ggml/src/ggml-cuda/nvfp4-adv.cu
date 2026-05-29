@@ -211,28 +211,124 @@ static constexpr float NVFP4_TUNE_FIXED_POOL[] = {
 };
 static constexpr float NVFP4_RSF_FIXED_SCALE_POOL[] = {
     0.625f,
+    0.65625f,
     0.6875f,
+    0.71875f,
     0.75f,
+    0.78125f,
     0.8125f,
+    0.84375f,
     0.875f,
+    0.90625f,
+    0.921875f,
     0.9375f,
+    0.953125f,
     0.96875f,
+    0.984375f,
     0.9918823242f,
     0.9864501953f,
     1.0f,
+    1.0078125f,
     1.015625f,
+    1.0234375f,
     1.03125f,
+    1.0390625f,
     1.046875f,
     1.0625f,
+    1.078125f,
     1.09375f,
     1.125f,
+    1.15625f,
     1.1875f,
     1.25f,
+    1.3125f,
     1.3333334f,
     1.375f,
+    1.4375f,
     1.50f,
+    1.5625f,
     1.625f,
 };
+
+static inline int nvfp4_cuda_rsf_depth(const nvfp4_cuda_runtime_cfg * cfg) {
+    if (cfg == nullptr || (cfg->reserved_i32 & NVFP4_CUDA_FLAG_RSF) == 0) {
+        return NVFP4_CUDA_RSF_DEPTH_DEEPER;
+    }
+    const int depth = (cfg->reserved_i32 & NVFP4_CUDA_RSF_DEPTH_MASK) >> NVFP4_CUDA_RSF_DEPTH_SHIFT;
+    return std::max((int) NVFP4_CUDA_RSF_DEPTH_NORMAL, std::min((int) NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE, depth));
+}
+
+static inline int64_t nvfp4_cuda_rsf_coarse_cap(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 4096;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 2048;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 1024;
+        default:                              return 512;
+    }
+}
+
+static inline int64_t nvfp4_cuda_rsf_refine_cap(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 131072;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 65536;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 32768;
+        default:                              return NVFP4_AUTOTUNE_MAX_SAMPLE_BLOCKS;
+    }
+}
+
+static inline int nvfp4_cuda_rsf_coarse_topk(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 80;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 64;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 40;
+        default:                              return 24;
+    }
+}
+
+static inline int nvfp4_cuda_rsf_analytic_pool_size(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 160;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 112;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 72;
+        default:                              return NVFP4_RSF_ANALYTIC_POOL_SIZE;
+    }
+}
+
+static inline int nvfp4_cuda_rsf_analytic_top_subblocks(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 2048;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 1024;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 512;
+        default:                              return NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS;
+    }
+}
+
+static inline int nvfp4_cuda_rsf_code_radius(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 6;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 5;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 4;
+        default:                              return 3;
+    }
+}
+
+static inline int nvfp4_cuda_rsf_joint_top_scales(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 24;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 20;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 14;
+        default:                              return NVFP4_RSF_JOINT_TOP_SCALES;
+    }
+}
+
+static inline int nvfp4_cuda_rsf_joint_top_ab(int depth) {
+    switch (depth) {
+        case NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE: return 24;
+        case NVFP4_CUDA_RSF_DEPTH_DEEPER:     return 20;
+        case NVFP4_CUDA_RSF_DEPTH_DEEP:       return 14;
+        default:                              return NVFP4_RSF_JOINT_TOP_AB;
+    }
+}
 
 static inline void nvfp4_host_apply_ab_caps(
         nvfp4_cuda_runtime_cfg & resolved,
@@ -2093,9 +2189,13 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
     if (x == nullptr || sample_nb <= 0) {
         return {};
     }
+    const int rsf_depth = nvfp4_cuda_rsf_depth(&cfg);
+    const int analytic_top_subblocks = nvfp4_cuda_rsf_analytic_top_subblocks(rsf_depth);
+    const int analytic_pool_size = nvfp4_cuda_rsf_analytic_pool_size(rsf_depth);
+    const int code_radius = nvfp4_cuda_rsf_code_radius(rsf_depth);
     hints.reserve((size_t) std::min<int64_t>(
         sample_nb * (QK_NVFP4 / QK_NVFP4_SUB) * 2,
-        NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS * 2));
+        analytic_top_subblocks * 2));
 
     auto add_hint = [&](const float * x16, const float * qw16, float anchor, float cap) {
         if (!(anchor > 0.0f) || !(cap > 0.0f) || !std::isfinite(anchor) || !std::isfinite(cap)) {
@@ -2171,8 +2271,8 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
     std::sort(hints.begin(), hints.end(), [](const nvfp4_rsf_subblock_hint & a, const nvfp4_rsf_subblock_hint & b) {
         return a.priority > b.priority;
     });
-    if ((int) hints.size() > NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS) {
-        hints.resize(NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS);
+    if ((int) hints.size() > analytic_top_subblocks) {
+        hints.resize(analytic_top_subblocks);
     }
 
     struct candidate {
@@ -2180,7 +2280,7 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
         double score;
     };
     std::vector<candidate> candidates;
-    candidates.reserve(NVFP4_RSF_ANALYTIC_POOL_SIZE);
+    candidates.reserve((size_t) analytic_pool_size);
     auto add_candidate = [&](float scale_mul, double score) {
         if (!(scale_mul > 0.0f) || !std::isfinite(scale_mul) || !(score > 0.0) || !std::isfinite(score)) {
             return;
@@ -2201,7 +2301,7 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
 
     for (const nvfp4_rsf_subblock_hint & hint : hints) {
         const int center = (int) hint.code;
-        for (int delta = -3; delta <= 3; ++delta) {
+        for (int delta = -code_radius; delta <= code_radius; ++delta) {
             const int code = center + delta;
             if (code <= 0 || code >= 0x7F) {
                 continue;
@@ -2218,8 +2318,8 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
     std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
         return a.score > b.score;
     });
-    if ((int) candidates.size() > NVFP4_RSF_ANALYTIC_POOL_SIZE) {
-        candidates.resize(NVFP4_RSF_ANALYTIC_POOL_SIZE);
+    if ((int) candidates.size() > analytic_pool_size) {
+        candidates.resize(analytic_pool_size);
     }
 
     std::vector<float> out;
@@ -3607,9 +3707,13 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     }
 
     const int64_t nb_total = n / QK_NVFP4;
-    const int64_t coarse_cap = 512;
-    const int64_t refine_cap = NVFP4_AUTOTUNE_MAX_SAMPLE_BLOCKS;
-    const int coarse_topk = 24;
+    const bool enable_rsf_scale_tune =
+        cfg_hint == nullptr ||
+        ((cfg_hint->reserved_i32 & NVFP4_CUDA_FLAG_RSF) != 0);
+    const int rsf_depth = enable_rsf_scale_tune ? nvfp4_cuda_rsf_depth(cfg_hint) : NVFP4_CUDA_RSF_DEPTH_NORMAL;
+    const int64_t coarse_cap = nvfp4_cuda_rsf_coarse_cap(rsf_depth);
+    const int64_t refine_cap = nvfp4_cuda_rsf_refine_cap(rsf_depth);
+    const int coarse_topk = nvfp4_cuda_rsf_coarse_topk(rsf_depth);
 
     const int64_t coarse_nb = std::min<int64_t>(nb_total, coarse_cap);
     const int64_t refine_nb = std::min<int64_t>(nb_total, refine_cap);
@@ -3647,9 +3751,6 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     const float * b_candidates = NVFP4_TUNE_FIXED_POOL;
     const int a_candidates_n = (int) (sizeof(NVFP4_TUNE_FIXED_POOL) / sizeof(NVFP4_TUNE_FIXED_POOL[0]));
     const int b_candidates_n = a_candidates_n;
-    const bool enable_rsf_scale_tune =
-        cfg_hint == nullptr ||
-        ((cfg_hint->reserved_i32 & NVFP4_CUDA_FLAG_RSF) != 0);
 
     std::vector<float> rsf_scale_mul_candidates;
     if (enable_rsf_scale_tune) {
@@ -3855,11 +3956,13 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         std::sort(top_ab.begin(), top_ab.end(), [](const ranked_ab & a, const ranked_ab & b) {
             return a.rank_score < b.rank_score;
         });
-        if ((int) top_scales.size() > NVFP4_RSF_JOINT_TOP_SCALES) {
-            top_scales.resize(NVFP4_RSF_JOINT_TOP_SCALES);
+        const int joint_top_scales = nvfp4_cuda_rsf_joint_top_scales(rsf_depth);
+        const int joint_top_ab = nvfp4_cuda_rsf_joint_top_ab(rsf_depth);
+        if ((int) top_scales.size() > joint_top_scales) {
+            top_scales.resize(joint_top_scales);
         }
-        if ((int) top_ab.size() > NVFP4_RSF_JOINT_TOP_AB) {
-            top_ab.resize(NVFP4_RSF_JOINT_TOP_AB);
+        if ((int) top_ab.size() > joint_top_ab) {
+            top_ab.resize(joint_top_ab);
         }
 
         std::vector<nvfp4_cuda_eval_request> joint_requests;

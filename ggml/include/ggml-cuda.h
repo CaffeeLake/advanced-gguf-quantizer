@@ -61,12 +61,21 @@ enum nvfp4_cuda_choose46_mode {
 #define NVFP4_CUDA_FLAG_RSF           (1 << 0)
 #define NVFP4_CUDA_RSF_MODE_SHIFT     4
 #define NVFP4_CUDA_RSF_MODE_MASK      (3 << NVFP4_CUDA_RSF_MODE_SHIFT)
+#define NVFP4_CUDA_RSF_DEPTH_SHIFT    8
+#define NVFP4_CUDA_RSF_DEPTH_MASK     (3 << NVFP4_CUDA_RSF_DEPTH_SHIFT)
 
 enum nvfp4_cuda_rsf_mode {
     NVFP4_CUDA_RSF_MODE_TENSOR = 0,
     NVFP4_CUDA_RSF_MODE_SLICE  = 1,
     NVFP4_CUDA_RSF_MODE_EXPERT = 2,
     NVFP4_CUDA_RSF_MODE_GROUP  = 3,
+};
+
+enum nvfp4_cuda_rsf_depth {
+    NVFP4_CUDA_RSF_DEPTH_NORMAL     = 0,
+    NVFP4_CUDA_RSF_DEPTH_DEEP       = 1,
+    NVFP4_CUDA_RSF_DEPTH_DEEPER     = 2,
+    NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE = 3,
 };
 
 typedef struct nvfp4_cuda_runtime_cfg {
