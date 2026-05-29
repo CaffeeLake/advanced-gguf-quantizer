@@ -186,10 +186,12 @@ static constexpr int NVFP4_REFIT_ITERS = 8;
 static constexpr int NVFP4_TUNE_REFIT_ITERS = 8;
 static constexpr int NVFP4_TUNE_POOL_SIZE = 48;
 static constexpr int NVFP4_COMPAND_TOPK = 6;
-static constexpr int NVFP4_RSF_ANALYTIC_POOL_SIZE = 24;
-static constexpr int NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS = 128;
-static constexpr float NVFP4_RSF_SCALE_MUL_MIN = 0.75f;
-static constexpr float NVFP4_RSF_SCALE_MUL_MAX = 1.50f;
+static constexpr int NVFP4_RSF_ANALYTIC_POOL_SIZE = 40;
+static constexpr int NVFP4_RSF_ANALYTIC_TOP_SUBBLOCKS = 256;
+static constexpr int NVFP4_RSF_JOINT_TOP_SCALES = 8;
+static constexpr int NVFP4_RSF_JOINT_TOP_AB = 10;
+static constexpr float NVFP4_RSF_SCALE_MUL_MIN = 0.625f;
+static constexpr float NVFP4_RSF_SCALE_MUL_MAX = 1.625f;
 static constexpr float NVFP4_E2M1_MAX_VALUE = 6.0f;
 static constexpr float NVFP4_TUNE_FIXED_POOL[] = {
     0.9918823242f,
@@ -206,6 +208,30 @@ static constexpr float NVFP4_TUNE_FIXED_POOL[] = {
     1.125f,
     1.1875f,
     1.25f,
+};
+static constexpr float NVFP4_RSF_FIXED_SCALE_POOL[] = {
+    0.625f,
+    0.6875f,
+    0.75f,
+    0.8125f,
+    0.875f,
+    0.9375f,
+    0.96875f,
+    0.9918823242f,
+    0.9864501953f,
+    1.0f,
+    1.015625f,
+    1.03125f,
+    1.046875f,
+    1.0625f,
+    1.09375f,
+    1.125f,
+    1.1875f,
+    1.25f,
+    1.3333334f,
+    1.375f,
+    1.50f,
+    1.625f,
 };
 
 static inline void nvfp4_host_apply_ab_caps(
@@ -3681,7 +3707,8 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
 
     std::vector<float> scale_mul_candidates;
     if (enable_rsf_scale_tune) {
-        scale_mul_candidates.reserve(rsf_scale_mul_candidates.size() + (size_t) a_candidates_n);
+        const int rsf_fixed_n = (int) (sizeof(NVFP4_RSF_FIXED_SCALE_POOL) / sizeof(NVFP4_RSF_FIXED_SCALE_POOL[0]));
+        scale_mul_candidates.reserve(rsf_scale_mul_candidates.size() + (size_t) rsf_fixed_n);
         auto add_scale_mul_candidate = [&](float cand_scale) {
             if (!(cand_scale > 0.0f) || !std::isfinite(cand_scale)) {
                 return;
@@ -3701,8 +3728,8 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         for (float cand_scale : rsf_scale_mul_candidates) {
             add_scale_mul_candidate(cand_scale);
         }
-        for (int si = 0; si < a_candidates_n; ++si) {
-            add_scale_mul_candidate(a_candidates[si]);
+        for (int si = 0; si < rsf_fixed_n; ++si) {
+            add_scale_mul_candidate(NVFP4_RSF_FIXED_SCALE_POOL[si]);
         }
         if (trace && !rsf_scale_mul_candidates.empty()) {
             fprintf(stderr,
@@ -3759,6 +3786,116 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
             best_a_now = coarse_requests[ci].a;
             best_b_now = coarse_requests[ci].b;
             best_scale_mul_now = coarse_requests[ci].scale_mul;
+        }
+    }
+
+    if (enable_rsf_scale_tune && !scale_mul_candidates.empty()) {
+        struct ranked_scale {
+            float scale_mul;
+            double rank_score;
+        };
+        struct ranked_ab {
+            float a;
+            float b;
+            double rank_score;
+        };
+        std::vector<ranked_scale> top_scales;
+        std::vector<ranked_ab> top_ab;
+        auto same_scale = [](float a, float b) {
+            return std::fabs(a - b) <= 5e-4f * std::max(1.0f, std::max(std::fabs(a), std::fabs(b)));
+        };
+        auto same_ab = [](float a0, float b0, float a1, float b1) {
+            return std::fabs(a0 - a1) <= 1e-12f && std::fabs(b0 - b1) <= 1e-12f;
+        };
+        auto add_ranked_scale = [&](float scale_mul, double rank_score) {
+            if (!(scale_mul > 0.0f) || !std::isfinite(scale_mul) || !std::isfinite(rank_score)) {
+                return;
+            }
+            for (auto & s : top_scales) {
+                if (same_scale(s.scale_mul, scale_mul)) {
+                    s.rank_score = std::min(s.rank_score, rank_score);
+                    return;
+                }
+            }
+            top_scales.push_back({ scale_mul, rank_score });
+        };
+        auto add_ranked_ab = [&](float a, float b, double rank_score) {
+            if (!(a > 0.0f) || !(b > 0.0f) || !std::isfinite(a) || !std::isfinite(b) || !std::isfinite(rank_score)) {
+                return;
+            }
+            for (auto & ab : top_ab) {
+                if (same_ab(ab.a, ab.b, a, b)) {
+                    ab.rank_score = std::min(ab.rank_score, rank_score);
+                    return;
+                }
+            }
+            top_ab.push_back({ a, b, rank_score });
+        };
+
+        for (size_t ci = 1; ci < coarse_requests.size(); ++ci) {
+            if (coarse_ok[ci] == 0) {
+                continue;
+            }
+            const auto & req = coarse_requests[ci];
+            const double rank_score = nvfp4_host_robust_score(coarse_results[ci], base_coarse);
+            const bool scale_changed = std::fabs(req.scale_mul - 1.0f) > 1e-5f;
+            const bool ab_changed =
+                std::fabs(req.a - NVFP4_A0) > 1e-12f ||
+                std::fabs(req.b - NVFP4_B0) > 1e-12f;
+            if (scale_changed && !ab_changed) {
+                add_ranked_scale(req.scale_mul, rank_score);
+            } else if (!scale_changed && ab_changed) {
+                add_ranked_ab(req.a, req.b, rank_score);
+            }
+        }
+
+        std::sort(top_scales.begin(), top_scales.end(), [](const ranked_scale & a, const ranked_scale & b) {
+            return a.rank_score < b.rank_score;
+        });
+        std::sort(top_ab.begin(), top_ab.end(), [](const ranked_ab & a, const ranked_ab & b) {
+            return a.rank_score < b.rank_score;
+        });
+        if ((int) top_scales.size() > NVFP4_RSF_JOINT_TOP_SCALES) {
+            top_scales.resize(NVFP4_RSF_JOINT_TOP_SCALES);
+        }
+        if ((int) top_ab.size() > NVFP4_RSF_JOINT_TOP_AB) {
+            top_ab.resize(NVFP4_RSF_JOINT_TOP_AB);
+        }
+
+        std::vector<nvfp4_cuda_eval_request> joint_requests;
+        joint_requests.reserve(top_scales.size() * top_ab.size());
+        for (const ranked_scale & scale : top_scales) {
+            for (const ranked_ab & ab : top_ab) {
+                joint_requests.push_back(make_ab_request(ab.a, ab.b, scale.scale_mul));
+            }
+        }
+
+        std::vector<nvfp4_tune_eval_stats> joint_results;
+        std::vector<uint8_t> joint_ok;
+        if (!joint_requests.empty() &&
+                nvfp4_cuda_eval_requests_parallel(x_coarse, qw_coarse, coarse_nb,
+                    joint_requests.data(), (int) joint_requests.size(), joint_results, &joint_ok, st)) {
+            for (size_t ji = 0; ji < joint_requests.size(); ++ji) {
+                if (joint_ok[ji] == 0) {
+                    continue;
+                }
+                const nvfp4_tune_eval_stats & joint_stats = joint_results[ji];
+                const double rank_score = nvfp4_host_robust_score(joint_stats, base_coarse);
+                insert_topk(joint_requests[ji].a, joint_requests[ji].b, joint_requests[ji].scale_mul, joint_stats, rank_score);
+                if (nvfp4_host_eval_better(joint_stats, best_coarse)) {
+                    best_coarse = joint_stats;
+                    best_a_now = joint_requests[ji].a;
+                    best_b_now = joint_requests[ji].b;
+                    best_scale_mul_now = joint_requests[ji].scale_mul;
+                }
+            }
+            if (trace) {
+                fprintf(stderr,
+                    "NVFP4_TUNE (CUDA RSF joint) scales=%d ab=%d requests=%d\n",
+                    (int) top_scales.size(),
+                    (int) top_ab.size(),
+                    (int) joint_requests.size());
+            }
         }
     }
 
