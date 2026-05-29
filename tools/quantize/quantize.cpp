@@ -7729,7 +7729,7 @@ static bool nvfp4_selector_choose_policy(
                         count,
                         0,
                         0,
-                        true) || count <= 0) {
+                        false) || count <= 0) {
                     return false;
                 }
 
@@ -7750,8 +7750,10 @@ static bool nvfp4_selector_choose_policy(
                             b.target_input_scale_nbytes)) {
                     return false;
                 }
-                return ggml_cuda_nvfp4_tensor_set_header_scales(
-                    b.target, header_weight_scale, header_input_scale, nullptr);
+                (void) header_weight_scale;
+                (void) header_input_scale;
+                return quantize_tensor_copy_in(
+                    b.target, b.working_target_bytes.data(), b.target_nbytes);
             };
 
             bool map_patch_ok = true;
