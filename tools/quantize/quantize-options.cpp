@@ -193,7 +193,7 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --nvfp4-autotune-max-blocks N / --nvfp4-autotune-threads N\n");
     printf("                                      set CUDA NVFP4 encoder autotune sample cap and worker count.\n");
     printf("  --nvfp4-fast-quantize\n");
-    printf("                                      use the default deep NVFP4 RSF selector/autotune budget.\n");
+    printf("                                      use the default full-KLD exhaustive NVFP4 RSF selector/autotune budget.\n");
     printf("  --nvfp4-selector-rsf-mode tensor|slice|expert|group / --nvfp4-selector-rsf-depth normal|deep|deeper|exhaustive / --nvfp4-selector-no-rsf\n");
     printf("                                      set refined scale fit (RSF) granularity/search depth, or disable default RSF selector variants for diagnostics.\n");
     printf("  --nvfp4-selector-rsf-report file.txt\n");

@@ -173,7 +173,8 @@ Recipe files can set the RSF granularity explicitly:
 
 ```toml
 [nvfp4.rsf]
-mode = "tensor" # tensor | slice | expert | group
+mode = "tensor"       # tensor | slice | expert | group
+depth = "exhaustive"  # normal | deep | deeper | exhaustive
 ```
 
 RSF variants are shortlisted by the existing proxy path and, when a KLD base is
@@ -181,12 +182,11 @@ available, scored by the same full PPL/KLD selector machinery as other NVFP4
 policies. Adaptive four-over-six remains the default NVFP4 encoder path for
 these variants and the base policies they extend.
 
-The default NVFP4 RSF selector budget is the deeper real-artifact search used
-for current production candidates: 32 search chunks, 16 holdout chunks, 48
-survey policies, 16 measured candidates, 32 measured KLD chunks per subset,
-2-way selector eval batching, and a 96-policy refinement budget. Use explicit
-selector fields only when intentionally running a smaller diagnostic or a
-larger full-best sweep.
+The default NVFP4 RSF selector budget is the full-evidence real-artifact search
+used for current production candidates: all available KLD chunks, exhaustive
+RSF depth, 64 survey policies, 24 measured candidates, 2-way selector eval
+batching, and a 192-policy refinement budget. Use explicit selector fields only
+when intentionally running a smaller diagnostic or a targeted reproduction.
 
 For targeted diagnostics, `--nvfp4-selector-include-policy name` and
 `--nvfp4-selector-include-policies a,b` limit selector work to exact policy

@@ -234,6 +234,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "nvfp4.calibration_families") { r.nvfp4.calibration_families = parse_string_list(raw_value); return; }
     if (path == "nvfp4.scale_tie") { r.nvfp4.scale_tie = value; return; }
     if (path == "nvfp4.rsf.mode") { r.nvfp4.rsf.mode = value; return; }
+    if (path == "nvfp4.rsf.depth") { r.nvfp4.rsf.depth = value; return; }
     if (path == "nvfp4.autotune.max_blocks") { r.nvfp4.autotune.max_blocks = value; return; }
     if (path == "nvfp4.autotune.threads") { r.nvfp4.autotune.threads = value; return; }
 
@@ -724,6 +725,14 @@ std::vector<std::string> validate_recipe(const Recipe & recipe, bool require_io)
             rsf_mode != "group") {
         errors.push_back("nvfp4.rsf.mode must be one of: tensor, slice, expert, group");
     }
+    const std::string rsf_depth = lower_copy(trim(recipe.nvfp4.rsf.depth));
+    if (!rsf_depth.empty() &&
+            rsf_depth != "normal" &&
+            rsf_depth != "deep" &&
+            rsf_depth != "deeper" &&
+            rsf_depth != "exhaustive") {
+        errors.push_back("nvfp4.rsf.depth must be one of: normal, deep, deeper, exhaustive");
+    }
     if (recipe.evaluation.kld_mode == "make_base" && recipe.evaluation.bf16_reference.empty() && recipe.io.input.empty()) {
         errors.push_back("evaluation.bf16_reference or io.input is required when evaluation.kld_mode=make_base");
     }
@@ -838,6 +847,7 @@ std::string dump_recipe_toml(const Recipe & r) {
 
     out << "\n[nvfp4.rsf]\n";
     dump_string(out, "mode", r.nvfp4.rsf.mode);
+    dump_string(out, "depth", r.nvfp4.rsf.depth);
 
     const bool show_low_level = !r.autotune.enabled || r.autotune.allow_diagnostic;
     if (show_low_level) {
@@ -1025,6 +1035,7 @@ void apply_master_autotune(Recipe & r) {
         assign_if_empty(r.selector.eval_chunks, "4");
         assign_if_empty(r.selector.n_seq, "1");
         assign_if_empty(r.nvfp4.autotune.max_blocks, "8192");
+        assign_if_empty(r.nvfp4.rsf.depth, "normal");
         assign_if_empty(r.nvfp4.four_six.refit_iters, "8");
         if (uses_mxfp6) {
             if (uses_nvfp4) {
@@ -1059,6 +1070,7 @@ void apply_master_autotune(Recipe & r) {
         r.selector.ranking.max_kld_hard_gate = false;
         if (uses_nvfp4) {
             assign_if_empty(r.nvfp4.autotune.max_blocks, "8192");
+            assign_if_empty(r.nvfp4.rsf.depth, "deeper");
             assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
             assign_if_empty(r.nvfp4.four_six.refit_iters, "8");
             assign_if_empty(r.nvfp4.four_six.compand, "1");
@@ -1079,30 +1091,31 @@ void apply_master_autotune(Recipe & r) {
     }
 
     const bool balanced = r.autotune.mode == "balanced";
-    assign_if_empty(r.selector.chunks, balanced ? "32" : "96");
-    assign_if_empty(r.selector.holdout_chunks, balanced ? "16" : "32");
-    assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "2048" : "16384");
+    assign_if_empty(r.selector.chunks, balanced ? "96" : "auto");
+    assign_if_empty(r.selector.holdout_chunks, balanced ? "48" : "auto");
+    assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "8192" : "16384");
     assign_if_empty(r.selector.stagea_max_policies, "0");
-    assign_if_empty(r.selector.refine_top, balanced ? "12" : "16");
-    assign_if_empty(r.selector.refine_budget, balanced ? "96" : "128");
-    assign_if_empty(r.selector.survey_top, balanced ? "48" : "24");
-    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "2048" : "16384");
+    assign_if_empty(r.selector.refine_top, "24");
+    assign_if_empty(r.selector.refine_budget, "192");
+    assign_if_empty(r.selector.survey_top, "64");
+    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "8192" : "16384");
     assign_if_empty(r.selector.max_tensors, "0");
-    assign_if_empty(r.selector.eval_top, balanced ? "16" : "8");
-    assign_if_empty(r.selector.eval_chunks, balanced ? "32" : "96");
-    assign_if_empty(r.selector.n_seq, balanced ? "2" : "4");
+    assign_if_empty(r.selector.eval_top, "24");
+    assign_if_empty(r.selector.eval_chunks, balanced ? "96" : "auto");
+    assign_if_empty(r.selector.n_seq, "2");
 
     if (uses_nvfp4) {
-        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "8192" : "65536");
+        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "32768" : "65536");
+        assign_if_empty(r.nvfp4.rsf.depth, balanced ? "deeper" : "exhaustive");
         assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
         assign_if_empty(r.nvfp4.four_six.refit_iters, "16");
         assign_if_empty(r.nvfp4.four_six.compand, "1");
         assign_if_empty(r.nvfp4.four_six.cap6, "448");
         assign_if_empty(r.nvfp4.four_six.cap4, "224");
-        assign_if_empty(r.selector.ranking.kld_penalty, balanced ? "4.0" : "12.0");
-        assign_if_empty(r.selector.ranking.p99_penalty, balanced ? "1.5" : "7.0");
-        assign_if_empty(r.selector.ranking.p999_penalty, balanced ? "0.75" : "2.0");
-        assign_if_empty(r.selector.ranking.max_kld_penalty, balanced ? "0.10" : "0.04");
+        assign_if_empty(r.selector.ranking.kld_penalty, "4.0");
+        assign_if_empty(r.selector.ranking.p99_penalty, "3.0");
+        assign_if_empty(r.selector.ranking.p999_penalty, "1.5");
+        assign_if_empty(r.selector.ranking.max_kld_penalty, "0.35");
         r.selector.ranking.kld_hard_gate = false;
         r.selector.ranking.p99_hard_gate = !balanced;
         r.selector.ranking.p999_hard_gate = !balanced;
@@ -1223,7 +1236,7 @@ Recipe default_recipe(const std::string & profile) {
         r.base.output_tensor_type = "Q6_K";
         r.base.token_embedding_type = "NVFP4";
         r.autotune.enabled = true;
-        r.autotune.mode = "balanced";
+        r.autotune.mode = "quality";
         r.autotune.objective = "kld-first";
         r.autotune.evidence = "real-ppl-kld";
         r.autotune.require_kld = true;
@@ -1238,7 +1251,7 @@ Recipe default_recipe(const std::string & profile) {
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "NVFP4" };
         r.stock_ftype.output_tensor_candidates = { "Q6_K" };
-        r.stock_ftype.rationale = "Default NVFP4 RSF search: deep real-artifact selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
+        r.stock_ftype.rationale = "Default NVFP4 RSF search: full-KLD exhaustive real-artifact selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
     } else if (profile == "nvfp4-fast" || profile == "nvfp4-minimal" || profile == "fast") {
         r.target.precision_mode = "NVFP4";
         r.base.ftype = "NVFP4";
@@ -1363,6 +1376,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--nvfp4-autotune-max-blocks", r.nvfp4.autotune.max_blocks);
         push_pair("--nvfp4-autotune-threads", r.nvfp4.autotune.threads);
         push_pair("--nvfp4-selector-rsf-mode", r.nvfp4.rsf.mode);
+        push_pair("--nvfp4-selector-rsf-depth", r.nvfp4.rsf.depth);
     }
 
     const bool uses_mxfp6_controls =

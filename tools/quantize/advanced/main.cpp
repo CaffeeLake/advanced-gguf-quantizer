@@ -508,26 +508,16 @@ static void apply_selector_kld_evidence_defaults(bq::Recipe & recipe) {
 
     const int total = info.available_chunks;
 
-    if (auto_search && auto_holdout) {
-        const int covered_chunks = std::min(total, 128);
-        int search_chunks = covered_chunks;
-        int holdout_chunks = 0;
-        if (covered_chunks > 8) {
-            holdout_chunks = std::min(32, std::max(8, covered_chunks / 4));
-            holdout_chunks = std::min(holdout_chunks, covered_chunks - 1);
-            search_chunks = covered_chunks - holdout_chunks;
-        }
+    if (auto_search) {
         recipe.selector.chunk_start = string_is_auto(recipe.selector.chunk_start) ? "0" : recipe.selector.chunk_start;
-        recipe.selector.chunks = std::to_string(search_chunks);
-        recipe.selector.holdout_chunks = std::to_string(holdout_chunks);
-        recipe.selector.holdout_start = holdout_chunks > 0 ? std::to_string(search_chunks) : "";
-        if (auto_eval) {
-            recipe.selector.eval_chunks = std::to_string(std::max(search_chunks, holdout_chunks));
-        }
-    } else if (auto_eval) {
-        const int search_chunks = parse_int_or_default(recipe.selector.chunks, total);
-        const int holdout_chunks = parse_int_or_default(recipe.selector.holdout_chunks, 0);
-        recipe.selector.eval_chunks = std::to_string(std::max(1, std::max(search_chunks, holdout_chunks)));
+        recipe.selector.chunks = std::to_string(total);
+    }
+    if (auto_holdout) {
+        recipe.selector.holdout_chunks = "0";
+        recipe.selector.holdout_start.clear();
+    }
+    if (auto_eval) {
+        recipe.selector.eval_chunks = std::to_string(total);
     }
 }
 

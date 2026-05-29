@@ -115,6 +115,7 @@ struct Recipe {
 
         struct Rsf {
             std::string mode = "tensor";
+            std::string depth;
         } rsf;
 
         struct Autotune {
