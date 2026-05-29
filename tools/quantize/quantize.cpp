@@ -7259,14 +7259,50 @@ static bool nvfp4_selector_choose_policy(
             fprintf(stderr, "%s: failed to open selector sensitivity report %s\n", __func__, sensitivity_report_file.c_str());
         } else {
             fprintf(stderr,
-                "%s: selector writing exact one-tensor sensitivity report %s top=%d layer_filter=%d tensor_filter=%s\n",
+                "%s: selector writing exact one-tensor sensitivity report %s top=%d layer_filter=%d tensor_filter=%s alt_search_sample_blocks=%" PRId64 " exact_patch_blocks=full\n",
                 __func__,
                 sensitivity_report_file.c_str(),
                 sensitivity_top,
                 layer_filter,
-                tensor_filter.empty() ? "<none>" : tensor_filter.c_str());
+                tensor_filter.empty() ? "<none>" : tensor_filter.c_str(),
+                sensitivity_sample_blocks);
 
-            std::vector<std::vector<uint8_t>> best_target_bytes(all_bindings.size());
+            auto quantize_apply_sensitivity_patch = [&](
+                    nvfp4_selector_binding & b,
+                    const nvfp4_cuda_runtime_cfg & cfg,
+                    double & sq,
+                    double & ab,
+                    double & mx,
+                    int64_t & n) -> bool {
+                if (!quantize_binding_ensure_target_bytes(b)) {
+                    return false;
+                }
+                if (!nvfp4_selector_quantize_binding(b, cfg, nthread, b.working_target_bytes, sq, ab, mx, n, 0, 0, true) ||
+                        n <= 0) {
+                    return false;
+                }
+
+                float header_weight_scale = 1.0f;
+                float header_input_scale = 1.0f;
+                if (!nvfp4_selector_prepare_nvfp4_runtime_scales(
+                        b, nvfp4_input_scale_policy, &header_weight_scale, &header_input_scale)) {
+                    return false;
+                }
+                if (b.target_scale != nullptr &&
+                        !quantize_tensor_copy_in(b.target_scale, b.working_scale_bytes.data(), b.target_scale_nbytes)) {
+                    return false;
+                }
+                if (b.target_input_scale != nullptr &&
+                        !quantize_tensor_copy_in(
+                            b.target_input_scale,
+                            b.working_input_scale_bytes.data(),
+                            b.target_input_scale_nbytes)) {
+                    return false;
+                }
+                return ggml_cuda_nvfp4_tensor_set_header_scales(
+                    b.target, header_weight_scale, header_input_scale, nullptr);
+            };
+
             bool best_patch_ok = true;
             restore_all();
             for (size_t i = 0; i < all_bindings.size(); ++i) {
@@ -7275,8 +7311,7 @@ static bool nvfp4_selector_choose_policy(
                 double ab = 0.0;
                 double mx = 0.0;
                 int64_t n = 0;
-                if (!nvfp4_selector_quantize_binding(b, best_it->cfg, nthread, best_target_bytes[i], sq, ab, mx, n, 0) ||
-                        !quantize_tensor_copy_in(b.target, best_target_bytes[i].data(), b.target_nbytes)) {
+                if (!quantize_apply_sensitivity_patch(b, best_it->cfg, sq, ab, mx, n)) {
                     fprintf(stderr, "%s: selector sensitivity failed to patch best policy tensor=%s\n", __func__, b.name.c_str());
                     best_patch_ok = false;
                     break;
@@ -7375,23 +7410,21 @@ static bool nvfp4_selector_choose_policy(
 
                         for (const auto & alt : layer_alts) {
                             auto & b = all_bindings[alt.index];
-                            std::vector<uint8_t> alt_bytes;
                             double sq = 0.0;
                             double ab = 0.0;
                             double mx = 0.0;
                             int64_t n = 0;
-                            if (!quantize_tensor_copy_in(b.target, best_target_bytes[alt.index].data(), b.target_nbytes) ||
-                                    !nvfp4_selector_quantize_binding(
-                                        b,
-                                        alt.cfg,
-                                        nthread,
-                                        alt_bytes,
-                                        sq,
-                                        ab,
-                                        mx,
-                                        n,
-                                        sensitivity_sample_blocks) ||
-                                    !quantize_tensor_copy_in(b.target, alt_bytes.data(), b.target_nbytes)) {
+                            if (!quantize_apply_sensitivity_patch(b, best_it->cfg, sq, ab, mx, n)) {
+                                fprintf(stderr, "%s: selector layer sensitivity failed tensor=%s alt=%s\n",
+                                    __func__, b.name.c_str(), alt.policy_name.c_str());
+                                layer_patch_ok = false;
+                                break;
+                            }
+                            sq = 0.0;
+                            ab = 0.0;
+                            mx = 0.0;
+                            n = 0;
+                            if (!quantize_apply_sensitivity_patch(b, alt.cfg, sq, ab, mx, n)) {
                                 fprintf(stderr, "%s: selector layer sensitivity failed tensor=%s alt=%s\n",
                                     __func__, b.name.c_str(), alt.policy_name.c_str());
                                 layer_patch_ok = false;
@@ -7454,7 +7487,11 @@ static bool nvfp4_selector_choose_policy(
 
                         for (const auto & alt : layer_alts) {
                             auto & b = all_bindings[alt.index];
-                            if (!quantize_tensor_copy_in(b.target, best_target_bytes[alt.index].data(), b.target_nbytes)) {
+                            double sq = 0.0;
+                            double ab = 0.0;
+                            double mx = 0.0;
+                            int64_t n = 0;
+                            if (!quantize_apply_sensitivity_patch(b, best_it->cfg, sq, ab, mx, n)) {
                                 restore_all();
                                 return false;
                             }
@@ -7470,23 +7507,20 @@ static bool nvfp4_selector_choose_policy(
                         continue;
                     }
 
-                    std::vector<uint8_t> alt_bytes;
                     double sq = 0.0;
                     double ab = 0.0;
                     double mx = 0.0;
                     int64_t n = 0;
-                    if (!quantize_tensor_copy_in(b.target, best_target_bytes[idx].data(), b.target_nbytes) ||
-                            !nvfp4_selector_quantize_binding(
-                                b,
-                                alt.cfg,
-                                nthread,
-                                alt_bytes,
-                                sq,
-                                ab,
-                                mx,
-                                n,
-                                sensitivity_sample_blocks) ||
-                            !quantize_tensor_copy_in(b.target, alt_bytes.data(), b.target_nbytes)) {
+                    if (!quantize_apply_sensitivity_patch(b, best_it->cfg, sq, ab, mx, n)) {
+                        fprintf(stderr, "%s: selector sensitivity failed tensor=%s alt=%s\n",
+                            __func__, b.name.c_str(), alt.policy_name.c_str());
+                        continue;
+                    }
+                    sq = 0.0;
+                    ab = 0.0;
+                    mx = 0.0;
+                    n = 0;
+                    if (!quantize_apply_sensitivity_patch(b, alt.cfg, sq, ab, mx, n)) {
                         fprintf(stderr, "%s: selector sensitivity failed tensor=%s alt=%s\n",
                             __func__, b.name.c_str(), alt.policy_name.c_str());
                         continue;
@@ -7535,7 +7569,11 @@ static bool nvfp4_selector_choose_policy(
                         dm.top_flip_weight - sensitivity_base.top_flip_weight,
                         dm.ln_ratio - sensitivity_base.ln_ratio);
 
-                    if (!quantize_tensor_copy_in(b.target, best_target_bytes[idx].data(), b.target_nbytes)) {
+                    sq = 0.0;
+                    ab = 0.0;
+                    mx = 0.0;
+                    n = 0;
+                    if (!quantize_apply_sensitivity_patch(b, best_it->cfg, sq, ab, mx, n)) {
                         restore_all();
                         return false;
                     }
