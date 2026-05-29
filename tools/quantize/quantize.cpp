@@ -6302,7 +6302,7 @@ static bool nvfp4_selector_choose_policy(
     const std::string mxfp6_binding_hash = mxfp6_binding_digest.hex();
     auto make_stageb_base_key = [&]() {
         nlohmann::ordered_json key = nlohmann::ordered_json::object();
-        key["cache_version"] = 2;
+        key["cache_version"] = 3;
         key["source_model"] = nvfp4_selector_stageb_file_json(source_model_path);
         key["checkpoint_model"] = nvfp4_selector_stageb_file_json(checkpoint_model_path);
         key["imatrix"] = {
@@ -6319,6 +6319,11 @@ static bool nvfp4_selector_choose_policy(
             {"n_ubatch", params.n_ubatch},
             {"n_gpu_layers", params.n_gpu_layers},
             {"input_scale_policy", nvfp4_input_scale_policy},
+        };
+        key["autotune"] = {
+            {"max_blocks", quantize_control_i64("LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS", 0)},
+            {"rsf_mode", nvfp4_rsf_mode_name(selector_rsf_mode)},
+            {"rsf_depth", nvfp4_rsf_depth_name(selector_rsf_depth)},
         };
         key["rank"] = nvfp4_selector_stageb_rank_json(rank_cfg);
         key["bindings"] = {
