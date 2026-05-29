@@ -7450,12 +7450,19 @@ static bool nvfp4_selector_choose_policy(
     if (out_tensor_overrides &&
             have_measured_eval &&
             best_it != policies.end() &&
-            best_it->name != "seed_keep" &&
             quantize_control_i64("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", 1) != 0) {
         const int tensor_policy_map_max = (int) std::max<int64_t>(
             0,
             quantize_control_i64("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP_MAX", SELECTOR_TENSOR_POLICY_MAP_MAX));
-        const auto base_records = nvfp4_selector_rsf_record_map(*best_it);
+        const nvfp4_selector_policy * base_record_policy = &*best_it;
+        auto base_records = nvfp4_selector_rsf_record_map(*base_record_policy);
+        if (base_records.empty() && best_it->name == "seed_keep") {
+            const nvfp4_selector_policy * baseline_policy = find_current_baseline_policy();
+            if (baseline_policy != nullptr && !baseline_policy->tensor_records.empty()) {
+                base_record_policy = baseline_policy;
+                base_records = nvfp4_selector_rsf_record_map(*base_record_policy);
+            }
+        }
         struct tensor_policy_choice {
             std::string tensor;
             const nvfp4_selector_policy * policy = nullptr;
@@ -7541,6 +7548,12 @@ static bool nvfp4_selector_choose_policy(
                     kv.first.c_str(),
                     kv.second);
             }
+            if (base_record_policy != &*best_it) {
+                fprintf(stderr,
+                    "%s: selector tensor policy map used policy=%s records as seed_keep tensor baseline\n",
+                    __func__,
+                    base_record_policy->name.c_str());
+            }
         }
     }
 
@@ -7573,7 +7586,27 @@ static bool nvfp4_selector_choose_policy(
     const std::string rescue_tensor_types_file = quantize_control_string("LLAMA_NVFP4_SELECTOR_RESCUE_TENSOR_TYPES_FILE");
     if (out_tensor_overrides) {
         out_tensor_overrides->clear();
-        if (out_name != "seed_keep" && !all_bindings.empty()) {
+        if (out_name == "seed_keep" && !tensor_policy_map.empty()) {
+            out_tensor_overrides->reserve(tensor_policy_map.size());
+            for (const auto & b : all_bindings) {
+                const auto mit = tensor_policy_map.find(b.name);
+                if (mit == tensor_policy_map.end() || mit->second == nullptr) {
+                    continue;
+                }
+                tensor_type_option opt;
+                opt.name = nvfp4_selector_regex_escape(b.name);
+                opt.type = GGML_TYPE_NVFP4;
+                opt.has_nvfp4_cfg = true;
+                opt.nvfp4_cfg = mit->second->cfg;
+                opt.nvfp4_policy_name = mit->second->name;
+                out_tensor_overrides->push_back(std::move(opt));
+            }
+            fprintf(stderr,
+                "%s: selector materialization added %zu exact NVFP4 override(s) for seed_keep tensor_policy_switches=%zu\n",
+                __func__,
+                out_tensor_overrides->size(),
+                tensor_policy_map.size());
+        } else if (out_name != "seed_keep" && !all_bindings.empty()) {
             out_tensor_overrides->reserve(out_tensor_overrides->size() + all_bindings.size());
             for (const auto & b : all_bindings) {
                 const nvfp4_selector_policy * materialize_policy = &*best_it;
