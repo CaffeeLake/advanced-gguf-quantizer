@@ -192,6 +192,13 @@ For targeted diagnostics, `--nvfp4-selector-include-policy name` and
 `--nvfp4-selector-include-policies a,b` limit selector work to exact policy
 names while still allowing the internal `seed_keep` checkpoint policy.
 
+After whole-model ranking, the selector can also emit a guarded per-tensor
+policy map. The global winner remains the baseline, but individual tensors can
+switch to another measured, passing policy when their tensor-local proxy score
+improves enough. This is enabled by default for measured selector runs; use
+`--nvfp4-selector-no-tensor-policy-map` for diagnostics or
+`--nvfp4-selector-tensor-policy-map-max N` to cap the number of tensor switches.
+
 ## Best Candidate Reports
 
 Use `best` for non-dominated candidate sets. Internally this is Pareto-style

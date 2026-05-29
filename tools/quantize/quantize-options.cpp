@@ -198,6 +198,10 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      set refined scale fit (RSF) granularity, or disable default RSF selector variants for diagnostics.\n");
     printf("  --nvfp4-selector-rsf-report file.txt\n");
     printf("                                      write the RSF policy summary, tensor rows, and scale-multiplier histograms.\n");
+    printf("  --nvfp4-selector-tensor-policy-map / --nvfp4-selector-no-tensor-policy-map\n");
+    printf("                                      allow guarded per-tensor policy selection after whole-model ranking.\n");
+    printf("  --nvfp4-selector-tensor-policy-map-max N\n");
+    printf("                                      cap per-tensor policy switches; default: 128, 0 disables switches.\n");
     printf("  --mxfp6_e2m3-tensor-scale on|off\n");
     printf("                                      write MXFP6_E2M3 tensor correction scales. default: on.\n");
     printf("                                      WARNING: MXFP6_E2M3 is experimental and unsupported by NVIDIA/llama.cpp.\n");

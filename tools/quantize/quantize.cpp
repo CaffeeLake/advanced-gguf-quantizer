@@ -93,6 +93,9 @@ static constexpr double  SELECTOR_RSF_SEARCH_SCORE_ABS_MARGIN = 1.20;
 static constexpr double  SELECTOR_RSF_SEARCH_SCORE_REL_MARGIN = 0.10;
 static constexpr double  SELECTOR_RSF_COMBINED_SCORE_ABS_GAIN = 0.02;
 static constexpr double  SELECTOR_RSF_COMBINED_SCORE_REL_GAIN = 0.0015;
+static constexpr double  SELECTOR_TENSOR_POLICY_PROXY_ABS_GAIN = 1e-3;
+static constexpr double  SELECTOR_TENSOR_POLICY_PROXY_REL_GAIN = 5e-3;
+static constexpr int     SELECTOR_TENSOR_POLICY_MAP_MAX = 128;
 static constexpr double  SELECTOR_MXFP6_PPL_ABS_TOL = 2e-4;
 static constexpr double  SELECTOR_MXFP6_PPL_REL_TOL = 0.01;
 static constexpr double  SELECTOR_MXFP6_MEAN_KLD_ABS_TOL = 7.5e-5;
@@ -7443,6 +7446,104 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
+    std::unordered_map<std::string, const nvfp4_selector_policy *> tensor_policy_map;
+    if (out_tensor_overrides &&
+            have_measured_eval &&
+            best_it != policies.end() &&
+            best_it->name != "seed_keep" &&
+            quantize_control_i64("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", 1) != 0) {
+        const int tensor_policy_map_max = (int) std::max<int64_t>(
+            0,
+            quantize_control_i64("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP_MAX", SELECTOR_TENSOR_POLICY_MAP_MAX));
+        const auto base_records = nvfp4_selector_rsf_record_map(*best_it);
+        struct tensor_policy_choice {
+            std::string tensor;
+            const nvfp4_selector_policy * policy = nullptr;
+            double base_score = std::numeric_limits<double>::infinity();
+            double alt_score = std::numeric_limits<double>::infinity();
+            double gain = 0.0;
+        };
+        std::unordered_map<std::string, tensor_policy_choice> best_by_tensor;
+
+        if (tensor_policy_map_max > 0 && !base_records.empty()) {
+            for (const auto & policy : policies) {
+                if (&policy == &*best_it ||
+                        policy.name == "seed_keep" ||
+                        !policy.measured_pass ||
+                        !policy.measured.ok ||
+                        !std::isfinite(policy.measured_score) ||
+                        policy.tensor_records.empty() ||
+                        nvfp4_selector_cfg_equal(policy.cfg, best_it->cfg)) {
+                    continue;
+                }
+                const auto alt_records = nvfp4_selector_rsf_record_map(policy);
+                for (const auto & b : all_bindings) {
+                    const auto bit = base_records.find(b.name);
+                    const auto ait = alt_records.find(b.name);
+                    if (bit == base_records.end() || ait == alt_records.end() ||
+                            bit->second == nullptr || ait->second == nullptr ||
+                            !std::isfinite(bit->second->proxy_score) ||
+                            !std::isfinite(ait->second->proxy_score)) {
+                        continue;
+                    }
+                    const double base_score = bit->second->proxy_score;
+                    const double alt_score = ait->second->proxy_score;
+                    const double gain = base_score - alt_score;
+                    const double min_gain = std::max(
+                        SELECTOR_TENSOR_POLICY_PROXY_ABS_GAIN,
+                        SELECTOR_TENSOR_POLICY_PROXY_REL_GAIN * std::max(std::fabs(base_score), std::fabs(alt_score)));
+                    if (!(gain > min_gain)) {
+                        continue;
+                    }
+                    auto cur = best_by_tensor.find(b.name);
+                    if (cur == best_by_tensor.end() || gain > cur->second.gain) {
+                        best_by_tensor[b.name] = { b.name, &policy, base_score, alt_score, gain };
+                    }
+                }
+            }
+        }
+
+        std::vector<tensor_policy_choice> choices;
+        choices.reserve(best_by_tensor.size());
+        for (auto & kv : best_by_tensor) {
+            choices.push_back(kv.second);
+        }
+        std::sort(choices.begin(), choices.end(), [](const tensor_policy_choice & a, const tensor_policy_choice & b) {
+            if (a.gain != b.gain) return a.gain > b.gain;
+            return a.tensor < b.tensor;
+        });
+        if ((int) choices.size() > tensor_policy_map_max) {
+            choices.resize((size_t) tensor_policy_map_max);
+        }
+        std::map<std::string, int> policy_counts;
+        double total_gain = 0.0;
+        for (const auto & choice : choices) {
+            if (choice.policy == nullptr) {
+                continue;
+            }
+            tensor_policy_map[choice.tensor] = choice.policy;
+            ++policy_counts[choice.policy->name];
+            total_gain += choice.gain;
+        }
+        if (!tensor_policy_map.empty()) {
+            fprintf(stderr,
+                "%s: selector tensor policy map switched %zu/%zu tensor(s) from global policy=%s proxy_gain_sum=%.6f max=%d\n",
+                __func__,
+                tensor_policy_map.size(),
+                all_bindings.size(),
+                best_it->name.c_str(),
+                total_gain,
+                tensor_policy_map_max);
+            for (const auto & kv : policy_counts) {
+                fprintf(stderr,
+                    "%s: selector tensor policy map policy=%s tensors=%d\n",
+                    __func__,
+                    kv.first.c_str(),
+                    kv.second);
+            }
+        }
+    }
+
     out_cfg = best_it->cfg;
     out_name = best_it->name.empty() ? "unnamed" : best_it->name;
     if (out_kept_seed != nullptr) {
@@ -7475,20 +7576,26 @@ static bool nvfp4_selector_choose_policy(
         if (out_name != "seed_keep" && !all_bindings.empty()) {
             out_tensor_overrides->reserve(out_tensor_overrides->size() + all_bindings.size());
             for (const auto & b : all_bindings) {
+                const nvfp4_selector_policy * materialize_policy = &*best_it;
+                const auto mit = tensor_policy_map.find(b.name);
+                if (mit != tensor_policy_map.end() && mit->second != nullptr) {
+                    materialize_policy = mit->second;
+                }
                 tensor_type_option opt;
                 opt.name = nvfp4_selector_regex_escape(b.name);
                 opt.type = GGML_TYPE_NVFP4;
                 opt.has_nvfp4_cfg = true;
-                opt.nvfp4_cfg = best_it->cfg;
-                opt.nvfp4_policy_name = best_it->name;
+                opt.nvfp4_cfg = materialize_policy->cfg;
+                opt.nvfp4_policy_name = materialize_policy->name;
                 out_tensor_overrides->push_back(std::move(opt));
             }
             fprintf(stderr,
-                "%s: selector materialization added %zu exact NVFP4 override(s) for policy=%s%s\n",
+                "%s: selector materialization added %zu exact NVFP4 override(s) for policy=%s%s tensor_policy_switches=%zu\n",
                 __func__,
                 all_bindings.size(),
                 best_it->name.c_str(),
-                nvfp4_selector_policy_is_rsf_family(*best_it) ? " (RSF)" : "");
+                nvfp4_selector_policy_is_rsf_family(*best_it) ? " (RSF)" : "",
+                tensor_policy_map.size());
         }
     }
     if (rescue_report_top > 0 || rescue_apply_top > 0) {
@@ -8695,6 +8802,16 @@ int llama_quantize(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--nvfp4-selector-include-policies") == 0) {
             if (arg_idx < argc-1) {
                 append_selector_include_policy(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-tensor-policy-map") == 0) {
+            add_selector_controls("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", "1");
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-no-tensor-policy-map") == 0) {
+            add_selector_controls("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", "0");
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-tensor-policy-map-max") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_controls("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP_MAX", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
