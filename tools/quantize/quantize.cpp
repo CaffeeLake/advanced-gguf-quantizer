@@ -6200,7 +6200,7 @@ static bool nvfp4_selector_choose_policy(
     const std::string mxfp6_binding_hash = mxfp6_binding_digest.hex();
     auto make_stageb_base_key = [&]() {
         nlohmann::ordered_json key = nlohmann::ordered_json::object();
-        key["cache_version"] = 1;
+        key["cache_version"] = 2;
         key["source_model"] = nvfp4_selector_stageb_file_json(source_model_path);
         key["checkpoint_model"] = nvfp4_selector_stageb_file_json(checkpoint_model_path);
         key["imatrix"] = {
