@@ -5631,6 +5631,13 @@ static bool nvfp4_selector_choose_policy(
                                           bool store_survey,
                                           const char * label) -> bool {
         restore_all();
+        nvfp4_cuda_runtime_cfg proxy_cfg = policy.cfg;
+        const bool proxy_only = !want_measured_eval;
+        if (proxy_only &&
+                nvfp4_cfg_has_rsf(proxy_cfg) &&
+                nvfp4_cfg_rsf_depth(proxy_cfg) > NVFP4_CUDA_RSF_DEPTH_DEEPER) {
+            nvfp4_cfg_set_rsf_depth(proxy_cfg, NVFP4_CUDA_RSF_DEPTH_DEEPER);
+        }
         if (binding_indices.empty()) {
             if (store_survey) {
                 policy.has_survey = true;
@@ -5685,7 +5692,7 @@ static bool nvfp4_selector_choose_policy(
                 auto & b = all_bindings[binding_indices[ib]];
                 std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes;
                 nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
-                if (!nvfp4_selector_quantize_binding(b, policy.cfg, binding_nthread, quant_bytes,
+                if (!nvfp4_selector_quantize_binding(b, proxy_cfg, binding_nthread, quant_bytes,
                         binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
                         sample_blocks_override, 0, false, rsf_record)) {
                     fprintf(stderr, "%s: selector failed patching tensor %s for policy %s\n", __func__, b.name.c_str(), policy.name.c_str());
@@ -5707,7 +5714,7 @@ static bool nvfp4_selector_choose_policy(
                         auto & b = all_bindings[binding_indices[ib]];
                         std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes_local;
                         nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
-                        if (!nvfp4_selector_quantize_binding(b, policy.cfg, binding_nthread, quant_bytes,
+                        if (!nvfp4_selector_quantize_binding(b, proxy_cfg, binding_nthread, quant_bytes,
                                 binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
                                 sample_blocks_override, 0, false, rsf_record)) {
                             binding_scores[ib].ok = false;
@@ -5763,7 +5770,8 @@ static bool nvfp4_selector_choose_policy(
             }
             fprintf(stderr,
                 "selector proxy-rank phase=%s policy=%s objective=weight_reconstruction_sampled rank=lower_is_better "
-                "score=%.6f rmse=%.6f mean_abs=%.6f max_abs=%.6f tensors=%zu sample_blocks_per_tensor=%" PRId64 " measured_kld_ppl=no\n",
+                "score=%.6f rmse=%.6f mean_abs=%.6f max_abs=%.6f tensors=%zu sample_blocks_per_tensor=%" PRId64
+                " rsf_depth=%s measured_kld_ppl=no\n",
                 label,
                 policy.name.c_str(),
                 proxy_metrics.score,
@@ -5771,7 +5779,8 @@ static bool nvfp4_selector_choose_policy(
                 proxy_metrics.abs_mean,
                 proxy_metrics.max_abs,
                 binding_indices.size(),
-                sample_blocks_override);
+                sample_blocks_override,
+                nvfp4_cfg_has_rsf(proxy_cfg) ? nvfp4_rsf_depth_name(nvfp4_cfg_rsf_depth(proxy_cfg)) : "off");
         }
         policy.tensor_records = std::move(tensor_records);
         return true;

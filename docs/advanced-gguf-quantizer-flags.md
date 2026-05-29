@@ -188,6 +188,9 @@ RSF depth with a 131k-block tensor sample cap, 64 survey policies, 24 measured
 candidates, 2-way selector eval batching, and a 192-policy refinement budget.
 Use explicit selector fields only when intentionally running a smaller
 diagnostic or a targeted reproduction.
+Proxy-only survey passes may use a bounded RSF depth so that expensive
+exhaustive scale fitting is reserved for measured KLD/PPL candidate evaluation
+and final materialization.
 
 For targeted diagnostics, `--nvfp4-selector-include-policy name` and
 `--nvfp4-selector-include-policies a,b` limit selector work to exact policy
