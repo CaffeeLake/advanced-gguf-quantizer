@@ -192,6 +192,23 @@ Proxy-only survey passes may use a bounded RSF depth so that expensive
 exhaustive scale fitting is reserved for measured KLD/PPL candidate evaluation
 and final materialization.
 
+After the selected NVFP4 policy is materialized, the main selector can also
+consider speed-aware tensor type candidates for the worst NVFP4-error tensors.
+This is not a separate repair pass: it is part of the final exact tensor map.
+With `--nvfp4-fast-quantize`, the default cap is the worst 10% of NVFP4
+candidate tensors. NVFP4/RSF tensor-local repairs are tried first; only tensors
+where NVFP4 still has high error are allowed to move to fallback types.
+
+```bash
+./build/bin/llama-quantize ... --nvfp4-selector-candidate-types Q4_K,Q6_K,Q8_0
+```
+
+Mixed NVFP4/MXFP6 runs prepend `MXFP6_E2M3` to that candidate list by default,
+so MXFP6 can win the tensor before Q4_K when it is available. Candidate ranking
+uses tensor-local NVFP4 error with static size and speed penalties; it does not
+run benchmarks during quantization. Use `--nvfp4-selector-candidate-fraction F`
+or `--nvfp4-selector-candidate-top N` to make the cap stricter or broader.
+
 For targeted diagnostics, `--nvfp4-selector-include-policy name` and
 `--nvfp4-selector-include-policies a,b` limit selector work to exact policy
 names while still allowing the internal `seed_keep` checkpoint policy.

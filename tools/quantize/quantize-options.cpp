@@ -270,6 +270,15 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      after the selected pass, patch high-risk exact tensors using the rescue settings.\n");
     printf("  --nvfp4-selector-only\n");
     printf("                                      run selector analysis and exit without writing a final model.\n");
+    printf("  --nvfp4-selector-candidate-type T / --nvfp4-selector-candidate-types A,B\n");
+    printf("                                      main-path tensor type candidates for high-error NVFP4 tensors.\n");
+    printf("                                      defaults with --nvfp4-fast-quantize: Q4_K,Q6_K,Q8_0; mixed adds MXFP6_E2M3 first.\n");
+    printf("  --nvfp4-selector-candidate-fraction F / --nvfp4-selector-candidate-top N\n");
+    printf("                                      cap type candidates to the worst NVFP4-error tensor fraction or exact count.\n");
+    printf("  --nvfp4-selector-candidate-budget-mb N / --nvfp4-selector-candidate-class-limit N\n");
+    printf("                                      cap extra size and per-class use for main-path type candidates.\n");
+    printf("  --nvfp4-selector-candidate-report file.csv / --nvfp4-selector-candidate-tensor-types file.txt\n");
+    printf("                                      write main-path candidate ranking and final exact tensor-type map.\n");
     printf("  --nvfp4-selector-eval-top N / --nvfp4-selector-eval-chunks N\n");
     printf("                                      number of policies/chunks used for KLD full PPL/KLD evaluation. defaults: 16/32.\n");
     printf("  --nvfp4-selector-n-seq N\n");
@@ -285,7 +294,7 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --nvfp4-selector-sensitivity-tensor text\n");
     printf("                                      only probe tensors whose name contains text.\n");
     printf("  --nvfp4-selector-rescue-type ggml_type\n");
-    printf("                                      tensor type used for rescue overrides. useful values: MXFP6_E2M3, Q8_0, BF16.\n");
+    printf("                                      legacy repair alias for a single candidate type. Prefer --nvfp4-selector-candidate-types.\n");
     printf("  --nvfp4-selector-rescue-top N\n");
     printf("                                      maximum exact tensor rescue overrides to apply.\n");
     printf("  --nvfp4-selector-rescue-nvfp4-top N / --nvfp4-selector-rescue-report-top N\n");
