@@ -5632,7 +5632,8 @@ static bool nvfp4_selector_choose_policy(
                                           const char * label) -> bool {
         restore_all();
         nvfp4_cuda_runtime_cfg proxy_cfg = policy.cfg;
-        const bool proxy_only = !want_measured_eval;
+        const bool materializes_full_policy = want_measured_eval && sample_blocks_override <= 0;
+        const bool proxy_only = !materializes_full_policy;
         if (proxy_only &&
                 nvfp4_cfg_has_rsf(proxy_cfg) &&
                 nvfp4_cfg_rsf_depth(proxy_cfg) > NVFP4_CUDA_RSF_DEPTH_DEEP) {
@@ -5690,7 +5691,7 @@ static bool nvfp4_selector_choose_policy(
             std::vector<uint8_t> tmp_bytes;
             for (size_t ib = 0; ib < binding_indices.size(); ++ib) {
                 auto & b = all_bindings[binding_indices[ib]];
-                std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes;
+                std::vector<uint8_t> & quant_bytes = materializes_full_policy ? b.working_target_bytes : tmp_bytes;
                 nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
                 if (!nvfp4_selector_quantize_binding(b, proxy_cfg, binding_nthread, quant_bytes,
                         binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
@@ -5712,7 +5713,7 @@ static bool nvfp4_selector_choose_policy(
                             break;
                         }
                         auto & b = all_bindings[binding_indices[ib]];
-                        std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes_local;
+                        std::vector<uint8_t> & quant_bytes = materializes_full_policy ? b.working_target_bytes : tmp_bytes_local;
                         nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
                         if (!nvfp4_selector_quantize_binding(b, proxy_cfg, binding_nthread, quant_bytes,
                                 binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
@@ -5737,7 +5738,7 @@ static bool nvfp4_selector_choose_policy(
         for (size_t ib = 0; ib < binding_indices.size(); ++ib) {
             auto & b = all_bindings[binding_indices[ib]];
             const auto & bs = binding_scores[ib];
-            if (want_measured_eval && sample_blocks_override <= 0 &&
+            if (materializes_full_policy &&
                     !quantize_tensor_copy_in(b.target, b.working_target_bytes.data(), b.target_nbytes)) {
                 fprintf(stderr, "%s: selector failed writing policy bytes for %s\n", __func__, b.name.c_str());
                 return false;
