@@ -5635,8 +5635,8 @@ static bool nvfp4_selector_choose_policy(
         const bool proxy_only = !want_measured_eval;
         if (proxy_only &&
                 nvfp4_cfg_has_rsf(proxy_cfg) &&
-                nvfp4_cfg_rsf_depth(proxy_cfg) > NVFP4_CUDA_RSF_DEPTH_DEEPER) {
-            nvfp4_cfg_set_rsf_depth(proxy_cfg, NVFP4_CUDA_RSF_DEPTH_DEEPER);
+                nvfp4_cfg_rsf_depth(proxy_cfg) > NVFP4_CUDA_RSF_DEPTH_DEEP) {
+            nvfp4_cfg_set_rsf_depth(proxy_cfg, NVFP4_CUDA_RSF_DEPTH_DEEP);
         }
         if (binding_indices.empty()) {
             if (store_survey) {
