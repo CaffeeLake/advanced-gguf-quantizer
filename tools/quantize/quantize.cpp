@@ -7706,6 +7706,116 @@ static bool nvfp4_selector_choose_policy(
                     __func__,
                     base_record_policy->name.c_str());
             }
+
+            auto apply_tensor_policy_patch = [&](
+                    nvfp4_selector_binding & b,
+                    const nvfp4_selector_policy & policy) -> bool {
+                if (!quantize_binding_ensure_target_bytes(b)) {
+                    return false;
+                }
+
+                double sum_sq = 0.0;
+                double sum_abs = 0.0;
+                double max_abs = 0.0;
+                int64_t count = 0;
+                if (!nvfp4_selector_quantize_binding(
+                        b,
+                        policy.cfg,
+                        nthread,
+                        b.working_target_bytes,
+                        sum_sq,
+                        sum_abs,
+                        max_abs,
+                        count,
+                        0,
+                        0,
+                        true) || count <= 0) {
+                    return false;
+                }
+
+                float header_weight_scale = 1.0f;
+                float header_input_scale = 1.0f;
+                if (!nvfp4_selector_prepare_nvfp4_runtime_scales(
+                        b, nvfp4_input_scale_policy, &header_weight_scale, &header_input_scale)) {
+                    return false;
+                }
+                if (b.target_scale != nullptr &&
+                        !quantize_tensor_copy_in(b.target_scale, b.working_scale_bytes.data(), b.target_scale_nbytes)) {
+                    return false;
+                }
+                if (b.target_input_scale != nullptr &&
+                        !quantize_tensor_copy_in(
+                            b.target_input_scale,
+                            b.working_input_scale_bytes.data(),
+                            b.target_input_scale_nbytes)) {
+                    return false;
+                }
+                return ggml_cuda_nvfp4_tensor_set_header_scales(
+                    b.target, header_weight_scale, header_input_scale, nullptr);
+            };
+
+            bool map_patch_ok = true;
+            restore_all();
+            for (auto & b : all_bindings) {
+                const nvfp4_selector_policy * materialize_policy = &*best_it;
+                const auto mit = tensor_policy_map.find(b.name);
+                if (mit != tensor_policy_map.end() && mit->second != nullptr) {
+                    materialize_policy = mit->second;
+                }
+                if (!apply_tensor_policy_patch(b, *materialize_policy)) {
+                    fprintf(stderr,
+                        "%s: selector tensor policy map failed to patch tensor=%s policy=%s; disabling map\n",
+                        __func__,
+                        b.name.c_str(),
+                        materialize_policy->name.c_str());
+                    map_patch_ok = false;
+                    break;
+                }
+            }
+
+            bool map_keep = false;
+            if (map_patch_ok) {
+                nvfp4_selector_kld_metrics map_km;
+                if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, map_km, true)) {
+                    restore_all();
+                    return false;
+                }
+                const nvfp4_selector_derived_metrics map_dm =
+                    nvfp4_selector_derive_metrics(map_km);
+                const nvfp4_selector_metric_rank map_rank =
+                    nvfp4_selector_rank_policy_metrics(
+                        map_dm,
+                        nullptr,
+                        baseline_eval,
+                        nullptr,
+                        rank_cfg);
+                const bool score_better =
+                    std::isfinite(map_rank.score) &&
+                    std::isfinite(best_it->measured_score) &&
+                    nvfp4_selector_compare_measured_score(map_rank.score, best_it->measured_score) < 0;
+                const bool metrics_better =
+                    map_dm.ok &&
+                    best_it->measured.ok &&
+                    nvfp4_selector_compare_one(map_dm, best_it->measured, rank_cfg) < 0;
+                map_keep = map_rank.pass && (score_better || metrics_better);
+                fprintf(stderr,
+                    "%s: selector tensor policy map measured_score=%.6f pass=%s keep=%s base_policy=%s switches=%zu %s\n",
+                    __func__,
+                    map_rank.score,
+                    map_rank.pass ? "yes" : "no",
+                    map_keep ? "yes" : "no",
+                    best_it->name.c_str(),
+                    tensor_policy_map.size(),
+                    nvfp4_selector_format_metrics("search", map_dm).c_str());
+            }
+            restore_all();
+
+            if (!map_keep) {
+                tensor_policy_map.clear();
+                fprintf(stderr,
+                    "%s: selector tensor policy map disabled after measured KLD guard\n",
+                    __func__);
+            }
         }
     }
 
