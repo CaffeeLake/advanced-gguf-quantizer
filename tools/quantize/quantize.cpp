@@ -5724,12 +5724,24 @@ static bool nvfp4_selector_choose_policy(
                 before - policies.size());
         }
     }
+    const std::unordered_set<std::string> include_policy_names =
+        selector_policy_set_from_control("LLAMA_NVFP4_SELECTOR_INCLUDE_POLICIES");
     const std::unordered_set<std::string> skip_policy_names =
         selector_policy_set_from_control("LLAMA_NVFP4_SELECTOR_SKIP_POLICIES");
+    auto selector_policy_excluded_by_include = [&](const nvfp4_selector_policy & policy) {
+        return policy.name != "seed_keep" &&
+               !include_policy_names.empty() &&
+               include_policy_names.find(policy.name) == include_policy_names.end();
+    };
     auto selector_policy_skipped = [&](const nvfp4_selector_policy & policy) {
         return policy.name != "seed_keep" &&
-               skip_policy_names.find(policy.name) != skip_policy_names.end();
+               (selector_policy_excluded_by_include(policy) ||
+                skip_policy_names.find(policy.name) != skip_policy_names.end());
     };
+    if (!include_policy_names.empty()) {
+        fprintf(stderr, "%s: selector include-only list has %zu named policy candidate(s); seed_keep remains allowed\n",
+            __func__, include_policy_names.size());
+    }
     if (!skip_policy_names.empty()) {
         fprintf(stderr, "%s: selector will skip %zu named policy candidate(s) during survey/eval\n",
             __func__, skip_policy_names.size());
@@ -5794,6 +5806,16 @@ static bool nvfp4_selector_choose_policy(
     }
     for (size_t policy_idx = 0; policy_idx < policies.size(); ++policy_idx) {
         auto & policy = policies[policy_idx];
+        if (selector_policy_excluded_by_include(policy)) {
+            policy.proxy_score = std::numeric_limits<double>::infinity();
+            policy.proxy_rejected = true;
+            fprintf(stderr,
+                "selector stage-a skip [%zu/%zu] policy=%s reason=include-only\n",
+                policy_idx + 1,
+                policies.size(),
+                policy.name.c_str());
+            continue;
+        }
         fprintf(stderr,
             "selector stage-a start [%zu/%zu] policy=%s tensors=%zu\n",
             policy_idx + 1,
@@ -5813,6 +5835,14 @@ static bool nvfp4_selector_choose_policy(
         auto refined = nvfp4_selector_refine_policies(policies);
         for (size_t policy_idx = 0; policy_idx < refined.size(); ++policy_idx) {
             auto & policy = refined[policy_idx];
+            if (selector_policy_excluded_by_include(policy)) {
+                fprintf(stderr,
+                    "selector refine skip [%zu/%zu] policy=%s reason=include-only\n",
+                    policy_idx + 1,
+                    refined.size(),
+                    policy.name.c_str());
+                continue;
+            }
             fprintf(stderr,
                 "selector refine start [%zu/%zu] policy=%s tensors=%zu\n",
                 policy_idx + 1,
@@ -5833,8 +5863,14 @@ static bool nvfp4_selector_choose_policy(
     auto baseline_it = std::find_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
         return policy.name == "baseline";
     });
+    if (baseline_it != policies.end() &&
+            (baseline_it->proxy_rejected || !std::isfinite(baseline_it->proxy_score))) {
+        baseline_it = policies.end();
+    }
     if (baseline_it == policies.end()) {
-        baseline_it = policies.begin();
+        baseline_it = std::find_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
+            return !policy.proxy_rejected && std::isfinite(policy.proxy_score);
+        });
     }
     if (baseline_it != policies.end()) {
         const double soft_factor = SELECTOR_FIRST_TENSOR_SOFT_FACTOR;
@@ -8279,6 +8315,7 @@ int llama_quantize(int argc, char ** argv) {
     bool cli_nvfp4_selector_include_rsf = true;
     bool selector_skip_remaining = false;
     std::string selector_skip_file;
+    std::string selector_include_policies_cli;
     std::string selector_skip_policies_cli;
     bool cli_nvfp4_cfg_valid = false;
     nvfp4_cuda_runtime_cfg cli_nvfp4_cfg = {
@@ -8301,6 +8338,15 @@ int llama_quantize(int argc, char ** argv) {
             selector_skip_policies_cli.push_back(',');
         }
         selector_skip_policies_cli += value;
+    };
+    auto append_selector_include_policy = [&](const char * value) {
+        if (value == nullptr || value[0] == '\0') {
+            return;
+        }
+        if (!selector_include_policies_cli.empty()) {
+            selector_include_policies_cli.push_back(',');
+        }
+        selector_include_policies_cli += value;
     };
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
@@ -8635,6 +8681,18 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-include-policy") == 0) {
+            if (arg_idx < argc-1) {
+                append_selector_include_policy(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-include-policies") == 0) {
+            if (arg_idx < argc-1) {
+                append_selector_include_policy(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
         } else if (strcmp(argv[arg_idx], "--nvfp4-selector-refine-top") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_controls("LLAMA_NVFP4_SELECTOR_REFINE_TOP", argv[++arg_idx]);
@@ -8963,6 +9021,9 @@ int llama_quantize(int argc, char ** argv) {
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_TOP", "0");
         add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_REPORT_TOP", "0");
         fprintf(stderr, "llama_quantize: NVFP4 fast quantize using deep RSF selector defaults\n");
+    }
+    if (!selector_include_policies_cli.empty()) {
+        add_selector_controls("LLAMA_NVFP4_SELECTOR_INCLUDE_POLICIES", selector_include_policies_cli.c_str());
     }
     if (!selector_skip_policies_cli.empty()) {
         add_selector_controls("LLAMA_NVFP4_SELECTOR_SKIP_POLICIES", selector_skip_policies_cli.c_str());

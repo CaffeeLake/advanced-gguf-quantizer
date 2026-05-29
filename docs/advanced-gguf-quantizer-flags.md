@@ -188,6 +188,10 @@ survey policies, 16 measured candidates, 32 measured KLD chunks per subset,
 selector fields only when intentionally running a smaller diagnostic or a
 larger full-best sweep.
 
+For targeted diagnostics, `--nvfp4-selector-include-policy name` and
+`--nvfp4-selector-include-policies a,b` limit selector work to exact policy
+names while still allowing the internal `seed_keep` checkpoint policy.
+
 ## Best Candidate Reports
 
 Use `best` for non-dominated candidate sets. Internally this is Pareto-style

@@ -250,6 +250,8 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      keep up to N asym/AWQ-tail policies when the coarse policy limit is active.\n");
     printf("  --nvfp4-selector-skip-policy name / --nvfp4-selector-skip-policies a,b\n");
     printf("                                      skip named policies during survey and measured eval.\n");
+    printf("  --nvfp4-selector-include-policy name / --nvfp4-selector-include-policies a,b\n");
+    printf("                                      evaluate only named policies; seed_keep remains allowed internally.\n");
     printf("  --nvfp4-selector-refine-top N / --nvfp4-selector-refine-budget N\n");
     printf("                                      selector refinement breadth and exact tensor override budget.\n");
     printf("  --nvfp4-selector-survey-top N / --nvfp4-selector-survey-sample-blocks N\n");
