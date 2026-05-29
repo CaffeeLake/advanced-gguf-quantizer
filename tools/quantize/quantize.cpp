@@ -4459,7 +4459,9 @@ static bool nvfp4_selector_write_rsf_report(
     std::map<std::string, std::vector<double>> hist_by_class;
 
     out << "RSF refined scale fit report\n\n";
-    out << "policy                         tensors tested    rsf wins    avg scale_mul    p10/p50/p90 scale_mul\n";
+    out << "Per-tensor rows use tensor_delta_proxy for tensor-local reconstruction evidence.\n";
+    out << "policy_delta_* fields are measured policy-wide KLD/PPL deltas versus the non-RSF companion.\n\n";
+    out << "policy                         tensors tested    proxy wins    avg scale_mul    p10/p50/p90 scale_mul\n";
     for (const auto * policy : rsf_policies) {
         const nvfp4_selector_policy * base_policy =
             nvfp4_selector_find_rsf_base_policy(policies, *policy);
@@ -4528,24 +4530,27 @@ static bool nvfp4_selector_write_rsf_report(
     });
 
     out << "\nper tensor RSF rows\n";
-    out << "tensor                         policy                      scale_mul    delta_mean_kld    delta_p99    delta_same_top    delta_proxy\n";
-    const size_t row_limit = std::min<size_t>(rows.size(), 512);
-    auto write_num = [&](double v, int width, int precision) {
+    out << "tensor\tpolicy\ttensor_class\tscale_mul\tpolicy_delta_mean_kld\tpolicy_delta_p99\tpolicy_delta_same_top\ttensor_delta_proxy\n";
+    auto write_num = [&](double v, int precision) {
         if (std::isfinite(v)) {
-            out << std::setw(width) << std::fixed << std::setprecision(precision) << v;
+            out << std::fixed << std::setprecision(precision) << v;
         } else {
-            out << std::setw(width) << "n/a";
+            out << "n/a";
         }
     };
-    for (size_t i = 0; i < row_limit; ++i) {
+    for (size_t i = 0; i < rows.size(); ++i) {
         const auto & row = rows[i];
-        out << std::left << std::setw(30) << row.tensor.substr(0, 29)
-            << std::setw(28) << row.policy.substr(0, 27)
-            << std::right << std::setw(10) << std::fixed << std::setprecision(6) << row.scale_mul;
-        write_num(row.delta_mean_kld, 18, 6);
-        write_num(row.delta_p99, 13, 6);
-        write_num(row.delta_same_top, 18, 6);
-        write_num(row.proxy_delta, 15, 6);
+        out << row.tensor << '\t'
+            << row.policy << '\t'
+            << row.cls << '\t'
+            << std::fixed << std::setprecision(6) << row.scale_mul << '\t';
+        write_num(row.delta_mean_kld, 6);
+        out << '\t';
+        write_num(row.delta_p99, 6);
+        out << '\t';
+        write_num(row.delta_same_top, 6);
+        out << '\t';
+        write_num(row.proxy_delta, 6);
         out << '\n';
     }
 
