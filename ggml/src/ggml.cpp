@@ -3,7 +3,15 @@
 
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 #include <atomic>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <unordered_map>
 #endif
 #include <cstdlib>
@@ -130,6 +138,52 @@ static nvfp4_cuda_runtime_cfg g_nvfp4_cfg = {
 };
 static bool g_nvfp4_cfg_valid = false;
 
+#if defined(_WIN32)
+static int g_nvfp4_cuda_module_anchor;
+
+static HMODULE ggml_cuda_load_library(const std::wstring & path) {
+    DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
+    SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
+    HMODULE handle = LoadLibraryW(path.c_str());
+    SetErrorMode(old_mode);
+    return handle;
+}
+
+template<typename T>
+static inline T ggml_cuda_sym(const char * name) {
+    static HMODULE cuda_handle = []() -> HMODULE {
+        HMODULE self = nullptr;
+        if (!GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&g_nvfp4_cuda_module_anchor), &self)) {
+            return nullptr;
+        }
+
+        wchar_t self_path[32768];
+        const DWORD self_path_cap = static_cast<DWORD>(sizeof(self_path) / sizeof(self_path[0]));
+        const DWORD len = GetModuleFileNameW(self, self_path, self_path_cap);
+        if (len == 0 || len >= self_path_cap) {
+            return nullptr;
+        }
+
+        std::wstring cuda_path(self_path, len);
+        const size_t slash = cuda_path.find_last_of(L"/\\");
+        if (slash == std::wstring::npos) {
+            return nullptr;
+        }
+        cuda_path.resize(slash + 1);
+        cuda_path += L"ggml-cuda.dll";
+        return ggml_cuda_load_library(cuda_path);
+    }();
+
+    if (cuda_handle) {
+        if (FARPROC sym = GetProcAddress(cuda_handle, name)) {
+            return reinterpret_cast<T>(sym);
+        }
+    }
+    return nullptr;
+}
+#else
 template<typename T>
 static inline T ggml_cuda_sym(const char * name) {
     static void * cuda_handle = []() -> void * {
@@ -166,6 +220,7 @@ static inline T ggml_cuda_sym(const char * name) {
     }
     return reinterpret_cast<T>(dlsym(RTLD_DEFAULT, name));
 }
+#endif
 
 static inline bool nvfp4_cuda_available() {
     const auto ggml_backend_cuda_get_device_count = ggml_cuda_sym<ggml_backend_cuda_get_device_count_t>("ggml_backend_cuda_get_device_count");

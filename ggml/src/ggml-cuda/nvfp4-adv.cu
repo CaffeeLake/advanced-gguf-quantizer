@@ -34,15 +34,17 @@ using block_mxfp6_e2m3 = compact_mxfp6_k32;
 using tile_mxfp6_e2m3 = tile_mxfp6;
 using tile_mxfp6_e2m3_frag = tile_mxfp6_frag;
 
-extern "C" void ggml_cuda_nvfp4_register_autotune();
-extern "C" void ggml_cuda_nvfp4_autotune(
+extern "C" {
+
+GGML_BACKEND_API void ggml_cuda_nvfp4_register_autotune();
+GGML_BACKEND_API void ggml_cuda_nvfp4_autotune(
         const float * x,
         const float * qw,
         int64_t n,
         float * best_a,
         float * best_b,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_nvfp4_quantize(
+GGML_BACKEND_API bool ggml_cuda_nvfp4_quantize(
         const void * x,
         bool x_bf16,
         float x_scale,
@@ -53,7 +55,7 @@ extern "C" bool ggml_cuda_nvfp4_quantize(
         float a,
         float b,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_nvfp4_quantize_cfg(
+GGML_BACKEND_API bool ggml_cuda_nvfp4_quantize_cfg(
         const void * x,
         bool x_bf16,
         float x_scale,
@@ -65,7 +67,7 @@ extern "C" bool ggml_cuda_nvfp4_quantize_cfg(
         float b,
         const nvfp4_cuda_runtime_cfg * cfg,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_nvfp4_quantize_eval_cfg(
+GGML_BACKEND_API bool ggml_cuda_nvfp4_quantize_eval_cfg(
         const void * x,
         bool x_bf16,
         float x_scale,
@@ -78,7 +80,7 @@ extern "C" bool ggml_cuda_nvfp4_quantize_eval_cfg(
         const nvfp4_cuda_runtime_cfg * cfg,
         nvfp4_cuda_eval_result * eval,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_nvfp4_quantize_eval_to_tensor_cfg(
+GGML_BACKEND_API bool ggml_cuda_nvfp4_quantize_eval_to_tensor_cfg(
         const void * x,
         bool x_bf16,
         float x_scale,
@@ -92,14 +94,14 @@ extern "C" bool ggml_cuda_nvfp4_quantize_eval_to_tensor_cfg(
         const nvfp4_cuda_runtime_cfg * cfg,
         nvfp4_cuda_eval_result * eval,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_nvfp4_autotune_ex(
+GGML_BACKEND_API bool ggml_cuda_nvfp4_autotune_ex(
         const float * x,
         const float * qw,
         int64_t n,
         const nvfp4_cuda_runtime_cfg * cfg_hint,
         nvfp4_cuda_tune_result * result,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_nvfp4_sample_cache_create(
+GGML_BACKEND_API bool ggml_cuda_nvfp4_sample_cache_create(
         const void * x,
         int32_t x_type,
         int64_t nrow,
@@ -114,10 +116,10 @@ extern "C" bool ggml_cuda_nvfp4_sample_cache_create(
         const float ** qw_device,
         int64_t * n_device,
         cudaStream_t stream);
-extern "C" void ggml_cuda_nvfp4_sample_cache_free(void * cache);
-extern "C" void ggml_cuda_nvfp4_set_autotune_threads(int32_t n_threads);
-extern "C" void ggml_cuda_nvfp4_clear_thread_cache();
-extern "C" bool ggml_cuda_mxfp6_e2m3_quantize_eval(
+GGML_BACKEND_API void ggml_cuda_nvfp4_sample_cache_free(void * cache);
+GGML_BACKEND_API void ggml_cuda_nvfp4_set_autotune_threads(int32_t n_threads);
+GGML_BACKEND_API void ggml_cuda_nvfp4_clear_thread_cache();
+GGML_BACKEND_API bool ggml_cuda_mxfp6_e2m3_quantize_eval(
         const void * x,
         bool x_bf16,
         float x_scale,
@@ -127,7 +129,7 @@ extern "C" bool ggml_cuda_mxfp6_e2m3_quantize_eval(
         const float * qw,
         nvfp4_cuda_eval_result * eval,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_mxfp6_e2m3_quantize_eval_to_tensor(
+GGML_BACKEND_API bool ggml_cuda_mxfp6_e2m3_quantize_eval_to_tensor(
         const void * x,
         bool x_bf16,
         float x_scale,
@@ -140,33 +142,33 @@ extern "C" bool ggml_cuda_mxfp6_e2m3_quantize_eval_to_tensor(
         float header_input_scale,
         nvfp4_cuda_eval_result * eval,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_tensor_set_host_impl(
+GGML_BACKEND_API bool ggml_cuda_tensor_set_host_impl(
         ggml_tensor * tensor,
         const void * src,
         size_t nbytes,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_nvfp4_tensor_set_header_scales_impl(
+GGML_BACKEND_API bool ggml_cuda_nvfp4_tensor_set_header_scales_impl(
         ggml_tensor * tensor,
         float weight_scale,
         float input_scale,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_tensor_get_host_impl(
+GGML_BACKEND_API bool ggml_cuda_tensor_get_host_impl(
         const ggml_tensor * tensor,
         void * dst,
         size_t nbytes,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_tensor_snapshot_impl(
+GGML_BACKEND_API bool ggml_cuda_tensor_snapshot_impl(
         const ggml_tensor * tensor,
         size_t nbytes,
         void ** snapshot,
         cudaStream_t stream);
-extern "C" bool ggml_cuda_tensor_restore_impl(
+GGML_BACKEND_API bool ggml_cuda_tensor_restore_impl(
         ggml_tensor * tensor,
         const void * snapshot,
         size_t nbytes,
         cudaStream_t stream);
-extern "C" void ggml_cuda_tensor_snapshot_free_impl(void * snapshot);
-extern "C" bool ggml_cuda_nvfp4_kld_reduce_tensor(
+GGML_BACKEND_API void ggml_cuda_tensor_snapshot_free_impl(void * snapshot);
+GGML_BACKEND_API bool ggml_cuda_nvfp4_kld_reduce_tensor(
         const ggml_tensor * logits,
         const uint16_t * base_logp_u16,
         const int32_t * token_ids,
@@ -177,6 +179,8 @@ extern "C" bool ggml_cuda_nvfp4_kld_reduce_tensor(
         nvfp4_cuda_kld_result * result,
         double * kld_values,
         cudaStream_t stream);
+
+}
 
 static constexpr int64_t NVFP4_AUTOTUNE_MAX_SAMPLE_BLOCKS = 8192;
 static constexpr double NVFP4_AUTOTUNE_MIN_IMPROVE_FRAC = 0.00075;
