@@ -251,6 +251,12 @@ Ledger estimates are not release-quality evidence. They can help prune or order
 candidate assignments, but final claims still need the same exact artifact
 evaluation and completion smoke required for any production run.
 
+Inspect a ledger without running model evaluation:
+
+```bash
+./build/bin/advanced-gguf-quantizer evidence inspect runs/model/selector-ledger.jsonl --top 40
+```
+
 ## Best Candidate Reports
 
 Use `best` for non-dominated candidate sets. Internally this is Pareto-style

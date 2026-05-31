@@ -12,6 +12,7 @@
 #include "tui.h"
 #include "utils.h"
 #include "../../../src/llama-quant.h"
+#include "quantize-selector-ledger.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -95,6 +97,7 @@ static void usage() {
         "  advanced-gguf-quantizer kld-info <logits.kld>\n"
         "  advanced-gguf-quantizer kld-command <recipe.toml> [--set path=value...]\n"
         "  advanced-gguf-quantizer imatrix-command <recipe.toml> [--set path=value...]\n"
+        "  advanced-gguf-quantizer evidence inspect <selector-ledger.jsonl> [--top N] [--json]\n"
         "  advanced-gguf-quantizer layer-policy\n"
         "  advanced-gguf-quantizer plan <recipe.toml> [--set path=value...]\n"
         "  advanced-gguf-quantizer what-if <sensitivity-report> [--tensor NAME|--layer N]\n"
@@ -1885,6 +1888,174 @@ static bool record_bool_field(const bq::CandidateRecord & record, const std::str
         return false;
     }
     return fallback;
+}
+
+struct EvidenceTensorMetric {
+    std::string tensor;
+    std::string policy;
+    std::string phase;
+    std::string cls;
+    int layer = -1;
+    double proxy_score = 0.0;
+    double rmse = 0.0;
+    double abs_mean = 0.0;
+    double max_abs = 0.0;
+    int64_t count = 0;
+};
+
+static int evidence_main(int argc, char ** argv) {
+    if (argc < 2) {
+        throw std::runtime_error("evidence requires: inspect <selector-ledger.jsonl>");
+    }
+    const std::string sub = argv[0];
+    if (sub != "inspect") {
+        throw std::runtime_error("unknown evidence subcommand: " + sub);
+    }
+
+    const std::string path = argv[1];
+    int top = 20;
+    bool json = false;
+    for (int i = 2; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--top" && i + 1 < argc) {
+            top = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--json") {
+            json = true;
+        } else {
+            throw std::runtime_error("unknown evidence argument: " + arg);
+        }
+    }
+
+    const bq::CandidateTable table = bq::load_candidate_table(path, bq::CandidateInputFormat::Jsonl);
+
+    std::map<std::string, size_t> row_counts;
+    std::vector<EvidenceTensorMetric> tensors;
+    const size_t rows = table.records.size();
+    size_t ignored = 0;
+    size_t exact_eval = 0;
+    double best_exact_score = std::numeric_limits<double>::infinity();
+    std::string best_exact_policy;
+    for (const bq::CandidateRecord & record : table.records) {
+        if (record_string_field(record, "schema") != nvfp4_selector_ledger::schema) {
+            ++ignored;
+            continue;
+        }
+        std::string row_type = record_string_field(record, "row_type");
+        if (row_type.empty()) {
+            row_type = "unknown";
+        }
+        ++row_counts[row_type];
+        if (row_type == "tensor.local_metric" && record_bool_field(record, "proxy_ok", false)) {
+            EvidenceTensorMetric m;
+            m.tensor = record_string_field(record, "tensor");
+            m.policy = record_string_field(record, "policy");
+            m.phase = record_string_field(record, "phase");
+            m.cls = record_string_field(record, "class");
+            const double layer = record_numeric_field(record, "layer", -1.0);
+            const double count = record_numeric_field(record, "count", 0.0);
+            m.layer = std::isfinite(layer) ? (int) layer : -1;
+            m.proxy_score = record_numeric_field(record, "proxy_score", 0.0);
+            m.rmse = record_numeric_field(record, "rmse", 0.0);
+            m.abs_mean = record_numeric_field(record, "abs_mean", 0.0);
+            m.max_abs = record_numeric_field(record, "max_abs", 0.0);
+            m.count = std::isfinite(count) && count > 0.0 ? (int64_t) count : 0;
+            if (!m.tensor.empty()) {
+                tensors.push_back(std::move(m));
+            }
+        } else if (row_type == "exact_eval") {
+            ++exact_eval;
+            const double score = record_numeric_field(record, "score", std::numeric_limits<double>::infinity());
+            if (std::isfinite(score) && score < best_exact_score) {
+                best_exact_score = score;
+                best_exact_policy = record_string_field(record, "policy");
+            }
+        }
+    }
+
+    std::sort(tensors.begin(), tensors.end(), [](const auto & a, const auto & b) {
+        if (a.proxy_score != b.proxy_score) return a.proxy_score > b.proxy_score;
+        if (a.max_abs != b.max_abs) return a.max_abs > b.max_abs;
+        return a.tensor < b.tensor;
+    });
+    if (top > 0 && tensors.size() > (size_t) top) {
+        tensors.resize((size_t) top);
+    }
+
+    if (json) {
+        std::cout << "{\n";
+        std::cout << "  \"schema\": \"advanced-gguf-selector-evidence-inspect-v1\",\n";
+        std::cout << "  \"path\": \"" << json_escape(path) << "\",\n";
+        std::cout << "  \"rows\": " << rows << ",\n";
+        std::cout << "  \"ignored\": " << ignored << ",\n";
+        std::cout << "  \"row_counts\": {";
+        bool first = true;
+        for (const auto & kv : row_counts) {
+            std::cout << (first ? "" : ", ") << "\"" << json_escape(kv.first) << "\": " << kv.second;
+            first = false;
+        }
+        std::cout << "},\n";
+        std::cout << "  \"exact_eval_rows\": " << exact_eval << ",\n";
+        std::cout << "  \"best_exact_policy\": \"" << json_escape(best_exact_policy) << "\",\n";
+        std::cout << "  \"best_exact_score\": ";
+        if (std::isfinite(best_exact_score)) {
+            std::cout << best_exact_score;
+        } else {
+            std::cout << "null";
+        }
+        std::cout << ",\n";
+        std::cout << "  \"top_tensor_local_metrics\": [\n";
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const EvidenceTensorMetric & m = tensors[i];
+            std::cout
+                << "    {\"tensor\": \"" << json_escape(m.tensor)
+                << "\", \"policy\": \"" << json_escape(m.policy)
+                << "\", \"phase\": \"" << json_escape(m.phase)
+                << "\", \"class\": \"" << json_escape(m.cls)
+                << "\", \"layer\": " << m.layer
+                << ", \"proxy_score\": " << m.proxy_score
+                << ", \"rmse\": " << m.rmse
+                << ", \"abs_mean\": " << m.abs_mean
+                << ", \"max_abs\": " << m.max_abs
+                << ", \"count\": " << m.count
+                << "}" << (i + 1 == tensors.size() ? "" : ",") << "\n";
+        }
+        std::cout << "  ]\n";
+        std::cout << "}\n";
+        return 0;
+    }
+
+    std::cout << "selector evidence ledger: " << path << "\n";
+    std::cout << "rows: " << rows << " ignored: " << ignored << "\n";
+    for (const auto & kv : row_counts) {
+        std::cout << "  " << kv.first << ": " << kv.second << "\n";
+    }
+    if (exact_eval > 0) {
+        std::cout << "exact_eval: " << exact_eval;
+        if (!best_exact_policy.empty()) {
+            std::cout << " best=" << best_exact_policy << " score=" << best_exact_score;
+        }
+        std::cout << "\n";
+    }
+    if (!tensors.empty()) {
+        std::cout << "top local tensor metrics (higher proxy score is worse):\n";
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const EvidenceTensorMetric & m = tensors[i];
+            std::cout
+                << "  " << (i + 1)
+                << ". " << m.tensor
+                << " policy=" << m.policy
+                << " phase=" << m.phase
+                << " cls=" << m.cls
+                << " layer=" << m.layer
+                << " proxy=" << m.proxy_score
+                << " rmse=" << m.rmse
+                << " abs=" << m.abs_mean
+                << " max=" << m.max_abs
+                << "\n";
+        }
+    }
+    std::cout << "note: ledger rankings are search evidence; release claims still need exact PPL/KLD on the final artifact.\n";
+    return 0;
 }
 
 static int what_if_main(int argc, char ** argv) {
@@ -5812,6 +5983,10 @@ int main(int argc, char ** argv) {
 
         if (command == "what-if") {
             return what_if_main(argc - 2, argv + 2);
+        }
+
+        if (command == "evidence") {
+            return evidence_main(argc - 2, argv + 2);
         }
 
         if (command == "size") {
