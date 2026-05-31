@@ -183,6 +183,15 @@ RSF variants are shortlisted by the existing proxy path and, when a KLD base is
 available, scored by the same full PPL/KLD selector machinery as other NVFP4
 policies. Adaptive four-over-six remains the default NVFP4 encoder path for
 these variants and the base policies they extend.
+During measured Stage-B policy materialization, direct runtime patching skips
+the extra tensor reconstruction-stat pass by default because the policy rank is
+computed from saved-logit runtime metrics: PPL, mean and tail KLD, RMS
+probability delta, same-top rate, top-flip weight, teacher-top probability
+RMSE, and entropy RMSE. Use `--nvfp4-selector-stageb-patch-eval` when a
+diagnostic run also needs patch-time tensor RMSE/abs/max aggregates in the log.
+Use `--nvfp4-selector-stageb-direct-verify` or
+`--nvfp4-selector-no-stageb-direct-verify` to override direct-patch readback
+verification for runtime-patch diagnostics.
 
 The default NVFP4 RSF selector budget is the full-evidence real-artifact search
 used for current production candidates: all available KLD chunks, exhaustive

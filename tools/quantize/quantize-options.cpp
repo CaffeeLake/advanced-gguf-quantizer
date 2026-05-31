@@ -272,6 +272,10 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      limit selector stress tensors and enable verbose selector tensor tracing.\n");
     printf("  --nvfp4-selector-policy-threads N / --nvfp4-selector-threads N\n");
     printf("                                      selector policy/tensor worker counts; final quantization still uses nthreads.\n");
+    printf("  --nvfp4-selector-stageb-patch-eval\n");
+    printf("                                      also collect tensor reconstruction stats while materializing Stage-B policies.\n");
+    printf("  --nvfp4-selector-stageb-direct-verify / --nvfp4-selector-no-stageb-direct-verify\n");
+    printf("                                      force-enable or disable Stage-B direct-patch readback verification.\n");
     printf("  --nvfp4-selector-kld-threads N\n");
     printf("                                      host worker count for full-vocab KLD/PPL metric reduction during selector full PPL/KLD eval.\n");
     printf("  --nvfp4-selector-auto-rescue\n");

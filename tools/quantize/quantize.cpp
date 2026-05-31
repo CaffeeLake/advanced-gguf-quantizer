@@ -3963,7 +3963,8 @@ static bool nvfp4_selector_quantize_binding(
     int64_t sample_blocks_override = 0,
     int64_t sample_phase = 0,
     bool direct_runtime_patch = false,
-    nvfp4_selector_rsf_tensor_record * rsf_record = nullptr) {
+    nvfp4_selector_rsf_tensor_record * rsf_record = nullptr,
+    bool collect_eval_metrics = true) {
     using qtype = ggml_quantize_type_traits<GGML_TYPE_NVFP4>;
 
     std::mutex rsf_record_mutex;
@@ -4168,7 +4169,7 @@ static bool nvfp4_selector_quantize_binding(
         eval_params.a = tune.a;
         eval_params.b = tune.b;
         eval_params.nvfp4_cfg = &cfg;
-        eval_params.eval = &eval;
+        eval_params.eval = collect_eval_metrics ? &eval : nullptr;
         eval_params.stream_key = stream_key;
         const bool quant_ok = qtype::quantize_eval(eval_params);
         if (!quant_ok) {
@@ -4192,10 +4193,12 @@ static bool nvfp4_selector_quantize_binding(
             acc.ok = false;
             return;
         }
-        acc.sum_sq += eval.sum_sq;
-        acc.sum_abs += eval.sum_abs;
-        acc.max_abs = std::max(acc.max_abs, eval.max_abs);
-        acc.count += eval.count;
+        if (collect_eval_metrics) {
+            acc.sum_sq += eval.sum_sq;
+            acc.sum_abs += eval.sum_abs;
+            acc.max_abs = std::max(acc.max_abs, eval.max_abs);
+            acc.count += eval.count;
+        }
     };
 
     return quantize_binding_quantize<qtype::quant_type>(
@@ -7262,25 +7265,33 @@ static bool nvfp4_selector_choose_policy(
             // write the runtime layout, not assume tensor->data is what matmul
             // will read.
             const bool stageb_direct_patch = true;
+            const bool stageb_collect_patch_eval_metrics =
+                quantize_control_bool("LLAMA_NVFP4_SELECTOR_STAGEB_PATCH_EVAL", false);
+            const bool stageb_verify_direct_patch =
+                quantize_control_bool("LLAMA_NVFP4_SELECTOR_STAGEB_DIRECT_VERIFY", !nvfp4_cfg_has_rsf(policy.cfg));
             std::vector<stageb_patch_result> patch_results(eval_binding_indices.size());
+            const bool stageb_policy_threads_explicit = quantize_control_has("LLAMA_NVFP4_SELECTOR_POLICY_THREADS");
             const int requested_stageb_patch_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
                 (int64_t) eval_binding_indices.size(),
                 quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS",
                     std::max<int>(1, nthread))));
             const int stageb_autotune_threads = nvfp4_autotune_threads > 0 ?
                 std::min<int>(4, std::max<int>(1, nvfp4_autotune_threads)) : 4;
-            const int stageb_patch_threads = std::max<int>(1, std::min<int>(
-                requested_stageb_patch_threads,
-                std::max<int>(1, nthread / stageb_autotune_threads)));
+            const int default_stageb_patch_threads = std::max<int>(1, nthread / stageb_autotune_threads);
+            const int stageb_patch_threads = stageb_policy_threads_explicit ?
+                requested_stageb_patch_threads :
+                std::max<int>(1, std::min<int>(requested_stageb_patch_threads, default_stageb_patch_threads));
             const int stageb_binding_nthread = std::max(1, nthread / std::max(1, stageb_patch_threads));
             if (stageb_patch_threads > 1) {
                 fprintf(stderr,
-                    "selector stage-b patch policy=%s threads=%d tensor_threads=%d autotune_threads=%d tensors=%zu\n",
+                    "selector stage-b patch policy=%s threads=%d tensor_threads=%d autotune_threads=%d tensors=%zu patch_eval=%s direct_verify=%s\n",
                     policy.name.c_str(),
                     stageb_patch_threads,
                     stageb_binding_nthread,
                     stageb_autotune_threads,
-                    eval_binding_indices.size());
+                    eval_binding_indices.size(),
+                    stageb_collect_patch_eval_metrics ? "yes" : "no",
+                    stageb_verify_direct_patch ? "yes" : "skipped_rsf");
             }
             const size_t no_failed_patch = std::numeric_limits<size_t>::max();
             auto clear_stageb_retry_caches = [&]() {
@@ -7344,13 +7355,15 @@ static bool nvfp4_selector_choose_policy(
                         patch_update("encoding", pos);
                         if (stageb_direct_patch &&
                                 nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                    r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
+                                    r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true, nullptr,
+                                    stageb_collect_patch_eval_metrics)) {
                             r.direct_applied = true;
                             patch_done_one("encoded direct", pos);
                             continue;
                         }
                         if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
+                                r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false, nullptr,
+                                stageb_collect_patch_eval_metrics)) {
                             r.ok = false;
                             failed_pos = pos;
                             patch_update("failed", pos, true);
@@ -7381,13 +7394,15 @@ static bool nvfp4_selector_choose_policy(
                                 patch_update("encoding", pos);
                                 if (stageb_direct_patch &&
                                         nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                            r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
+                                            r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true, nullptr,
+                                            stageb_collect_patch_eval_metrics)) {
                                     r.direct_applied = true;
                                     patch_done_one("encoded direct", pos);
                                     continue;
                                 }
                                 if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                        r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
+                                        r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false, nullptr,
+                                        stageb_collect_patch_eval_metrics)) {
                                     r.ok = false;
                                     size_t expected = no_failed_patch;
                                     (void) failed_patch.compare_exchange_strong(
@@ -7486,7 +7501,7 @@ static bool nvfp4_selector_choose_policy(
                     return false;
                 }
             }
-            if (policy_patch_ok && direct_patch_count > 0) {
+            if (policy_patch_ok && direct_patch_count > 0 && stageb_verify_direct_patch) {
                 bool direct_verified = false;
                 bool direct_mismatch = false;
                 std::string direct_mismatch_name;
@@ -7526,31 +7541,31 @@ static bool nvfp4_selector_choose_policy(
                             "%s: selector direct runtime patch readback mismatch policy=%s tensor=%s; keeping direct NVFP4 runtime layout for RSF policy\n",
                             __func__, policy.name.c_str(), direct_mismatch_name.c_str());
                     } else {
-                    fprintf(stderr,
-                        "%s: selector direct runtime patch readback mismatch policy=%s tensor=%s; falling back to backend tensor setter for this policy\n",
-                        __func__, policy.name.c_str(), direct_mismatch_name.c_str());
-                    for (size_t pos = 0; pos < eval_binding_indices.size(); ++pos) {
-                        auto & b = all_bindings[eval_binding_indices[pos]];
-                        const auto & r = patch_results[pos];
-                        if (!r.direct_applied) {
-                            continue;
+                        fprintf(stderr,
+                            "%s: selector direct runtime patch readback mismatch policy=%s tensor=%s; falling back to backend tensor setter for this policy\n",
+                            __func__, policy.name.c_str(), direct_mismatch_name.c_str());
+                        for (size_t pos = 0; pos < eval_binding_indices.size(); ++pos) {
+                            auto & b = all_bindings[eval_binding_indices[pos]];
+                            const auto & r = patch_results[pos];
+                            if (!r.direct_applied) {
+                                continue;
+                            }
+                            double ref_sq = 0.0;
+                            double ref_abs = 0.0;
+                            double ref_max = 0.0;
+                            int64_t ref_n = 0;
+                            if (!nvfp4_selector_quantize_binding(
+                                    b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
+                                    ref_sq, ref_abs, ref_max, ref_n, 0, 0, false) || ref_n <= 0) {
+                                restore_all();
+                                return false;
+                            }
+                            if (!quantize_tensor_copy_in(b.target, b.working_target_bytes.data(), b.target_nbytes)) {
+                                restore_all();
+                                return false;
+                            }
+                            ++direct_fallback_count;
                         }
-                        double ref_sq = 0.0;
-                        double ref_abs = 0.0;
-                        double ref_max = 0.0;
-                        int64_t ref_n = 0;
-                        if (!nvfp4_selector_quantize_binding(
-                                b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
-                                ref_sq, ref_abs, ref_max, ref_n, 0, 0, false) || ref_n <= 0) {
-                            restore_all();
-                            return false;
-                        }
-                        if (!quantize_tensor_copy_in(b.target, b.working_target_bytes.data(), b.target_nbytes)) {
-                            restore_all();
-                            return false;
-                        }
-                        ++direct_fallback_count;
-                    }
                     }
                 }
             }
@@ -7558,13 +7573,31 @@ static bool nvfp4_selector_choose_policy(
             const double patch_ensure_s = std::chrono::duration<double>(patch_ensure_t1 - patch_t0).count();
             const double patch_quant_s = std::chrono::duration<double>(patch_quant_t1 - patch_ensure_t1).count();
             const double patch_apply_s = std::chrono::duration<double>(patch_apply_t1 - patch_quant_t1).count();
+            double patch_sum_sq = 0.0;
+            double patch_sum_abs = 0.0;
+            double patch_max_abs = 0.0;
+            int64_t patch_count = 0;
+            if (stageb_collect_patch_eval_metrics) {
+                for (const auto & r : patch_results) {
+                    patch_sum_sq += r.tensor_sq;
+                    patch_sum_abs += r.tensor_abs;
+                    patch_max_abs = std::max(patch_max_abs, r.tensor_max);
+                    patch_count += r.tensor_n;
+                }
+            }
             fprintf(stderr,
-                "selector stage-b patch complete policy=%s tensors=%zu direct=%zu direct_fallback=%zu threads=%d ensure=%.3fs encode=%.3fs apply=%.3fs total=%.3fs\n",
+                "selector stage-b patch complete policy=%s tensors=%zu direct=%zu direct_fallback=%zu threads=%d patch_eval=%s direct_verify=%s patch_rmse=%.8f patch_abs=%.8f patch_max=%.8f patch_n=%" PRId64 " ensure=%.3fs encode=%.3fs apply=%.3fs total=%.3fs\n",
                 policy.name.c_str(),
                 eval_binding_indices.size(),
                 direct_patch_count,
                 direct_fallback_count,
                 stageb_patch_threads,
+                stageb_collect_patch_eval_metrics ? "yes" : "no",
+                direct_patch_count == 0 ? "none" : (stageb_verify_direct_patch ? "checked" : "skipped_rsf"),
+                patch_count > 0 ? std::sqrt(patch_sum_sq / (double) patch_count) : 0.0,
+                patch_count > 0 ? patch_sum_abs / (double) patch_count : 0.0,
+                patch_max_abs,
+                patch_count,
                 patch_ensure_s,
                 patch_quant_s,
                 patch_apply_s,
@@ -10067,6 +10100,12 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-stageb-patch-eval") == 0) {
+            add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEB_PATCH_EVAL", "1");
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-stageb-direct-verify") == 0) {
+            add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEB_DIRECT_VERIFY", "1");
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-no-stageb-direct-verify") == 0) {
+            add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEB_DIRECT_VERIFY", "0");
         } else if (strcmp(argv[arg_idx], "--nvfp4-selector-threads") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_controls("LLAMA_NVFP4_SELECTOR_THREADS", argv[++arg_idx]);
