@@ -379,6 +379,15 @@ static void write_assignment_jsonl(
             << ",\"file_bytes\":" << output->file_bytes;
     }
     out << "}\n";
+    out << "{\"schema\":\"advanced-gguf-quantizer-assignment-v1\",\"event\":\"selector_planner\""
+        << ",\"evidence_ledger\":\"" << json_escape(recipe.selector.ledger) << "\""
+        << ",\"search\":\"" << json_escape(recipe.selector.search) << "\""
+        << ",\"local_top_k\":\"" << json_escape(recipe.selector.local_top_k) << "\""
+        << ",\"group_units\":\"" << json_escape(recipe.selector.group_units) << "\""
+        << ",\"beam_width\":\"" << json_escape(recipe.selector.beam_width) << "\""
+        << ",\"exact_budget\":\"" << json_escape(recipe.selector.exact_budget) << "\""
+        << ",\"delta_mode\":\"" << json_escape(recipe.selector.delta_mode) << "\""
+        << ",\"note\":\"ledger planner estimates are not release evidence; exact PPL/KLD gates still apply\"}\n";
     out << "{\"schema\":\"advanced-gguf-quantizer-assignment-v1\",\"event\":\"fused_decision_units\""
         << ",\"units\":[\"qkv\",\"gate_up\",\"expert_pairs\",\"mtp_heads\",\"lm_head_and_embeddings\"]"
         << ",\"policy\":\"record groups as coherent layer decisions before per-tensor overrides\"}\n";
@@ -454,6 +463,15 @@ static void write_run_manifest_and_report(
     report << "- p999 penalty: `" << recipe.selector.ranking.p999_penalty << "`, hard gate: `"
            << (recipe.selector.ranking.p999_hard_gate ? "on" : "off") << "`, threshold: `"
            << (recipe.selector.ranking.p999_threshold.empty() ? "baseline" : recipe.selector.ranking.p999_threshold) << "`\n\n";
+    report << "## Selector Planner\n\n";
+    report << "- Evidence ledger: `" << (recipe.selector.ledger.empty() ? "disabled" : recipe.selector.ledger) << "`\n";
+    report << "- Search: `" << (recipe.selector.search.empty() ? "legacy" : recipe.selector.search)
+           << "`, local top-k: `" << recipe.selector.local_top_k
+           << "`, group units: `" << recipe.selector.group_units << "`\n";
+    report << "- Beam width: `" << recipe.selector.beam_width
+           << "`, exact budget: `" << recipe.selector.exact_budget
+           << "`, delta mode: `" << recipe.selector.delta_mode << "`\n";
+    report << "- Planner estimates are for search only; release evidence still comes from exact PPL/KLD gates and final artifact evaluation.\n\n";
     report << "## Keys\n\n";
     report << "- Source: `" << key.source.hash64 << "` (" << key.source.mode << ", " << key.source.bytes << " bytes)\n";
     report << "- Imatrix: `" << key.imatrix.hash64 << "` (" << key.imatrix.mode << ", " << key.imatrix.bytes << " bytes)\n";
@@ -1223,6 +1241,14 @@ static int plan_recipe(int argc, char ** argv) {
                       << ", eval_budget_per_subset=" << loaded.recipe.selector.eval_chunks << "\n";
         }
     }
+    std::cout << "selector_planner: ledger="
+              << (loaded.recipe.selector.ledger.empty() ? "disabled" : loaded.recipe.selector.ledger)
+              << ", search=" << (loaded.recipe.selector.search.empty() ? "legacy" : loaded.recipe.selector.search)
+              << ", local_top_k=" << loaded.recipe.selector.local_top_k
+              << ", group_units=" << loaded.recipe.selector.group_units
+              << ", beam_width=" << loaded.recipe.selector.beam_width
+              << ", exact_budget=" << loaded.recipe.selector.exact_budget
+              << ", delta_mode=" << loaded.recipe.selector.delta_mode << "\n";
     std::cout << "internal quantize call:\n  " << shellish_args(plan.argv) << "\n";
     const std::string kld_command = kld_base_command_shell(loaded.recipe);
     if (!kld_command.empty()) {
@@ -4754,6 +4780,13 @@ static void shell_configure_candidate_search(ShellState & state) {
     const std::string title = "Project > Options > Candidate Search";
     state.recipe.autotune.enabled = false;
     state.recipe.selector.kld = shell_prompt_on_page(state, title, "KLD base file", state.recipe.selector.kld.empty() ? state.recipe.evaluation.kld_base : state.recipe.selector.kld);
+    state.recipe.selector.ledger = shell_prompt_on_page(state, title, "selector evidence ledger", state.recipe.selector.ledger);
+    state.recipe.selector.search = shell_prompt_on_page(state, title, "ledger planner search mode", state.recipe.selector.search);
+    state.recipe.selector.local_top_k = shell_prompt_on_page(state, title, "local alternatives per unit", state.recipe.selector.local_top_k);
+    state.recipe.selector.group_units = shell_prompt_on_page(state, title, "planner grouping units", state.recipe.selector.group_units);
+    state.recipe.selector.beam_width = shell_prompt_on_page(state, title, "planner beam width", state.recipe.selector.beam_width);
+    state.recipe.selector.exact_budget = shell_prompt_on_page(state, title, "exact planner budget", state.recipe.selector.exact_budget);
+    state.recipe.selector.delta_mode = shell_prompt_on_page(state, title, "planner delta mode", state.recipe.selector.delta_mode);
     state.recipe.selector.checkpoint_model = shell_prompt_on_page(state, title, "candidate search checkpoint GGUF", state.recipe.selector.checkpoint_model);
     state.recipe.selector.cache_dir = shell_prompt_on_page(state, title, "checkpoint cache directory", state.recipe.selector.cache_dir);
     state.recipe.selector.skip_file = shell_prompt_on_page(state, title, "skip remaining tuning request file", state.recipe.selector.skip_file);

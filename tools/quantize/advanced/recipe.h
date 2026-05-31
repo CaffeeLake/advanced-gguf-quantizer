@@ -162,6 +162,12 @@ struct Recipe {
         std::string cache_dir;
         std::string skip_file;
         std::string ledger;
+        std::string search;
+        std::string local_top_k;
+        std::string group_units;
+        std::string beam_width;
+        std::string exact_budget;
+        std::string delta_mode;
         bool keep_checkpoint = false;
         bool require_runtime_cache = false;
         std::string chunks;

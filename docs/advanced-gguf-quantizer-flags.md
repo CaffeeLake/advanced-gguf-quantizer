@@ -222,6 +222,35 @@ improves enough. This is enabled by default for measured selector runs; use
 `--nvfp4-selector-no-tensor-policy-map` for diagnostics or
 `--nvfp4-selector-tensor-policy-map-max N` to cap the number of tensor switches.
 
+## Assignment-Ledger Planner
+
+The recipe surface includes experimental planner fields for assignment-ledger
+search:
+
+```toml
+[selector]
+ledger = "runs/model/selector-ledger.jsonl"
+search = "legacy"
+local_top_k = "0"
+group_units = "auto"
+beam_width = "1"
+exact_budget = "off"
+delta_mode = "estimate"
+```
+
+`selector.ledger` passes through to `--nvfp4-selector-ledger` when set and
+appends raw selector evidence rows to JSONL. Leave it empty for normal runs.
+`selector.search`, `selector.local_top_k`, `selector.group_units`,
+`selector.beam_width`, `selector.exact_budget`, and `selector.delta_mode` are
+future-facing planner controls. They are recorded in the recipe lock, plan
+output, assignment log, and quantization report, but they do not replace the
+existing exact selector path unless matching low-level planner support is
+present.
+
+Ledger estimates are not release-quality evidence. They can help prune or order
+candidate assignments, but final claims still need the same exact artifact
+evaluation and completion smoke required for any production run.
+
 ## Best Candidate Reports
 
 Use `best` for non-dominated candidate sets. Internally this is Pareto-style

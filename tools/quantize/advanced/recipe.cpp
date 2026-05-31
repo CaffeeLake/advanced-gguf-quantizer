@@ -269,6 +269,12 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.cache_dir") { r.selector.cache_dir = value; return; }
     if (path == "selector.skip_file") { r.selector.skip_file = value; return; }
     if (path == "selector.ledger" || path == "selector.evidence_ledger") { r.selector.ledger = value; return; }
+    if (path == "selector.search") { r.selector.search = value; return; }
+    if (path == "selector.local_top_k") { r.selector.local_top_k = value; return; }
+    if (path == "selector.group_units") { r.selector.group_units = value; return; }
+    if (path == "selector.beam_width") { r.selector.beam_width = value; return; }
+    if (path == "selector.exact_budget") { r.selector.exact_budget = value; return; }
+    if (path == "selector.delta_mode") { r.selector.delta_mode = value; return; }
     if (path == "selector.keep_checkpoint") { r.selector.keep_checkpoint = parse_bool_value(value); return; }
     if (path == "selector.require_runtime_cache") { r.selector.require_runtime_cache = parse_bool_value(value); return; }
     if (path == "selector.chunks") { r.selector.chunks = value; return; }
@@ -902,6 +908,12 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "cache_dir", r.selector.cache_dir);
     dump_string(out, "skip_file", r.selector.skip_file);
     dump_string(out, "ledger", r.selector.ledger);
+    dump_string(out, "search", r.selector.search);
+    dump_string(out, "local_top_k", r.selector.local_top_k);
+    dump_string(out, "group_units", r.selector.group_units);
+    dump_string(out, "beam_width", r.selector.beam_width);
+    dump_string(out, "exact_budget", r.selector.exact_budget);
+    dump_string(out, "delta_mode", r.selector.delta_mode);
     if (show_low_level) {
         dump_bool(out, "keep_checkpoint", r.selector.keep_checkpoint);
         dump_bool(out, "require_runtime_cache", r.selector.require_runtime_cache);
@@ -1023,6 +1035,12 @@ void apply_master_autotune(Recipe & r) {
             value = fallback;
         }
     };
+    assign_if_empty(r.selector.search, "legacy");
+    assign_if_empty(r.selector.local_top_k, "0");
+    assign_if_empty(r.selector.group_units, "auto");
+    assign_if_empty(r.selector.beam_width, "1");
+    assign_if_empty(r.selector.exact_budget, "off");
+    assign_if_empty(r.selector.delta_mode, "estimate");
     if (diagnostic) {
         assign_if_empty(r.selector.chunks, "4");
         assign_if_empty(r.selector.holdout_chunks, "1");
