@@ -2643,7 +2643,7 @@ static void configure_standard_quantize_options(bq::Recipe & recipe) {
 
     recipe.base.output_tensor_type = sanitize_tensor_type_token(prompt("output.weight tensor type", recipe.base.output_tensor_type));
     recipe.base.token_embedding_type = sanitize_tensor_type_token(prompt("token embedding tensor type", recipe.base.token_embedding_type));
-    recipe.base.mtp_tensor_type = sanitize_tensor_type_token(prompt("MTP/NextN tensor type (blank preserves source; use Q8_0/BF16)", recipe.base.mtp_tensor_type));
+    recipe.base.mtp_tensor_type = sanitize_tensor_type_token(prompt("MTP/NextN tensor type (blank preserves source; use MXFP6_E2M3/Q8_0/BF16)", recipe.base.mtp_tensor_type));
     recipe.base.leave_output_tensor = prompt_bool("leave output.weight unquantized", recipe.base.leave_output_tensor);
     recipe.stock_ftype.sweep_tensor_policy = prompt_bool("measure embeddings/output as candidates", recipe.stock_ftype.sweep_tensor_policy || recipe.stock_ftype.sweep_sensitive_tensors);
     recipe.stock_ftype.sweep_sensitive_tensors = recipe.stock_ftype.sweep_tensor_policy;
@@ -5048,7 +5048,7 @@ static void shell_configure_standard_quantize_options(ShellState & state) {
     const std::string title = "Project > Options > Standard Quantize Options";
     state.recipe.base.output_tensor_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "output.weight tensor type", state.recipe.base.output_tensor_type));
     state.recipe.base.token_embedding_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "token embedding tensor type", state.recipe.base.token_embedding_type));
-    state.recipe.base.mtp_tensor_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "MTP/NextN tensor type (blank preserves source; use Q8_0/BF16)", state.recipe.base.mtp_tensor_type));
+    state.recipe.base.mtp_tensor_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "MTP/NextN tensor type (blank preserves source; use MXFP6_E2M3/Q8_0/BF16)", state.recipe.base.mtp_tensor_type));
     state.recipe.base.leave_output_tensor = shell_prompt_bool_on_page(state, title, "leave output.weight unquantized", state.recipe.base.leave_output_tensor);
     state.recipe.stock_ftype.sweep_tensor_policy = shell_prompt_bool_on_page(
         state,

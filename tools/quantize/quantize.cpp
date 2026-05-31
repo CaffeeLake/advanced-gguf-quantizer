@@ -9729,7 +9729,7 @@ int llama_quantize(int argc, char ** argv) {
                     usage(argv[0]);
                 }
                 if (params.mtp_tensor_type == GGML_TYPE_NVFP4) {
-                    fprintf(stderr, "%s: --mtp-tensor-type NVFP4 is refused; use Q8_0 or BF16 for MTP/NextN tensors\n", __func__);
+                    fprintf(stderr, "%s: --mtp-tensor-type NVFP4 is refused; use MXFP6_E2M3, Q8_0, BF16, F16, or source precision for MTP/NextN tensors\n", __func__);
                     usage(argv[0]);
                 }
             } else {

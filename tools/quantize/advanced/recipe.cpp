@@ -699,7 +699,7 @@ std::vector<std::string> validate_recipe(const Recipe & recipe, bool require_io)
     check_tensor_type("base.token_embedding_type", recipe.base.token_embedding_type);
     check_tensor_type("base.mtp_tensor_type", recipe.base.mtp_tensor_type);
     if (lower_copy(sanitize_tensor_type_token(recipe.base.mtp_tensor_type)) == "nvfp4") {
-        errors.push_back("base.mtp_tensor_type must not be NVFP4; leave it blank to preserve source MTP tensors, or use Q8_0/BF16");
+        errors.push_back("base.mtp_tensor_type must not be NVFP4; leave it blank to preserve source MTP tensors, or use MXFP6_E2M3/Q8_0/BF16/F16");
     }
     const bool advanced_precision_quant =
         quant_type_uses_nvfp4(recipe.base.ftype) ||

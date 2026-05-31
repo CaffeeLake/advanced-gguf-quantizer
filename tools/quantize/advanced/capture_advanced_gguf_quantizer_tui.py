@@ -1123,6 +1123,13 @@ def case_candidate_search_all_paths(session: PtySession, case_dir: Path) -> None
         session,
         [
             "KLD base file",
+            "selector evidence ledger",
+            "ledger planner search mode",
+            "local alternatives per unit",
+            "planner grouping units",
+            "planner beam width",
+            "exact planner budget",
+            "planner delta mode",
             "candidate search checkpoint GGUF",
             "checkpoint cache directory",
             "skip remaining tuning request file",

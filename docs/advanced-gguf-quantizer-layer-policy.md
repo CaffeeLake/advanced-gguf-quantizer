@@ -9,7 +9,8 @@ extra bits only where evidence justifies them.
 - Preserve MTP and NextN tensors by default, including the whole appended
   decoder block on Qwen-style MTP models.
 - Use `base.mtp_tensor_type` / `--mtp-tensor-type` when a recipe deliberately
-  converts MTP tensors. Prefer `Q8_0` or `BF16`; do not use `NVFP4` for MTP.
+  converts MTP tensors. `MXFP6_E2M3`, `Q8_0`, `BF16`, and `F16` are valid
+  release choices; do not use `NVFP4` for MTP.
 - Keep token embeddings as `NVFP4` in pure NVFP4 artifacts.
 - A separate `output.weight` may use `Q6_K`, `Q8_0`, `BF16`, or another stronger
   type when the recipe asks for it.
