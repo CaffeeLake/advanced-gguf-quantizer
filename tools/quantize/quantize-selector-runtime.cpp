@@ -22,7 +22,7 @@ static constexpr double NVFP4_SELECTOR_LOGITS_FALLBACK_GIB = 4.0;
 static constexpr double NVFP4_SELECTOR_LOGITS_RESERVE_MIN_GIB = 4.0;
 static constexpr double NVFP4_SELECTOR_LOGITS_RESERVE_MAX_GIB = 16.0;
 static constexpr double NVFP4_SELECTOR_LOGITS_RESERVE_FRACTION = 0.20;
-static constexpr int64_t NVFP4_SELECTOR_PROGRESS_HEARTBEAT_SEC = 120;
+static constexpr int64_t NVFP4_SELECTOR_PROGRESS_HEARTBEAT_SEC = 30;
 
 static std::atomic<int32_t> g_nvfp4_selector_kld_threads_override{0};
 static std::atomic_bool g_nvfp4_selector_skip_requested{false};

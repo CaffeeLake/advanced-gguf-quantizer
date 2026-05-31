@@ -7074,7 +7074,9 @@ static bool nvfp4_selector_choose_policy(
             has_holdout_eval = cached_baseline.has_validation && baseline_holdout_eval.ok;
         } else {
             nvfp4_selector_kld_metrics baseline_km;
-            if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, baseline_km, true)) {
+            if (!nvfp4_selector_eval_kld_subset(
+                    lctx, kld_budget, params.n_batch, baseline_km, true,
+                    "selector stage-b baseline search kld")) {
                 restore_all();
                 return false;
             }
@@ -7083,7 +7085,9 @@ static bool nvfp4_selector_choose_policy(
 
             if (holdout_budget && holdout_budget->n_chunk > 0) {
                 nvfp4_selector_kld_metrics baseline_holdout_km;
-                if (!nvfp4_selector_eval_kld_subset(lctx, *holdout_budget, params.n_batch, baseline_holdout_km, true)) {
+                if (!nvfp4_selector_eval_kld_subset(
+                        lctx, *holdout_budget, params.n_batch, baseline_holdout_km, true,
+                        "selector stage-b baseline validation kld")) {
                     restore_all();
                     return false;
                 }
@@ -7243,23 +7247,66 @@ static bool nvfp4_selector_choose_policy(
                 for (auto & r : patch_results) {
                     r = stageb_patch_result{};
                 }
+                auto patch_detail = [&](const char * state, size_t pos) -> std::string {
+                    char detail[512];
+                    if (pos < eval_binding_indices.size()) {
+                        const auto & b = all_bindings[eval_binding_indices[pos]];
+                        snprintf(detail, sizeof(detail),
+                            "policy=%s attempt=%d %s tensor=%s",
+                            policy.name.c_str(),
+                            attempt,
+                            state,
+                            b.name.c_str());
+                    } else {
+                        snprintf(detail, sizeof(detail),
+                            "policy=%s attempt=%d %s",
+                            policy.name.c_str(),
+                            attempt,
+                            state);
+                    }
+                    return detail;
+                };
+                nvfp4_selector_progress_heartbeat patch_heartbeat(
+                    "selector stage-b patch",
+                    (int64_t) eval_binding_indices.size());
+                std::atomic<int64_t> patch_done { 0 };
+                auto patch_update = [&](const char * state, size_t pos, bool print_now = false) {
+                    patch_heartbeat.update(
+                        patch_done.load(std::memory_order_relaxed),
+                        (int64_t) eval_binding_indices.size(),
+                        patch_detail(state, pos),
+                        print_now);
+                };
+                auto patch_done_one = [&](const char * state, size_t pos) {
+                    const int64_t done = patch_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                    patch_heartbeat.update(
+                        done,
+                        (int64_t) eval_binding_indices.size(),
+                        patch_detail(state, pos));
+                };
+                patch_update("starting", no_failed_patch, true);
                 if (stageb_patch_threads <= 1 || eval_binding_indices.size() <= 1) {
                     for (size_t pos = 0; pos < eval_binding_indices.size(); ++pos) {
                         auto & b = all_bindings[eval_binding_indices[pos]];
                         auto & r = patch_results[pos];
+                        patch_update("encoding", pos);
                         if (stageb_direct_patch &&
                                 nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
                                     r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
                             r.direct_applied = true;
+                            patch_done_one("encoded direct", pos);
                             continue;
                         }
                         if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
                                 r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, false)) {
                             r.ok = false;
                             failed_pos = pos;
+                            patch_update("failed", pos, true);
                             return false;
                         }
+                        patch_done_one("encoded", pos);
                     }
+                    patch_heartbeat.finish(patch_detail("complete", no_failed_patch));
                     return true;
                 } else {
                     std::atomic<size_t> next_patch { 0 };
@@ -7279,10 +7326,12 @@ static bool nvfp4_selector_choose_policy(
                                 }
                                 auto & b = all_bindings[eval_binding_indices[pos]];
                                 auto & r = patch_results[pos];
+                                patch_update("encoding", pos);
                                 if (stageb_direct_patch &&
                                         nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
                                             r.tensor_sq, r.tensor_abs, r.tensor_max, r.tensor_n, 0, 0, true)) {
                                     r.direct_applied = true;
+                                    patch_done_one("encoded direct", pos);
                                     continue;
                                 }
                                 if (!nvfp4_selector_quantize_binding(b, policy.cfg, stageb_binding_nthread, b.working_target_bytes,
@@ -7292,7 +7341,10 @@ static bool nvfp4_selector_choose_policy(
                                     (void) failed_patch.compare_exchange_strong(
                                         expected, pos, std::memory_order_acq_rel, std::memory_order_acquire);
                                     patch_failed.store(true, std::memory_order_release);
+                                    patch_update("failed", pos, true);
+                                    continue;
                                 }
+                                patch_done_one("encoded", pos);
                             }
                         });
                     }
@@ -7305,8 +7357,10 @@ static bool nvfp4_selector_choose_policy(
                         fprintf(stderr,
                             "%s: selector stage-b patch attempt=%d failed policy=%s tensor=%s; stopped remaining workers\n",
                             __func__, attempt, policy.name.c_str(), b.name.c_str());
+                        patch_update("failed", failed_pos, true);
                         return false;
                     }
+                    patch_heartbeat.finish(patch_detail("complete", no_failed_patch));
                     return true;
                 }
             };
@@ -7474,7 +7528,11 @@ static bool nvfp4_selector_choose_policy(
             }
 
             nvfp4_selector_kld_metrics km;
-            if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
+            const std::string policy_search_kld_label =
+                "selector stage-b policy=" + policy.name + " search kld";
+            if (!nvfp4_selector_eval_kld_subset(
+                    lctx, kld_budget, params.n_batch, km, true,
+                    policy_search_kld_label)) {
                 restore_all();
                 return false;
             }
@@ -7482,7 +7540,11 @@ static bool nvfp4_selector_choose_policy(
             policy.measured = nvfp4_selector_derive_metrics(km);
             if (holdout_budget && has_holdout_eval) {
                 nvfp4_selector_kld_metrics km_holdout;
-                if (!nvfp4_selector_eval_kld_subset(lctx, *holdout_budget, params.n_batch, km_holdout, true)) {
+                const std::string policy_validation_kld_label =
+                    "selector stage-b policy=" + policy.name + " validation kld";
+                if (!nvfp4_selector_eval_kld_subset(
+                        lctx, *holdout_budget, params.n_batch, km_holdout, true,
+                        policy_validation_kld_label)) {
                     restore_all();
                     return false;
                 }
