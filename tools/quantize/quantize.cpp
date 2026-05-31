@@ -5366,8 +5366,12 @@ static bool nvfp4_selector_choose_policy(
     int64_t stageb_policy_total = 0;
     int64_t stageb_policy_done = 0;
     double stageb_policy_done_seconds = 0.0;
+    int64_t stageb_policy_eta_done = 0;
+    double stageb_policy_eta_done_seconds = 0.0;
     bool stageb_policy_active = false;
     std::chrono::steady_clock::time_point stageb_policy_start;
+    std::string stageb_policy_active_name;
+    size_t stageb_policy_active_index = 0;
     auto stageb_eta_hint = [&]() -> std::string {
         if (full_quant_eta_total > 0 && full_quant_eta_done >= full_quant_eta_total) {
             return "done";
@@ -5375,35 +5379,71 @@ static bool nvfp4_selector_choose_policy(
         if (stageb_policy_total <= 0) {
             return {};
         }
-        if (stageb_policy_done <= 0 || !(stageb_policy_done_seconds > 0.0)) {
-            return "TBD...";
-        }
-        const double avg_policy_s = stageb_policy_done_seconds / (double) stageb_policy_done;
         int64_t remaining_policies = std::max<int64_t>(0, stageb_policy_total - stageb_policy_done);
-        double remaining_s = 0.0;
-        if (stageb_policy_active && remaining_policies > 0) {
-            const double active_s = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - stageb_policy_start).count();
-            remaining_s += std::max(0.0, avg_policy_s - active_s);
-            --remaining_policies;
+        const double active_s = stageb_policy_active
+            ? std::chrono::duration<double>(std::chrono::steady_clock::now() - stageb_policy_start).count()
+            : 0.0;
+        if (stageb_policy_eta_done > 0 && stageb_policy_eta_done_seconds > 0.0) {
+            const double avg_policy_s = stageb_policy_eta_done_seconds / (double) stageb_policy_eta_done;
+            double remaining_s = 0.0;
+            if (stageb_policy_active && remaining_policies > 0) {
+                remaining_s += std::max(0.0, avg_policy_s - active_s);
+                --remaining_policies;
+            }
+            remaining_s += (double) remaining_policies * avg_policy_s;
+            return nvfp4_selector_format_duration(remaining_s) + " avg_measured_policy";
         }
-        remaining_s += (double) remaining_policies * avg_policy_s;
-        return nvfp4_selector_format_duration(remaining_s);
+        if (stageb_policy_active && active_s > 0.0 && remaining_policies > 0) {
+            return ">=" + nvfp4_selector_format_duration(active_s * (double) remaining_policies) + " active_policy";
+        }
+        return "warming-up";
+    };
+    auto stageb_eta_detail = [&]() -> std::string {
+        if (stageb_policy_total <= 0) {
+            return "policy_units=0/0";
+        }
+        char buf[256];
+        if (stageb_policy_active) {
+            snprintf(buf, sizeof(buf),
+                "policy_units=%" PRId64 "/%" PRId64 " measured_eta_units=%" PRId64 " active=[%zu/%" PRId64 "] policy=%s",
+                stageb_policy_done,
+                stageb_policy_total,
+                stageb_policy_eta_done,
+                stageb_policy_active_index,
+                stageb_policy_total,
+                stageb_policy_active_name.c_str());
+        } else {
+            snprintf(buf, sizeof(buf),
+                "policy_units=%" PRId64 "/%" PRId64 " measured_eta_units=%" PRId64,
+                stageb_policy_done,
+                stageb_policy_total,
+                stageb_policy_eta_done);
+        }
+        return buf;
     };
     auto update_full_quant_eta = [&](const char * phase, bool print_now = false) {
-        char detail[256];
+        const std::string eta_detail = stageb_eta_detail();
+        char detail[512];
         snprintf(detail, sizeof(detail),
-            "phase=%s scope=whole_artifact_estimate basis=selector_stageb_policy_units_plus_final_materialization",
-            phase);
+            "phase=%s scope=whole_artifact_estimate basis=selector_stageb_policy_units_plus_final_materialization %s",
+            phase,
+            eta_detail.c_str());
         full_quant_eta.eta_hint(stageb_eta_hint());
         full_quant_eta.update(full_quant_eta_done, full_quant_eta_total, detail, print_now);
     };
-    auto finish_stageb_policy_unit = [&](const char * phase, bool print_now = false) {
+    auto finish_stageb_policy_unit = [&](const char * phase, bool print_now = false, bool count_for_eta = true) {
         if (stageb_policy_active) {
-            stageb_policy_done_seconds += std::chrono::duration<double>(
+            const double policy_s = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - stageb_policy_start).count();
+            stageb_policy_done_seconds += policy_s;
+            if (count_for_eta && policy_s > 0.0) {
+                stageb_policy_eta_done_seconds += policy_s;
+                ++stageb_policy_eta_done;
+            }
             ++stageb_policy_done;
             stageb_policy_active = false;
+            stageb_policy_active_name.clear();
+            stageb_policy_active_index = 0;
         }
         full_quant_eta_done = std::min<int64_t>(full_quant_eta_total, 2 + stageb_policy_done);
         update_full_quant_eta(phase, print_now);
@@ -6643,7 +6683,11 @@ static bool nvfp4_selector_choose_policy(
         stageb_policy_total = (int64_t) eval_policy_indices.size();
         stageb_policy_done = 0;
         stageb_policy_done_seconds = 0.0;
+        stageb_policy_eta_done = 0;
+        stageb_policy_eta_done_seconds = 0.0;
         stageb_policy_active = false;
+        stageb_policy_active_name.clear();
+        stageb_policy_active_index = 0;
         update_full_quant_eta("selector-stage-b-runtime-load", true);
     } else {
         full_quant_eta_total = 1;
@@ -6651,7 +6695,11 @@ static bool nvfp4_selector_choose_policy(
         stageb_policy_total = 0;
         stageb_policy_done = 0;
         stageb_policy_done_seconds = 0.0;
+        stageb_policy_eta_done = 0;
+        stageb_policy_eta_done_seconds = 0.0;
         stageb_policy_active = false;
+        stageb_policy_active_name.clear();
+        stageb_policy_active_index = 0;
         update_full_quant_eta(skip_remaining_tuning ? "selector-skipping-to-final-materialization" : "selector-proxy-only", true);
     }
     const int32_t stageb_eval_chunk_budget =
@@ -7131,6 +7179,8 @@ static bool nvfp4_selector_choose_policy(
             auto & policy = policies[eval_policy_indices[i]];
             stageb_policy_active = true;
             stageb_policy_start = std::chrono::steady_clock::now();
+            stageb_policy_active_name = policy.name;
+            stageb_policy_active_index = i + 1;
             full_quant_eta_done = std::min<int64_t>(full_quant_eta_total, 2 + stageb_policy_done);
             update_full_quant_eta("selector-stage-b-policy-running", true);
             fprintf(stderr,
@@ -7179,7 +7229,7 @@ static bool nvfp4_selector_choose_policy(
                         policy.name.c_str(),
                         policy_holdout_summary.c_str());
                 }
-                finish_stageb_policy_unit("selector-stage-b-policy-cached", true);
+                finish_stageb_policy_unit("selector-stage-b-policy-cached", true, false);
                 if (note_skip_remaining("stage-b")) {
                     break;
                 }
