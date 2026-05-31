@@ -5353,6 +5353,7 @@ static bool nvfp4_selector_choose_policy(
     update_full_quant_eta("selector-setup", true);
 
     nvfp4_selector_ledger selector_ledger(quantize_control_string("LLAMA_NVFP4_SELECTOR_LEDGER_FILE"));
+    selector_ledger.load_local_metrics();
     selector_ledger.append_context("selector_setup", {
         {"source_model", source_model_path},
         {"checkpoint_model", checkpoint_model_path},
@@ -5635,6 +5636,32 @@ static bool nvfp4_selector_choose_policy(
             __func__);
     }
 
+    auto selector_local_metric_key = [&](
+            const char * phase,
+            const std::string & policy_name,
+            const nvfp4_cuda_runtime_cfg & cfg,
+            const nvfp4_selector_binding & binding,
+            int64_t sample_blocks_requested,
+            int64_t sample_phase) {
+        nlohmann::ordered_json key = nlohmann::ordered_json::object();
+        key["row_type"] = "tensor.local_metric";
+        key["objective"] = "weight_reconstruction_sampled";
+        key["source_model"] = source_model_path;
+        key["checkpoint_model"] = checkpoint_model_path;
+        key["imatrix_hash"] = imatrix_hash;
+        key["phase"] = phase != nullptr ? phase : "";
+        key["policy"] = policy_name;
+        key["policy_cfg"] = nvfp4_selector_stageb_cfg_json(cfg);
+        key["tensor"] = binding.name;
+        key["source_type"] = binding.source != nullptr ? ggml_type_name(binding.source->type) : "unknown";
+        key["target_type"] = binding.target != nullptr ? ggml_type_name(binding.target->type) : "unknown";
+        key["source_nbytes"] = binding.source_nbytes;
+        key["target_nbytes"] = binding.target_nbytes;
+        key["sample_blocks_requested"] = sample_blocks_requested;
+        key["sample_phase"] = sample_phase;
+        return key;
+    };
+
     auto emit_selector_local_metric = [&](
             const char * phase,
             const nvfp4_selector_policy & policy,
@@ -5658,6 +5685,8 @@ static bool nvfp4_selector_choose_policy(
         row["objective"] = "weight_reconstruction_sampled";
         row["policy"] = policy.name;
         row["policy_cfg"] = nvfp4_selector_stageb_cfg_json(cfg);
+        row["key"] = selector_local_metric_key(
+            phase, policy.name, cfg, binding, sample_blocks_requested, sample_phase);
         row["tensor"] = binding.name;
         row["class"] = nvfp4_selector_tensor_class_name(binding.cls);
         row["bucket"] = binding.bucket;
@@ -5723,6 +5752,7 @@ static bool nvfp4_selector_choose_policy(
         }
         struct binding_score {
             bool ok = true;
+            bool cached = false;
             double tensor_sq = 0.0;
             double tensor_abs = 0.0;
             double tensor_max = 0.0;
@@ -5742,6 +5772,22 @@ static bool nvfp4_selector_choose_policy(
             tensor_records[ib].bucket = b.bucket;
             tensor_records[ib].layer = b.layer;
         }
+        const bool may_use_cached_local_metrics = !(want_measured_eval && stagea_sample_blocks <= 0);
+        std::atomic<size_t> ledger_hits{0};
+        auto apply_cached_local_metric = [&](size_t ib, const nvfp4_selector_ledger::local_metric & cached) {
+            auto & bs = binding_scores[ib];
+            auto & rsf = tensor_records[ib];
+            bs.cached = true;
+            bs.tensor_sq = cached.sum_sq;
+            bs.tensor_abs = cached.sum_abs;
+            bs.tensor_max = cached.max_abs;
+            bs.tensor_n = cached.count;
+            rsf.proxy_score = cached.proxy_score;
+            rsf.rsf_changed = cached.rsf_changed;
+            rsf.slices = cached.rsf_slices;
+            rsf.scale_mul_sum = cached.rsf_scale_mul_mean * (double) cached.rsf_scale_mul_count;
+            ledger_hits.fetch_add(1, std::memory_order_relaxed);
+        };
 
         if (policy_threads <= 1 || binding_indices.size() <= 1) {
             std::vector<uint8_t> tmp_bytes;
@@ -5749,6 +5795,12 @@ static bool nvfp4_selector_choose_policy(
                 auto & b = all_bindings[binding_indices[ib]];
                 std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes;
                 nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                nvfp4_selector_ledger::local_metric cached;
+                const auto key = selector_local_metric_key("stage-a", policy.name, policy.cfg, b, stagea_sample_blocks, 0);
+                if (may_use_cached_local_metrics && selector_ledger.find_local_metric(key, cached)) {
+                    apply_cached_local_metric(ib, cached);
+                    continue;
+                }
                 if (!nvfp4_selector_quantize_binding(b, policy.cfg, binding_nthread, quant_bytes,
                         binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
                         stagea_sample_blocks, 0, false, rsf_record)) {
@@ -5771,6 +5823,12 @@ static bool nvfp4_selector_choose_policy(
                         auto & b = all_bindings[binding_indices[ib]];
                         std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes_local;
                         nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                        nvfp4_selector_ledger::local_metric cached;
+                        const auto key = selector_local_metric_key("stage-a", policy.name, policy.cfg, b, stagea_sample_blocks, 0);
+                        if (may_use_cached_local_metrics && selector_ledger.find_local_metric(key, cached)) {
+                            apply_cached_local_metric(ib, cached);
+                            continue;
+                        }
                         if (!nvfp4_selector_quantize_binding(b, policy.cfg, binding_nthread, quant_bytes,
                                 binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
                                 stagea_sample_blocks, 0, false, rsf_record)) {
@@ -5807,7 +5865,8 @@ static bool nvfp4_selector_choose_policy(
                 const nvfp4_selector_proxy_metrics tensor_proxy =
                     nvfp4_selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
                 tensor_records[ib].proxy_score = tensor_proxy.score;
-                emit_selector_local_metric(
+                if (!bs.cached) {
+                    emit_selector_local_metric(
                     "stage-a",
                     policy,
                     b,
@@ -5819,6 +5878,7 @@ static bool nvfp4_selector_choose_policy(
                     bs.tensor_abs,
                     bs.tensor_max,
                     bs.tensor_n);
+                }
             }
             if (ib == 0 && bs.tensor_n > 0) {
                 policy.first_tensor_rmse = std::sqrt(bs.tensor_sq / (double) bs.tensor_n);
@@ -5837,6 +5897,14 @@ static bool nvfp4_selector_choose_policy(
         }
         policy.tensor_records = std::move(tensor_records);
 
+        if (ledger_hits.load(std::memory_order_relaxed) > 0) {
+            fprintf(stderr,
+                "%s: selector ledger local-metric cache hits phase=stage-a policy=%s hits=%zu/%zu\n",
+                __func__,
+                policy.name.c_str(),
+                ledger_hits.load(std::memory_order_relaxed),
+                binding_indices.size());
+        }
         fprintf(stderr,
             "selector proxy-rank phase=stage-a policy=%s objective=weight_reconstruction_sampled rank=lower_is_better "
             "score=%.6f rmse=%.6f mean_abs=%.6f max_abs=%.6f tensors=%zu sample_blocks=full measured_kld_ppl=no\n",
@@ -5891,6 +5959,7 @@ static bool nvfp4_selector_choose_policy(
         int64_t count = 0;
         struct binding_score {
             bool ok = true;
+            bool cached = false;
             double tensor_sq = 0.0;
             double tensor_abs = 0.0;
             double tensor_max = 0.0;
@@ -5910,6 +5979,21 @@ static bool nvfp4_selector_choose_policy(
             tensor_records[ib].bucket = b.bucket;
             tensor_records[ib].layer = b.layer;
         }
+        std::atomic<size_t> ledger_hits{0};
+        auto apply_cached_local_metric = [&](size_t ib, const nvfp4_selector_ledger::local_metric & cached) {
+            auto & bs = binding_scores[ib];
+            auto & rsf = tensor_records[ib];
+            bs.cached = true;
+            bs.tensor_sq = cached.sum_sq;
+            bs.tensor_abs = cached.sum_abs;
+            bs.tensor_max = cached.max_abs;
+            bs.tensor_n = cached.count;
+            rsf.proxy_score = cached.proxy_score;
+            rsf.rsf_changed = cached.rsf_changed;
+            rsf.slices = cached.rsf_slices;
+            rsf.scale_mul_sum = cached.rsf_scale_mul_mean * (double) cached.rsf_scale_mul_count;
+            ledger_hits.fetch_add(1, std::memory_order_relaxed);
+        };
 
         if (policy_threads <= 1 || binding_indices.size() <= 1) {
             std::vector<uint8_t> tmp_bytes;
@@ -5917,6 +6001,12 @@ static bool nvfp4_selector_choose_policy(
                 auto & b = all_bindings[binding_indices[ib]];
                 std::vector<uint8_t> & quant_bytes = materializes_full_policy ? b.working_target_bytes : tmp_bytes;
                 nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                nvfp4_selector_ledger::local_metric cached;
+                const auto key = selector_local_metric_key(label, policy.name, proxy_cfg, b, sample_blocks_override, 0);
+                if (proxy_only && selector_ledger.find_local_metric(key, cached)) {
+                    apply_cached_local_metric(ib, cached);
+                    continue;
+                }
                 if (!nvfp4_selector_quantize_binding(b, proxy_cfg, binding_nthread, quant_bytes,
                         binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
                         sample_blocks_override, 0, false, rsf_record)) {
@@ -5939,6 +6029,12 @@ static bool nvfp4_selector_choose_policy(
                         auto & b = all_bindings[binding_indices[ib]];
                         std::vector<uint8_t> & quant_bytes = materializes_full_policy ? b.working_target_bytes : tmp_bytes_local;
                         nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                        nvfp4_selector_ledger::local_metric cached;
+                        const auto key = selector_local_metric_key(label, policy.name, proxy_cfg, b, sample_blocks_override, 0);
+                        if (proxy_only && selector_ledger.find_local_metric(key, cached)) {
+                            apply_cached_local_metric(ib, cached);
+                            continue;
+                        }
                         if (!nvfp4_selector_quantize_binding(b, proxy_cfg, binding_nthread, quant_bytes,
                                 binding_scores[ib].tensor_sq, binding_scores[ib].tensor_abs, binding_scores[ib].tensor_max, binding_scores[ib].tensor_n,
                                 sample_blocks_override, 0, false, rsf_record)) {
@@ -5975,7 +6071,8 @@ static bool nvfp4_selector_choose_policy(
                 const nvfp4_selector_proxy_metrics tensor_proxy =
                     nvfp4_selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
                 tensor_records[ib].proxy_score = tensor_proxy.score;
-                emit_selector_local_metric(
+                if (!bs.cached) {
+                    emit_selector_local_metric(
                     label,
                     policy,
                     b,
@@ -5987,6 +6084,7 @@ static bool nvfp4_selector_choose_policy(
                     bs.tensor_abs,
                     bs.tensor_max,
                     bs.tensor_n);
+                }
             }
         }
 
@@ -6020,6 +6118,15 @@ static bool nvfp4_selector_choose_policy(
                 nvfp4_cfg_has_rsf(proxy_cfg) ? nvfp4_rsf_depth_name(nvfp4_cfg_rsf_depth(proxy_cfg)) : "off");
         }
         policy.tensor_records = std::move(tensor_records);
+        if (ledger_hits.load(std::memory_order_relaxed) > 0) {
+            fprintf(stderr,
+                "%s: selector ledger local-metric cache hits phase=%s policy=%s hits=%zu/%zu\n",
+                __func__,
+                label,
+                policy.name.c_str(),
+                ledger_hits.load(std::memory_order_relaxed),
+                binding_indices.size());
+        }
         return true;
     };
 

@@ -1,6 +1,7 @@
 #include "quantize-selector-ledger.h"
 
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
@@ -13,6 +14,8 @@ nvfp4_selector_ledger::nvfp4_selector_ledger(std::string path) {
 void nvfp4_selector_ledger::configure(std::string path) {
     std::lock_guard<std::mutex> lock(mutex_);
     path_ = std::move(path);
+    local_metrics_loaded_ = false;
+    local_metrics_.clear();
 }
 
 bool nvfp4_selector_ledger::enabled() const {
@@ -22,6 +25,92 @@ bool nvfp4_selector_ledger::enabled() const {
 
 const std::string & nvfp4_selector_ledger::path() const {
     return path_;
+}
+
+bool nvfp4_selector_ledger::metric_from_json(const nlohmann::ordered_json & row, local_metric & out) {
+    if (!row.is_object()) {
+        return false;
+    }
+    out.sum_sq = row.value("sum_sq", 0.0);
+    out.sum_abs = row.value("sum_abs", 0.0);
+    out.max_abs = row.value("max_abs", 0.0);
+    out.proxy_score = row.value("proxy_score", 0.0);
+    out.count = row.value("count", (int64_t) 0);
+    out.proxy_ok = row.value("proxy_ok", false);
+    if (const auto rsf_it = row.find("rsf"); rsf_it != row.end() && rsf_it->is_object()) {
+        out.rsf_changed = rsf_it->value("changed", false);
+        out.rsf_slices = rsf_it->value("slices", (int64_t) 0);
+        out.rsf_scale_mul_count = rsf_it->value("scale_mul_count", (int64_t) 0);
+        out.rsf_scale_mul_mean = rsf_it->value("scale_mul_mean", 0.0);
+    }
+    return out.count > 0;
+}
+
+std::string nvfp4_selector_ledger::key_string(const nlohmann::ordered_json & key) {
+    return key.dump();
+}
+
+bool nvfp4_selector_ledger::load_local_metrics() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    local_metrics_.clear();
+    local_metrics_loaded_ = true;
+    if (path_.empty()) {
+        return true;
+    }
+
+    std::ifstream in(path_);
+    if (!in) {
+        return true;
+    }
+
+    std::string line;
+    size_t loaded = 0;
+    size_t ignored = 0;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        try {
+            const auto row = nlohmann::ordered_json::parse(line);
+            if (!row.is_object() ||
+                    row.value("schema", std::string()) != schema ||
+                    row.value("row_type", std::string()) != "tensor.local_metric") {
+                ++ignored;
+                continue;
+            }
+            const auto key_it = row.find("key");
+            if (key_it == row.end()) {
+                ++ignored;
+                continue;
+            }
+            local_metric metric;
+            if (!metric_from_json(row, metric)) {
+                ++ignored;
+                continue;
+            }
+            local_metrics_[key_string(*key_it)] = metric;
+            ++loaded;
+        } catch (const std::exception &) {
+            ++ignored;
+        }
+    }
+    std::fprintf(stderr,
+        "%s: selector ledger loaded local_metrics=%zu ignored=%zu path=%s\n",
+        __func__, loaded, ignored, path_.c_str());
+    return true;
+}
+
+bool nvfp4_selector_ledger::find_local_metric(const nlohmann::ordered_json & key, local_metric & out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!local_metrics_loaded_) {
+        return false;
+    }
+    const auto it = local_metrics_.find(key_string(key));
+    if (it == local_metrics_.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
 }
 
 bool nvfp4_selector_ledger::append_context(const char * event, nlohmann::ordered_json payload) const {
