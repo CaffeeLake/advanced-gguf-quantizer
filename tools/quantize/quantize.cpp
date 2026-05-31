@@ -8797,6 +8797,16 @@ static bool nvfp4_selector_choose_policy(
             s.proxy_abs_mean = proxy_metrics.abs_mean;
             s.proxy_max_abs = proxy_metrics.max_abs;
             s.proxy_score = proxy_metrics.score;
+            fprintf(stderr,
+                "selector sensitivity result [%zu/%zu] tensor=%s nvfp4_error=%.6f rmse=%.6f abs=%.6f max=%.6f samples=%" PRId64 "\n",
+                bind_i + 1,
+                all_bindings.size(),
+                b.name.c_str(),
+                s.proxy_score,
+                s.proxy_rmse,
+                s.proxy_abs_mean,
+                s.proxy_max_abs,
+                tensor_n);
             s.q8_delta_bytes = s.q8_nbytes > s.target_nbytes ? s.q8_nbytes - s.target_nbytes : 0;
             s.bf16_delta_bytes = s.bf16_nbytes > s.target_nbytes ? s.bf16_nbytes - s.target_nbytes : 0;
             const double hotness = nvfp4_selector_class_hotness(b.cls);
@@ -8853,6 +8863,23 @@ static bool nvfp4_selector_choose_policy(
         });
 
         const int candidate_scan_n = std::min<int>(candidate_nvfp4_top, (int) sens.size());
+        const int sensitivity_preview_n = std::min<int>(
+            candidate_report_top > 0 ? candidate_report_top : candidate_scan_n,
+            (int) sens.size());
+        for (int i = 0; i < sensitivity_preview_n; ++i) {
+            const auto & s = sens[(size_t) i];
+            fprintf(stderr,
+                "selector sensitivity rank=%d tensor=%s cls=%s bucket=%d layer=%d nvfp4_error=%.6f rmse=%.6f abs=%.6f max=%.6f\n",
+                i + 1,
+                s.name.c_str(),
+                nvfp4_selector_tensor_class_name(s.cls),
+                s.bucket,
+                s.layer,
+                s.proxy_score,
+                s.proxy_rmse,
+                s.proxy_abs_mean,
+                s.proxy_max_abs);
+        }
         for (int i = 0; i < candidate_scan_n; ++i) {
             auto & s = sens[(size_t) i];
             auto & b = all_bindings[s.binding_index];
@@ -9089,8 +9116,10 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
-    const int mxfp6_e2m3_scale_top_default =
-        candidate_apply_top > 0 ? candidate_apply_top : (mxfp6_bindings.empty() ? 0 : 96);
+    const bool selector_only_control = quantize_control_i64("LLAMA_NVFP4_SELECTOR_ONLY", 0) != 0;
+    const int mxfp6_e2m3_scale_top_default = selector_only_control
+        ? 0
+        : (candidate_apply_top > 0 ? candidate_apply_top : (mxfp6_bindings.empty() ? 0 : 96));
     const int mxfp6_e2m3_scale_top = out_tensor_overrides && have_runtime_eval
         ? (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_MXFP6_SELECTOR_SCALE_TOP", mxfp6_e2m3_scale_top_default))
         : 0;
