@@ -268,6 +268,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.checkpoint_model" || path == "selector.seed_model") { r.selector.checkpoint_model = value; return; }
     if (path == "selector.cache_dir") { r.selector.cache_dir = value; return; }
     if (path == "selector.skip_file") { r.selector.skip_file = value; return; }
+    if (path == "selector.ledger" || path == "selector.evidence_ledger") { r.selector.ledger = value; return; }
     if (path == "selector.keep_checkpoint") { r.selector.keep_checkpoint = parse_bool_value(value); return; }
     if (path == "selector.require_runtime_cache") { r.selector.require_runtime_cache = parse_bool_value(value); return; }
     if (path == "selector.chunks") { r.selector.chunks = value; return; }
@@ -900,6 +901,7 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "checkpoint_model", r.selector.checkpoint_model);
     dump_string(out, "cache_dir", r.selector.cache_dir);
     dump_string(out, "skip_file", r.selector.skip_file);
+    dump_string(out, "ledger", r.selector.ledger);
     if (show_low_level) {
         dump_bool(out, "keep_checkpoint", r.selector.keep_checkpoint);
         dump_bool(out, "require_runtime_cache", r.selector.require_runtime_cache);
@@ -1410,6 +1412,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_pair("--nvfp4-selector-checkpoint-model", r.selector.checkpoint_model);
     push_pair("--nvfp4-selector-cache-dir", r.selector.cache_dir);
     push_pair("--nvfp4-selector-skip-file", r.selector.skip_file);
+    push_pair("--nvfp4-selector-ledger", r.selector.ledger);
     push_bool("--nvfp4-selector-keep-checkpoint", r.selector.keep_checkpoint);
     push_bool("--nvfp4-selector-require-runtime-cache", r.selector.require_runtime_cache);
     push_pair("--nvfp4-selector-chunks", r.selector.chunks);

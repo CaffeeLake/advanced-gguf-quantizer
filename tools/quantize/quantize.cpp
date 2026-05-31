@@ -6,6 +6,7 @@
 #include "quantize-kld.h"
 #include "quantize-mxfp6.h"
 #include "quantize-options.h"
+#include "quantize-selector-ledger.h"
 #include "quantize-selector-runtime.h"
 #include "../../src/llama-context.h"
 #include "../../src/llama-model.h"
@@ -1719,6 +1720,7 @@ struct nvfp4_selector_stageb_cache {
     static constexpr const char * legacy_schema = "blackwell-selector-stageb-result-v1";
 
     std::string path;
+    const nvfp4_selector_ledger * ledger = nullptr;
     std::unordered_map<std::string, nvfp4_selector_stageb_cache_entry> entries;
     std::unordered_set<std::string> policies;
     std::unordered_set<std::string> mismatch_logged;
@@ -1846,6 +1848,22 @@ struct nvfp4_selector_stageb_cache {
             return;
         }
         out << record.dump() << '\n';
+
+        if (ledger != nullptr) {
+            nlohmann::ordered_json ledger_record = nlohmann::ordered_json::object();
+            ledger_record["event"] = event;
+            ledger_record["policy"] = policy;
+            ledger_record["cache_path"] = path;
+            ledger_record["key"] = key;
+            ledger_record["search"] = nvfp4_selector_stageb_metric_json(search);
+            ledger_record["has_validation"] = validation != nullptr && validation->ok;
+            if (validation != nullptr && validation->ok) {
+                ledger_record["validation"] = nvfp4_selector_stageb_metric_json(*validation);
+            }
+            ledger_record["pass"] = pass;
+            ledger_record["score"] = score;
+            ledger->append_exact_eval(std::move(ledger_record));
+        }
 
         nvfp4_selector_stageb_cache_entry entry;
         entry.event = event;
@@ -5334,6 +5352,15 @@ static bool nvfp4_selector_choose_policy(
     };
     update_full_quant_eta("selector-setup", true);
 
+    nvfp4_selector_ledger selector_ledger(quantize_control_string("LLAMA_NVFP4_SELECTOR_LEDGER_FILE"));
+    selector_ledger.append_context("selector_setup", {
+        {"source_model", source_model_path},
+        {"checkpoint_model", checkpoint_model_path},
+        {"nthread", nthread},
+        {"input_scale_policy", nvfp4_input_scale_policy},
+        {"include_rsf", include_rsf},
+    });
+
     const int eval_top = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_TOP", 16));
     const bool want_measured_eval_requested = eval_top > 0;
     const bool want_measured_eval = want_measured_eval_requested && quantize_control_i64("LLAMA_NVFP4_SELECTOR_ENABLE_EVAL", 0) != 0;
@@ -5567,6 +5594,28 @@ static bool nvfp4_selector_choose_policy(
         all_binding_indices.push_back(i);
     }
 
+    selector_ledger.append_context("selector_bindings_loaded", {
+        {"source_model", source_model_path},
+        {"checkpoint_model", checkpoint_model_path},
+        {"imatrix", {
+            {"entries", imatrix_data.size()},
+            {"hash", imatrix_hash},
+        }},
+        {"search_kld", nvfp4_selector_stageb_kld_json(kld)},
+        {"validation_kld", kld_holdout != nullptr ? nvfp4_selector_stageb_kld_json(*kld_holdout) : nlohmann::ordered_json(nullptr)},
+        {"eval", {
+            {"enabled", want_measured_eval},
+            {"requested", want_measured_eval_requested},
+            {"eval_top", eval_top},
+            {"eval_batch_override", selector_eval_batch_override},
+        }},
+        {"bindings", {
+            {"nvfp4_count", all_bindings.size()},
+            {"nvfp4_stress_count", stress_binding_indices.size()},
+            {"mxfp6_count", mxfp6_bindings.size()},
+        }},
+    });
+
     fprintf(stderr,
 	        "%s: selector loaded %zu NVFP4 candidate tensors from checkpoint=%s (stress=%zu, survey=%zu, eval=%s, eval_rank=best)\n",
 	        __func__,
@@ -5585,6 +5634,68 @@ static bool nvfp4_selector_choose_policy(
             "%s: selector measured stage is unavailable because the runtime patch cache is not active\n",
             __func__);
     }
+
+    auto emit_selector_local_metric = [&](
+            const char * phase,
+            const nvfp4_selector_policy & policy,
+            const nvfp4_selector_binding & binding,
+            const nvfp4_selector_rsf_tensor_record & rsf_record,
+            const nvfp4_cuda_runtime_cfg & cfg,
+            int64_t sample_blocks_requested,
+            int64_t sample_phase,
+            double tensor_sq,
+            double tensor_abs,
+            double tensor_max,
+            int64_t tensor_n) {
+        if (tensor_n <= 0) {
+            return;
+        }
+        const nvfp4_selector_proxy_metrics proxy_metrics =
+            nvfp4_selector_proxy_score(tensor_sq, tensor_abs, tensor_max, tensor_n);
+
+        nlohmann::ordered_json row = nlohmann::ordered_json::object();
+        row["phase"] = phase != nullptr ? phase : "";
+        row["objective"] = "weight_reconstruction_sampled";
+        row["policy"] = policy.name;
+        row["policy_cfg"] = nvfp4_selector_stageb_cfg_json(cfg);
+        row["tensor"] = binding.name;
+        row["class"] = nvfp4_selector_tensor_class_name(binding.cls);
+        row["bucket"] = binding.bucket;
+        row["layer"] = binding.layer;
+        row["source_type"] = binding.source != nullptr ? ggml_type_name(binding.source->type) : "unknown";
+        row["target_type"] = binding.target != nullptr ? ggml_type_name(binding.target->type) : "unknown";
+        row["source_nbytes"] = binding.source_nbytes;
+        row["target_nbytes"] = binding.target_nbytes;
+        row["sample_blocks_requested"] = sample_blocks_requested;
+        row["sample_blocks_evaluated"] = (tensor_n + NVFP4_SELECTOR_BLOCK_SIZE - 1) / NVFP4_SELECTOR_BLOCK_SIZE;
+        row["sample_phase"] = sample_phase;
+        row["count"] = tensor_n;
+        row["sum_sq"] = tensor_sq;
+        row["sum_abs"] = tensor_abs;
+        row["rmse"] = proxy_metrics.rmse;
+        row["abs_mean"] = proxy_metrics.abs_mean;
+        row["max_abs"] = proxy_metrics.max_abs;
+        row["proxy_score"] = proxy_metrics.score;
+        row["proxy_ok"] = proxy_metrics.ok;
+
+        nlohmann::ordered_json rsf = nlohmann::ordered_json::object();
+        rsf["enabled"] = nvfp4_cfg_has_rsf(cfg);
+        rsf["changed"] = rsf_record.rsf_changed;
+        rsf["slices"] = rsf_record.slices;
+        rsf["scale_mul_count"] = rsf_record.scale_muls.size();
+        if (nvfp4_cfg_has_rsf(cfg)) {
+            rsf["mode"] = nvfp4_rsf_mode_name(nvfp4_cfg_rsf_mode(cfg));
+            rsf["depth"] = nvfp4_rsf_depth_name(nvfp4_cfg_rsf_depth(cfg));
+        }
+        if (!rsf_record.scale_muls.empty()) {
+            const auto minmax = std::minmax_element(rsf_record.scale_muls.begin(), rsf_record.scale_muls.end());
+            rsf["scale_mul_mean"] = rsf_record.scale_mul_sum / (double) rsf_record.scale_muls.size();
+            rsf["scale_mul_min"] = *minmax.first;
+            rsf["scale_mul_max"] = *minmax.second;
+        }
+        row["rsf"] = std::move(rsf);
+        selector_ledger.append_tensor_local_metric(std::move(row));
+    };
 
     auto score_proxy_policy = [&](nvfp4_selector_policy & policy, const std::vector<size_t> & binding_indices) -> bool {
         restore_all();
@@ -5696,6 +5807,18 @@ static bool nvfp4_selector_choose_policy(
                 const nvfp4_selector_proxy_metrics tensor_proxy =
                     nvfp4_selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
                 tensor_records[ib].proxy_score = tensor_proxy.score;
+                emit_selector_local_metric(
+                    "stage-a",
+                    policy,
+                    b,
+                    tensor_records[ib],
+                    policy.cfg,
+                    stagea_sample_blocks,
+                    0,
+                    bs.tensor_sq,
+                    bs.tensor_abs,
+                    bs.tensor_max,
+                    bs.tensor_n);
             }
             if (ib == 0 && bs.tensor_n > 0) {
                 policy.first_tensor_rmse = std::sqrt(bs.tensor_sq / (double) bs.tensor_n);
@@ -5852,6 +5975,18 @@ static bool nvfp4_selector_choose_policy(
                 const nvfp4_selector_proxy_metrics tensor_proxy =
                     nvfp4_selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
                 tensor_records[ib].proxy_score = tensor_proxy.score;
+                emit_selector_local_metric(
+                    label,
+                    policy,
+                    b,
+                    tensor_records[ib],
+                    proxy_cfg,
+                    sample_blocks_override,
+                    0,
+                    bs.tensor_sq,
+                    bs.tensor_abs,
+                    bs.tensor_max,
+                    bs.tensor_n);
             }
         }
 
@@ -6485,6 +6620,7 @@ static bool nvfp4_selector_choose_policy(
         return key;
     };
     nvfp4_selector_stageb_cache stageb_result_cache;
+    stageb_result_cache.ledger = &selector_ledger;
     if (run_stageb_eval) {
         stageb_result_cache.load(checkpoint_model_path + ".stageb-results.jsonl");
     }
@@ -9351,6 +9487,12 @@ int llama_quantize(int argc, char ** argv) {
             if (arg_idx < argc-1) {
                 add_selector_controls("LLAMA_NVFP4_SELECTOR_KLD_FILE", argv[++arg_idx]);
                 add_selector_controls("LLAMA_NVFP4_SELECTOR_ENABLE_EVAL", "1");
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-ledger") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_controls("LLAMA_NVFP4_SELECTOR_LEDGER_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }

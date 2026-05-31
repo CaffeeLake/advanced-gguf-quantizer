@@ -8,6 +8,7 @@ add_library(${TARGET}
     quantize-kld.cpp
     quantize-mxfp6.cpp
     quantize-options.cpp
+    quantize-selector-ledger.cpp
     quantize-selector-runtime.cpp
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)

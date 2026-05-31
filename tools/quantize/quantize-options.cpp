@@ -232,6 +232,8 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --nvfp4-selector-kld file.kld\n");
     printf("                                      use saved BF16 logits as the NVFP4 policy/rescue selector oracle.\n");
     printf("                                      enables true KLD/PPL ranking for the selected KLD subset.\n");
+    printf("  --nvfp4-selector-ledger file.jsonl\n");
+    printf("                                      append raw selector evidence rows to a JSONL ledger.\n");
     printf("  --nvfp4-selector-checkpoint-model model.gguf\n");
     printf("                                      existing quantized checkpoint used by candidate search instead of creating one.\n");
     printf("  --nvfp4-selector-cache-dir dir / --nvfp4-selector-keep-checkpoint\n");

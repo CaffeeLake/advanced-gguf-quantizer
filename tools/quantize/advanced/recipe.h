@@ -161,6 +161,7 @@ struct Recipe {
         std::string checkpoint_model;
         std::string cache_dir;
         std::string skip_file;
+        std::string ledger;
         bool keep_checkpoint = false;
         bool require_runtime_cache = false;
         std::string chunks;
