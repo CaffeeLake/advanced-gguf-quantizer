@@ -1722,20 +1722,21 @@ struct nvfp4_selector_stageb_cache {
     std::string path;
     const nvfp4_selector_ledger * ledger = nullptr;
     std::unordered_map<std::string, nvfp4_selector_stageb_cache_entry> entries;
+    std::unordered_set<std::string> sidecar_keys;
     std::unordered_set<std::string> policies;
     std::unordered_set<std::string> mismatch_logged;
 
-    void load(const std::string & cache_path) {
-        path = cache_path;
-        if (path.empty()) {
+    void load_rows(const std::string & rows_path, bool from_ledger) {
+        if (rows_path.empty()) {
             return;
         }
-        std::ifstream in(path);
+        std::ifstream in(rows_path);
         if (!in) {
             return;
         }
 
         std::string line;
+        size_t loaded = 0;
         size_t ignored = 0;
         while (std::getline(in, line)) {
             if (line.empty()) {
@@ -1744,7 +1745,17 @@ struct nvfp4_selector_stageb_cache {
             try {
                 const auto record = nlohmann::ordered_json::parse(line);
                 const std::string record_schema = record.value("schema", std::string());
-                if (!record.is_object() || (record_schema != schema && record_schema != legacy_schema)) {
+                if (!record.is_object()) {
+                    ++ignored;
+                    continue;
+                }
+                if (from_ledger) {
+                    if (record_schema != nvfp4_selector_ledger::schema ||
+                            record.value("row_type", std::string()) != "exact_eval") {
+                        ++ignored;
+                        continue;
+                    }
+                } else if (record_schema != schema && record_schema != legacy_schema) {
                     ++ignored;
                     continue;
                 }
@@ -1774,16 +1785,33 @@ struct nvfp4_selector_stageb_cache {
                         continue;
                     }
                 }
-                entries[key_it->dump()] = entry;
+                const std::string key = key_it->dump();
+                if (from_ledger && sidecar_keys.find(key) != sidecar_keys.end()) {
+                    continue;
+                }
+                entries[key] = entry;
+                if (!from_ledger) {
+                    sidecar_keys.insert(key);
+                }
                 policies.insert(entry.policy);
+                ++loaded;
             } catch (const std::exception &) {
                 ++ignored;
             }
         }
 
         fprintf(stderr,
-            "%s: selector stage-b result cache loaded entries=%zu ignored=%zu path=%s\n",
-            __func__, entries.size(), ignored, path.c_str());
+            "%s: selector stage-b result cache loaded %s entries=%zu total=%zu ignored=%zu path=%s\n",
+            __func__, from_ledger ? "ledger" : "sidecar", loaded, entries.size(), ignored, rows_path.c_str());
+    }
+
+    void load(const std::string & cache_path) {
+        path = cache_path;
+        load_rows(path, false);
+    }
+
+    void load_exact_eval_ledger(const std::string & ledger_path) {
+        load_rows(ledger_path, true);
     }
 
     bool find(
@@ -6793,6 +6821,9 @@ static bool nvfp4_selector_choose_policy(
     stageb_result_cache.ledger = &selector_ledger;
     if (run_stageb_eval) {
         stageb_result_cache.load(checkpoint_model_path + ".stageb-results.jsonl");
+        if (selector_ledger.enabled()) {
+            stageb_result_cache.load_exact_eval_ledger(selector_ledger.path());
+        }
     }
 
     common_init_result_ptr init_res;

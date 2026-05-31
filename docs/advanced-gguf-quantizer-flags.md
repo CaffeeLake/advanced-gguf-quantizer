@@ -239,7 +239,9 @@ delta_mode = "estimate"
 ```
 
 `selector.ledger` passes through to `--nvfp4-selector-ledger` when set and
-appends raw selector evidence rows to JSONL. Leave it empty for normal runs.
+appends raw selector evidence rows to JSONL. When exact stage-B KLD rows in the
+ledger match the current cache key, the selector can reuse them as a read-through
+cache before remeasuring a policy. Leave it empty for normal runs.
 `selector.search`, `selector.local_top_k`, `selector.group_units`,
 `selector.beam_width`, `selector.exact_budget`, and `selector.delta_mode` are
 planner controls. The default `legacy` search keeps the existing selector path.
