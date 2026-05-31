@@ -145,7 +145,7 @@ def tensor_type_name(tensor) -> str:
     return getattr(tensor.tensor_type, "name", str(tensor.tensor_type)).lower()
 
 
-def graft_mtp(base: Path, donor: Path, output: Path, *, name: str | None) -> None:
+def graft_mtp(base: Path, donor: Path, output: Path, *, name: str | None, mtp_policy: str | None) -> None:
     base_reader = GGUFReader(str(base))
     donor_reader = GGUFReader(str(donor))
 
@@ -172,7 +172,7 @@ def graft_mtp(base: Path, donor: Path, output: Path, *, name: str | None) -> Non
         base_reader,
         name=name,
         mtp_donor=str(donor),
-        mtp_policy="graft Qwen3.6 BF16 blk.64 MTP block after core blend quantization",
+        mtp_policy=mtp_policy or "graft Qwen3.6 blk.64 MTP block after core blend quantization",
     )
 
     for index, _ in enumerate(base_reader.tensors):
@@ -272,6 +272,7 @@ def main() -> None:
     parser.add_argument("--donor", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--name", default=None)
+    parser.add_argument("--mtp-policy", default=None, help="metadata string for the grafted MTP policy")
     parser.add_argument("--replace-donor-type", default=None, help="replace matching base tensors with donor tensors of this GGML type")
     parser.add_argument("--drop-sidecars", action="store_true", help="drop .scale/.input_scale sidecars for replaced .weight tensors")
     args = parser.parse_args()
@@ -286,7 +287,7 @@ def main() -> None:
             drop_sidecars=args.drop_sidecars,
         )
     else:
-        graft_mtp(args.base, args.donor, args.output, name=args.name)
+        graft_mtp(args.base, args.donor, args.output, name=args.name, mtp_policy=args.mtp_policy)
 
 
 if __name__ == "__main__":
