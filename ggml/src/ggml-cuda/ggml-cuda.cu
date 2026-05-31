@@ -79,7 +79,9 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#if !defined(_MSC_VER)
 #include <strings.h>
+#endif
 #include <map>
 #include <memory>
 #include <mutex>
@@ -94,6 +96,17 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+
+static bool ggml_cuda_env_is_false(const char * env) {
+    if (env == nullptr || strcmp(env, "0") == 0) {
+        return env != nullptr;
+    }
+#if defined(_MSC_VER)
+    return _stricmp(env, "false") == 0 || _stricmp(env, "off") == 0 || _stricmp(env, "no") == 0;
+#else
+    return strcasecmp(env, "false") == 0 || strcasecmp(env, "off") == 0 || strcasecmp(env, "no") == 0;
+#endif
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -824,7 +837,7 @@ static bool ggml_cuda_nvfp4_set_ensure_buf(void ** ptr, size_t * cap, size_t nee
 
 static bool ggml_cuda_set_tensor_nvfp4_gpu_repack(ggml_tensor * tensor, const void * data, size_t size) {
     const char * env = std::getenv("LLAMA_CUDA_NVFP4_SET_GPU_REPACK");
-    if (env != nullptr && (strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 || strcasecmp(env, "off") == 0 || strcasecmp(env, "no") == 0)) {
+    if (ggml_cuda_env_is_false(env)) {
         return false;
     }
     if (tensor->type != GGML_TYPE_NVFP4 || tensor->view_src != nullptr || tensor->data == nullptr || tensor->ne[0] % QK_NVFP4 != 0 ||

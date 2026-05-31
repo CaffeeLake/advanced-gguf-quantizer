@@ -25,7 +25,6 @@
 #include <regex>
 #include <thread>
 #include <unordered_map>
-#include <strings.h>
 
 static bool llama_nvfp4_ascii_iequals(const std::string & a, const char * b) {
     size_t i = 0;
