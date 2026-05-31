@@ -143,7 +143,8 @@ Do not confuse the search stages:
 - the experimental assignment-ledger planner fields (`selector.ledger`,
   `selector.search`, `selector.local_top_k`, `selector.group_units`,
   `selector.beam_width`, `selector.exact_budget`, and `selector.delta_mode`)
-  are search bookkeeping, not release evidence;
+  are search bookkeeping, not release evidence; non-legacy `selector.search`
+  enables low-level grouped tensor-policy planning;
 - measured ranking uses runtime model output against the KLD base and is the
   quality evidence that matters;
 - holdout KLD is validation evidence, not the same subset used to choose

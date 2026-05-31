@@ -234,6 +234,12 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      enables true KLD/PPL ranking for the selected KLD subset.\n");
     printf("  --nvfp4-selector-ledger file.jsonl\n");
     printf("                                      append raw selector evidence rows to a JSONL ledger.\n");
+    printf("  --nvfp4-selector-search mode / --nvfp4-selector-local-top-k N\n");
+    printf("                                      enable ledger/planner search controls for tensor-local policy reuse.\n");
+    printf("  --nvfp4-selector-group-units mode / --nvfp4-selector-beam-width N / --nvfp4-selector-exact-budget N|auto|off\n");
+    printf("                                      shape fused tensor-unit planning and exact guard budget.\n");
+    printf("  --nvfp4-selector-delta-mode mode\n");
+    printf("                                      record the planner delta mode used for evidence and reports.\n");
     printf("  --nvfp4-selector-checkpoint-model model.gguf\n");
     printf("                                      existing quantized checkpoint used by candidate search instead of creating one.\n");
     printf("  --nvfp4-selector-cache-dir dir / --nvfp4-selector-keep-checkpoint\n");

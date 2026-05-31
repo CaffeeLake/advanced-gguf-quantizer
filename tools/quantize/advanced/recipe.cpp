@@ -1039,7 +1039,7 @@ void apply_master_autotune(Recipe & r) {
     assign_if_empty(r.selector.local_top_k, "0");
     assign_if_empty(r.selector.group_units, "auto");
     assign_if_empty(r.selector.beam_width, "1");
-    assign_if_empty(r.selector.exact_budget, "off");
+    assign_if_empty(r.selector.exact_budget, "auto");
     assign_if_empty(r.selector.delta_mode, "estimate");
     if (diagnostic) {
         assign_if_empty(r.selector.chunks, "4");
@@ -1431,6 +1431,20 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_pair("--nvfp4-selector-cache-dir", r.selector.cache_dir);
     push_pair("--nvfp4-selector-skip-file", r.selector.skip_file);
     push_pair("--nvfp4-selector-ledger", r.selector.ledger);
+    const std::string selector_search_lower = lower_copy(r.selector.search);
+    const bool selector_planner_requested =
+        !r.selector.search.empty() &&
+        selector_search_lower != "legacy" &&
+        selector_search_lower != "off" &&
+        selector_search_lower != "none";
+    if (selector_planner_requested) {
+        push_pair("--nvfp4-selector-search", r.selector.search);
+        push_pair("--nvfp4-selector-local-top-k", r.selector.local_top_k);
+        push_pair("--nvfp4-selector-group-units", r.selector.group_units);
+        push_pair("--nvfp4-selector-beam-width", r.selector.beam_width);
+        push_pair("--nvfp4-selector-exact-budget", r.selector.exact_budget);
+        push_pair("--nvfp4-selector-delta-mode", r.selector.delta_mode);
+    }
     push_bool("--nvfp4-selector-keep-checkpoint", r.selector.keep_checkpoint);
     push_bool("--nvfp4-selector-require-runtime-cache", r.selector.require_runtime_cache);
     push_pair("--nvfp4-selector-chunks", r.selector.chunks);

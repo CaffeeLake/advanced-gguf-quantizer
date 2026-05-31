@@ -234,7 +234,7 @@ search = "legacy"
 local_top_k = "0"
 group_units = "auto"
 beam_width = "1"
-exact_budget = "off"
+exact_budget = "auto"
 delta_mode = "estimate"
 ```
 
@@ -242,10 +242,10 @@ delta_mode = "estimate"
 appends raw selector evidence rows to JSONL. Leave it empty for normal runs.
 `selector.search`, `selector.local_top_k`, `selector.group_units`,
 `selector.beam_width`, `selector.exact_budget`, and `selector.delta_mode` are
-future-facing planner controls. They are recorded in the recipe lock, plan
-output, assignment log, and quantization report, but they do not replace the
-existing exact selector path unless matching low-level planner support is
-present.
+planner controls. The default `legacy` search keeps the existing selector path.
+Set `selector.search` to a non-legacy value to pass the planner knobs through to
+the low-level quantizer, where grouped tensor-policy planning can spend an exact
+KLD budget on ranked local assignment prefixes.
 
 Ledger estimates are not release-quality evidence. They can help prune or order
 candidate assignments, but final claims still need the same exact artifact
