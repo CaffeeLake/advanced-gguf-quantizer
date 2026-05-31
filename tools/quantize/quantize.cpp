@@ -5375,6 +5375,20 @@ static bool nvfp4_selector_choose_policy(
     std::chrono::steady_clock::time_point stageb_policy_start;
     std::string stageb_policy_active_name;
     size_t stageb_policy_active_index = 0;
+    double stageb_policy_active_estimated_total_seconds = 0.0;
+    std::string stageb_policy_active_estimate_basis;
+    auto note_stageb_policy_active_progress = [&](int64_t completed, int64_t total, const char * basis) {
+        if (!stageb_policy_active || completed <= 0 || total <= 0 || completed > total) {
+            return;
+        }
+        const double active_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - stageb_policy_start).count();
+        const double fraction = (double) completed / (double) total;
+        if (active_s > 0.0 && fraction > 0.0) {
+            stageb_policy_active_estimated_total_seconds = active_s / fraction;
+            stageb_policy_active_estimate_basis = basis != nullptr ? basis : "active_progress";
+        }
+    };
     auto stageb_eta_hint = [&]() -> std::string {
         if (full_quant_eta_total > 0 && full_quant_eta_done >= full_quant_eta_total) {
             return "done";
@@ -5390,11 +5404,21 @@ static bool nvfp4_selector_choose_policy(
             const double avg_policy_s = stageb_policy_eta_done_seconds / (double) stageb_policy_eta_done;
             double remaining_s = 0.0;
             if (stageb_policy_active && remaining_policies > 0) {
-                remaining_s += std::max(0.0, avg_policy_s - active_s);
+                if (stageb_policy_active_estimated_total_seconds > 0.0) {
+                    remaining_s += std::max(0.0, stageb_policy_active_estimated_total_seconds - active_s);
+                } else {
+                    remaining_s += std::max(0.0, avg_policy_s - active_s);
+                }
                 --remaining_policies;
             }
             remaining_s += (double) remaining_policies * avg_policy_s;
             return nvfp4_selector_format_duration(remaining_s) + " avg_measured_policy";
+        }
+        if (stageb_policy_active && stageb_policy_active_estimated_total_seconds > 0.0 && remaining_policies > 0) {
+            double remaining_s = std::max(0.0, stageb_policy_active_estimated_total_seconds - active_s);
+            --remaining_policies;
+            remaining_s += (double) remaining_policies * stageb_policy_active_estimated_total_seconds;
+            return "~" + nvfp4_selector_format_duration(remaining_s) + " rough_active_progress";
         }
         if (stageb_policy_active && active_s > 0.0 && remaining_policies > 0) {
             return ">=" + nvfp4_selector_format_duration(active_s * (double) remaining_policies) + " active_policy";
@@ -5407,14 +5431,27 @@ static bool nvfp4_selector_choose_policy(
         }
         char buf[256];
         if (stageb_policy_active) {
-            snprintf(buf, sizeof(buf),
-                "policy_units=%" PRId64 "/%" PRId64 " measured_eta_units=%" PRId64 " active=[%zu/%" PRId64 "] policy=%s",
-                stageb_policy_done,
-                stageb_policy_total,
-                stageb_policy_eta_done,
-                stageb_policy_active_index,
-                stageb_policy_total,
-                stageb_policy_active_name.c_str());
+            if (stageb_policy_active_estimated_total_seconds > 0.0) {
+                snprintf(buf, sizeof(buf),
+                    "policy_units=%" PRId64 "/%" PRId64 " measured_eta_units=%" PRId64 " active=[%zu/%" PRId64 "] active_est=%s basis=%s policy=%s",
+                    stageb_policy_done,
+                    stageb_policy_total,
+                    stageb_policy_eta_done,
+                    stageb_policy_active_index,
+                    stageb_policy_total,
+                    nvfp4_selector_format_duration(stageb_policy_active_estimated_total_seconds).c_str(),
+                    stageb_policy_active_estimate_basis.c_str(),
+                    stageb_policy_active_name.c_str());
+            } else {
+                snprintf(buf, sizeof(buf),
+                    "policy_units=%" PRId64 "/%" PRId64 " measured_eta_units=%" PRId64 " active=[%zu/%" PRId64 "] policy=%s",
+                    stageb_policy_done,
+                    stageb_policy_total,
+                    stageb_policy_eta_done,
+                    stageb_policy_active_index,
+                    stageb_policy_total,
+                    stageb_policy_active_name.c_str());
+            }
         } else {
             snprintf(buf, sizeof(buf),
                 "policy_units=%" PRId64 "/%" PRId64 " measured_eta_units=%" PRId64,
@@ -5447,6 +5484,8 @@ static bool nvfp4_selector_choose_policy(
             stageb_policy_active = false;
             stageb_policy_active_name.clear();
             stageb_policy_active_index = 0;
+            stageb_policy_active_estimated_total_seconds = 0.0;
+            stageb_policy_active_estimate_basis.clear();
         }
         full_quant_eta_done = std::min<int64_t>(full_quant_eta_total, 2 + stageb_policy_done);
         update_full_quant_eta(phase, print_now);
@@ -7184,6 +7223,8 @@ static bool nvfp4_selector_choose_policy(
             stageb_policy_start = std::chrono::steady_clock::now();
             stageb_policy_active_name = policy.name;
             stageb_policy_active_index = i + 1;
+            stageb_policy_active_estimated_total_seconds = 0.0;
+            stageb_policy_active_estimate_basis.clear();
             full_quant_eta_done = std::min<int64_t>(full_quant_eta_total, 2 + stageb_policy_done);
             update_full_quant_eta("selector-stage-b-policy-running", true);
             fprintf(stderr,
@@ -7332,6 +7373,10 @@ static bool nvfp4_selector_choose_policy(
                     (int64_t) eval_binding_indices.size());
                 std::atomic<int64_t> patch_done { 0 };
                 auto patch_update = [&](const char * state, size_t pos, bool print_now = false) {
+                    note_stageb_policy_active_progress(
+                        patch_done.load(std::memory_order_relaxed),
+                        (int64_t) eval_binding_indices.size(),
+                        "patch");
                     patch_heartbeat.update(
                         patch_done.load(std::memory_order_relaxed),
                         (int64_t) eval_binding_indices.size(),
@@ -7341,6 +7386,7 @@ static bool nvfp4_selector_choose_policy(
                 };
                 auto patch_done_one = [&](const char * state, size_t pos) {
                     const int64_t done = patch_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                    note_stageb_policy_active_progress(done, (int64_t) eval_binding_indices.size(), "patch");
                     patch_heartbeat.update(
                         done,
                         (int64_t) eval_binding_indices.size(),
