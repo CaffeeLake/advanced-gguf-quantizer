@@ -7326,6 +7326,7 @@ static bool nvfp4_selector_choose_policy(
                         (int64_t) eval_binding_indices.size(),
                         patch_detail(state, pos),
                         print_now);
+                    update_full_quant_eta("selector-stage-b-policy-patch", print_now);
                 };
                 auto patch_done_one = [&](const char * state, size_t pos) {
                     const int64_t done = patch_done.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -7333,6 +7334,7 @@ static bool nvfp4_selector_choose_policy(
                         done,
                         (int64_t) eval_binding_indices.size(),
                         patch_detail(state, pos));
+                    update_full_quant_eta("selector-stage-b-policy-patch");
                 };
                 patch_update("starting", no_failed_patch, true);
                 if (stageb_patch_threads <= 1 || eval_binding_indices.size() <= 1) {
