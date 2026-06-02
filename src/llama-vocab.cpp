@@ -511,6 +511,13 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 };
                 byte_encode = false;
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_WHITESPACE:
+                // whitespace pre-tokenizer (jinaai/jina-embeddings-v2-base-zh)
+                regex_exprs = {
+                    "\\S+",
+                };
+                byte_encode = false;
+                break;
             default:
                 // default regex for BPE tokenization pre-processing
                 regex_exprs = {
@@ -739,7 +746,7 @@ struct llm_tokenizer_wpm_session {
 
     void tokenize(const std::string & text, std::vector<llama_token> & output) {
         // normalize and split by whitespace
-        std::vector<std::string> words = preprocess(text);
+        std::vector<std::string> words = preprocess(text, vocab.get_normalizer_lowercase());
         // bos token prepended already
 
         // find the longest tokens that form the words
@@ -784,7 +791,7 @@ struct llm_tokenizer_wpm_session {
     }
 
     // TODO: reduce string copies by using cpts_offs array
-    static std::vector<std::string> preprocess(const std::string & text)  {
+    static std::vector<std::string> preprocess(const std::string & text, bool lowercase)  {
         const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
         std::vector<std::string> words(1, "");
 
@@ -803,7 +810,7 @@ struct llm_tokenizer_wpm_session {
                 continue;
             }
 
-            const std::string s = unicode_cpt_to_utf8(unicode_tolower(cpt));
+            const std::string s = unicode_cpt_to_utf8(lowercase ? unicode_tolower(cpt) : cpt);
             if (flags.is_punctuation || ( cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt)) {
                 if (words.back().size()) {  // finish previous word if any
                     words.emplace_back();
@@ -1663,6 +1670,34 @@ private:
     const llama_vocab & vocab;
 };
 
+struct llm_tokenizer_whitespace_session : llm_tokenizer_bpe_session {
+    llm_tokenizer_whitespace_session(const llama_vocab & vocab, const llm_tokenizer_bpe & tokenizer) : llm_tokenizer_bpe_session{vocab, tokenizer}, vocab{vocab} {}
+
+    void tokenize(const std::string & text, std::vector<llama_token> & output) override {
+        const bool lowercase = vocab.get_normalizer_lowercase();
+
+        std::string segment;
+        auto flush = [&]() {
+            if (!segment.empty()) {
+                llm_tokenizer_bpe_session::tokenize(segment, output);
+                segment.clear();
+            }
+        };
+
+        for (uint32_t cpt : unicode_cpts_from_utf8(text)) {
+            if (unicode_cpt_flags_from_cpt(cpt).is_whitespace) {
+                flush();
+            } else {
+                segment += unicode_cpt_to_utf8(lowercase ? unicode_tolower(cpt) : cpt);
+            }
+        }
+        flush();
+    }
+
+private:
+    const llama_vocab & vocab;
+};
+
 //
 // impl
 //
@@ -1743,6 +1778,7 @@ struct llama_vocab::impl {
     bool remove_extra_whitespaces   = false;
     bool escape_whitespaces         = true;
     bool treat_whitespace_as_suffix = false;
+    bool normalizer_lowercase       = true; // Lowercase normalizer (tokenizer.json)
 
     std::unordered_map<std::string, llama_token> token_to_id;
     std::vector<token_data>                      id_to_token;
@@ -1892,7 +1928,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             special_mask_id = 103;
 
             add_sep = true;
-        } else if (tokenizer_model == "gpt2" || tokenizer_model == "hybriddna") {
+        } else if (tokenizer_model == "gpt2" || tokenizer_model == "hybriddna" || tokenizer_model == "whitespace") {
             type = LLAMA_VOCAB_TYPE_BPE;
 
             // read bpe merges and populate bpe ranks
@@ -2109,6 +2145,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GPT2;
                 add_sep = true;
             } else if (
+                    tokenizer_pre == "whitespace") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_WHITESPACE;
+                normalizer_lowercase = false;
+            } else if (
                     tokenizer_pre == "refact") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_REFACT;
             } else if (
@@ -2290,6 +2330,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
 
         ml.get_key(LLM_KV_TOKENIZER_ADD_PREFIX,      add_space_prefix,         false);
         ml.get_key(LLM_KV_TOKENIZER_REMOVE_EXTRA_WS, remove_extra_whitespaces, false);
+        ml.get_key(LLM_KV_TOKENIZER_NORMALIZER_LOWERCASE, normalizer_lowercase, false);
     }
 
     const int token_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_LIST).c_str());
@@ -3253,6 +3294,8 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                 std::unique_ptr<llm_tokenizer_bpe_session> session;
                 if (vocab.get_tokenizer_model() == "hybriddna") {
                     session = std::make_unique<llm_tokenizer_hybriddna_session>(vocab, *tok_bpe);
+                } else if (vocab.get_tokenizer_model() == "whitespace") {
+                    session = std::make_unique<llm_tokenizer_whitespace_session>(vocab, *tok_bpe);
                 } else {
                     session = std::make_unique<llm_tokenizer_bpe_session>(vocab, *tok_bpe);
                 }
@@ -3879,6 +3922,10 @@ bool llama_vocab::get_escape_whitespaces() const {
 
 bool llama_vocab::get_treat_whitespace_as_suffix() const {
     return pimpl->treat_whitespace_as_suffix;
+}
+
+bool llama_vocab::get_normalizer_lowercase() const {
+    return pimpl->normalizer_lowercase;
 }
 
 int llama_vocab::max_token_len() const {

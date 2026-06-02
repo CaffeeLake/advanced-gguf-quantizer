@@ -25,7 +25,7 @@ Useful options:
 - `-r, --repetitions`: repetitions per case.
 - `-b, --batch-size`: logical batch size.
 - `-ub, --ubatch-size`: physical batch size.
-- `-fa, --flash-attn`: Flash Attention setting.
+- `-fa, --flash-attn`: Flash Attention setting, `on`, `off`, or `auto`.
 - `-o, --output`: output format, such as `md`, `csv`, `json`, or `jsonl`.
 
 Do not run competing benchmark jobs at the same time on the same GPU. If a run
