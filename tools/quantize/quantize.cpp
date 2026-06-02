@@ -670,6 +670,7 @@ struct quantize_binding_shape_t {
     int64_t nb_total = 0;
     bool sample_only = false;
     int64_t sample_nb_for_bytes = 0;
+    int host_threads = 1;
     int64_t out_nrow = 0;
     int64_t out_n_per_row = 0;
     size_t out_slice_bytes = 0;
@@ -747,6 +748,45 @@ static int quantize_binding_thread_count(int64_t n_slices, int nthread) {
         requested = quantize_control_i64(traits::thread_control_key, requested);
     }
     return (int) std::max<int64_t>(1, std::min<int64_t>(std::max<int64_t>(1, n_slices), requested));
+}
+
+static int quantize_host_range_worker_count(int64_t n_items, int nthread, int64_t min_items_per_worker) {
+    if (n_items <= 1 || nthread <= 1) {
+        return 1;
+    }
+
+    const int64_t min_items = std::max<int64_t>(1, min_items_per_worker);
+    const int64_t work_limited = (n_items + min_items - 1) / min_items;
+    return (int) std::max<int64_t>(1, std::min<int64_t>({
+        n_items,
+        (int64_t) nthread,
+        work_limited,
+    }));
+}
+
+template <typename RangeFn>
+static bool quantize_parallel_for_ranges(int64_t n_items, int nthread, int64_t min_items_per_worker, RangeFn && fn) {
+    const int worker_count = quantize_host_range_worker_count(n_items, nthread, min_items_per_worker);
+    if (worker_count <= 1) {
+        return fn(0, 0, n_items);
+    }
+
+    std::atomic_bool ok { true };
+    std::vector<std::thread> workers;
+    workers.reserve((size_t) worker_count);
+    for (int wi = 0; wi < worker_count; ++wi) {
+        workers.emplace_back([&, wi]() {
+            const int64_t begin = (n_items * wi) / worker_count;
+            const int64_t end = (n_items * (wi + 1)) / worker_count;
+            if (!fn(wi, begin, end)) {
+                ok.store(false, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    return ok.load(std::memory_order_relaxed);
 }
 
 template <ggml_type type>
@@ -901,11 +941,13 @@ static bool quantize_binding_quantize(
         return false;
     }
 
+    const int selector_threads = quantize_binding_thread_count<traits::quant_type>(shape.n_slices, nthread);
+    shape.host_threads = std::max(1, nthread / std::max(1, selector_threads));
+
     if (!prepare(shape)) {
         return false;
     }
 
-    const int selector_threads = quantize_binding_thread_count<traits::quant_type>(shape.n_slices, nthread);
     auto run_slice_with_shape = [&](int64_t i03, void * stream_key, quantize_binding_slice_accum_t & acc) {
         run_slice(i03, stream_key, shape, acc);
     };
@@ -3644,7 +3686,8 @@ static bool quantize_tensor_slice_to_f32(
     const ggml_tensor * src_tensor,
     int64_t slice_index,
     float tensor_scale,
-    std::vector<float> & out) {
+    std::vector<float> & out,
+    int nthread = 1) {
     if (src_tensor == nullptr || slice_index < 0 || slice_index >= src_tensor->ne[2]) {
         return false;
     }
@@ -3661,26 +3704,31 @@ static bool quantize_tensor_slice_to_f32(
         return false;
     }
 
-    for (int64_t row = 0; row < nrows; ++row) {
-        const uint8_t * src_ptr = (const uint8_t *) src_tensor->data + ((size_t) slice_index * (size_t) nrows + (size_t) row) * src_row_size;
-        float * dst_ptr = out.data() + (size_t) row * (size_t) n_per_row;
-        if (src_tensor->type == GGML_TYPE_F32) {
-            memcpy(dst_ptr, src_ptr, (size_t) n_per_row * sizeof(float));
-        } else if (src_tensor->type == GGML_TYPE_F16) {
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src_ptr, dst_ptr, n_per_row);
-        } else if (src_tensor->type == GGML_TYPE_BF16) {
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) src_ptr, dst_ptr, n_per_row);
-        } else {
-            src_traits->to_float(src_ptr, dst_ptr, n_per_row);
+    const bool apply_tensor_scale =
+        std::isfinite(tensor_scale) && tensor_scale > 0.0f && std::fabs(tensor_scale - 1.0f) > 1e-12f;
+    const int64_t min_rows_per_worker =
+        std::max<int64_t>(1, (1024 * 1024) / std::max<int64_t>(1, (int64_t) src_row_size));
+    return quantize_parallel_for_ranges(nrows, nthread, min_rows_per_worker, [&](int, int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            const uint8_t * src_ptr = (const uint8_t *) src_tensor->data + ((size_t) slice_index * (size_t) nrows + (size_t) row) * src_row_size;
+            float * dst_ptr = out.data() + (size_t) row * (size_t) n_per_row;
+            if (src_tensor->type == GGML_TYPE_F32) {
+                memcpy(dst_ptr, src_ptr, (size_t) n_per_row * sizeof(float));
+            } else if (src_tensor->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) src_ptr, dst_ptr, n_per_row);
+            } else if (src_tensor->type == GGML_TYPE_BF16) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) src_ptr, dst_ptr, n_per_row);
+            } else {
+                src_traits->to_float(src_ptr, dst_ptr, n_per_row);
+            }
+            if (apply_tensor_scale) {
+                for (int64_t i = 0; i < n_per_row; ++i) {
+                    dst_ptr[i] *= tensor_scale;
+                }
+            }
         }
-    }
-
-    if (std::isfinite(tensor_scale) && tensor_scale > 0.0f && std::fabs(tensor_scale - 1.0f) > 1e-12f) {
-        for (float & v : out) {
-            v *= tensor_scale;
-        }
-    }
-    return true;
+        return true;
+    });
 }
 
 struct nvfp4_selector_source_slice_view {
@@ -3746,7 +3794,8 @@ static bool nvfp4_selector_prepare_sample(
     std::vector<float> & sample_qw,
     nvfp4_selector_source_slice_view & source_view,
     int64_t sample_blocks_override = 0,
-    int64_t sample_phase = 0) {
+    int64_t sample_phase = 0,
+    int host_threads = 1) {
     const ggml_tensor * src_tensor = binding.source;
     if (src_tensor == nullptr || slice_index < 0 || slice_index >= src_tensor->ne[2]) {
         return false;
@@ -3829,15 +3878,20 @@ static bool nvfp4_selector_prepare_sample(
                 memcpy(sample_qw.data() + dst_off, imatrix_row + block_in_row * NVFP4_SELECTOR_BLOCK_SIZE, (size_t) NVFP4_SELECTOR_BLOCK_SIZE * sizeof(float));
             }
         }
-        source_view.owned_f32.resize((size_t) nrows * (size_t) n_per_row);
-        ggml_fp16_to_fp32_row(src_f16, source_view.owned_f32.data(), (int64_t) source_view.owned_f32.size());
+        if (sample_blocks_override > 0) {
+            source_view.x_scale = quant_tensor_scale;
+            return true;
+        }
+        if (!quantize_tensor_slice_to_f32(src_tensor, slice_index, binding.source_tensor_scale, source_view.owned_f32, host_threads)) {
+            return false;
+        }
         source_view.raw = source_view.owned_f32.data();
         source_view.raw_bf16 = false;
         source_view.x_scale = quant_tensor_scale;
         return true;
     }
 
-    if (!quantize_tensor_slice_to_f32(src_tensor, slice_index, binding.source_tensor_scale, source_view.owned_f32)) {
+    if (!quantize_tensor_slice_to_f32(src_tensor, slice_index, binding.source_tensor_scale, source_view.owned_f32, host_threads)) {
         return false;
     }
     source_view.raw = source_view.owned_f32.data();
@@ -4073,7 +4127,9 @@ static bool nvfp4_selector_quantize_binding(
         nvfp4_selector_source_slice_view source_view;
         std::vector<float> sample_x;
         std::vector<float> sample_qw;
-        if (!nvfp4_selector_prepare_sample(binding, i03, sample_x, sample_qw, source_view, sample_blocks_override, sample_phase)) {
+        if (!nvfp4_selector_prepare_sample(
+                binding, i03, sample_x, sample_qw, source_view,
+                sample_blocks_override, sample_phase, shape.host_threads)) {
             fprintf(stderr,
                 "%s: failed preparing selector sample for %s slice=%" PRId64 " source_type=%s rows=%" PRId64 " cols=%" PRId64 " sample_blocks=%" PRId64 " phase=%" PRId64 "\n",
                 __func__,
@@ -4280,7 +4336,7 @@ static bool mxfp6_selector_quantize_binding(
         const int64_t n_per_row = shape.n_per_row;
         const int64_t nrows = shape.nrows;
         std::vector<float> src_f32;
-        if (!quantize_tensor_slice_to_f32(binding.source, i03, binding.source_tensor_scale, src_f32)) {
+        if (!quantize_tensor_slice_to_f32(binding.source, i03, binding.source_tensor_scale, src_f32, shape.host_threads)) {
             fprintf(stderr, "%s: failed dequantizing source slice for %s slice=%" PRId64 "\n", __func__, binding.name.c_str(), i03);
             acc.ok = false;
             return;
@@ -5931,9 +5987,10 @@ static bool nvfp4_selector_choose_policy(
             double tensor_max = 0.0;
             int64_t tensor_n = 0;
         };
+        const int default_policy_threads = std::max<int>(1, nthread / 4);
         const int policy_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
             (int64_t) binding_indices.size(),
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", std::max(1, nthread))));
+            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", default_policy_threads)));
         const int binding_nthread = std::max(1, nthread / std::max(1, policy_threads));
         std::vector<binding_score> binding_scores(binding_indices.size());
         std::vector<nvfp4_selector_rsf_tensor_record> tensor_records(binding_indices.size());
@@ -6138,9 +6195,10 @@ static bool nvfp4_selector_choose_policy(
             double tensor_max = 0.0;
             int64_t tensor_n = 0;
         };
+        const int default_policy_threads = std::max<int>(1, nthread / 4);
         const int policy_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
             (int64_t) binding_indices.size(),
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", std::max(1, nthread))));
+            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", default_policy_threads)));
         const int binding_nthread = std::max(1, nthread / std::max(1, policy_threads));
         std::vector<binding_score> binding_scores(binding_indices.size());
         std::vector<nvfp4_selector_rsf_tensor_record> tensor_records(binding_indices.size());
@@ -7552,6 +7610,12 @@ static bool nvfp4_selector_choose_policy(
                     return true;
                 }
             };
+            const std::string stageb_binding_threads_text = std::to_string(stageb_binding_nthread);
+            // Stage-B has already split nthread across patch workers; keep a
+            // recipe-level selector.threads from expanding each binding patch.
+            scoped_quantize_control stageb_selector_threads(
+                "LLAMA_NVFP4_SELECTOR_THREADS",
+                stageb_binding_threads_text.c_str());
             size_t failed_patch_pos = no_failed_patch;
             bool stageb_patch_quant_ok = patch_policy_once(1, failed_patch_pos);
             if (!stageb_patch_quant_ok) {

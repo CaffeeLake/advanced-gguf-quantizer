@@ -557,8 +557,6 @@ static void apply_search_effort_preset(bq::Recipe & recipe, const std::string & 
     set_if_empty(recipe.selector.kld, recipe.evaluation.kld_base);
     recipe.base.threads = recipe.base.threads > 0 ? recipe.base.threads : default_worker_threads();
     set_if_empty(recipe.nvfp4.autotune.threads, threads);
-    set_if_empty(recipe.selector.policy_threads, threads);
-    set_if_empty(recipe.selector.threads, threads);
     set_if_empty(recipe.selector.kld_threads, threads);
     recipe.selector.keep_checkpoint = true;
     recipe.selector.require_runtime_cache = !fast;
@@ -598,8 +596,6 @@ static void apply_execution_defaults(bq::Recipe & recipe) {
     }
     set_if_empty(recipe.selector.kld, recipe.evaluation.kld_base);
     set_if_empty(recipe.nvfp4.autotune.threads, thread_text);
-    set_if_empty(recipe.selector.policy_threads, thread_text);
-    set_if_empty(recipe.selector.threads, thread_text);
     set_if_empty(recipe.selector.kld_threads, thread_text);
     if (recipe.autotune.enabled) {
         bq::apply_master_autotune(recipe);
