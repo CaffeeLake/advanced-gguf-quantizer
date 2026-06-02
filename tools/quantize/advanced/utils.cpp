@@ -81,10 +81,9 @@ int default_worker_threads() {
     if (detected <= 2) {
         return std::max(1U, detected);
     }
-    // Leave real headroom for the OS, CUDA workers, file cache, and browser/UI
-    // responsiveness during multi-GB GGUF runs. Users can still raise recipe
-    // thread fields explicitly on dedicated machines.
-    return (int) std::min(16U, std::max(1U, detected - 4U));
+    // Leave light headroom for the OS, CUDA workers, and file cache while
+    // still using the machine aggressively for long quantization runs.
+    return (int) std::max(1U, detected - 2U);
 }
 
 void set_if_empty(std::string & value, const std::string & fallback) {
