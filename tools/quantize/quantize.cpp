@@ -10894,11 +10894,14 @@ int llama_quantize(int argc, char ** argv) {
         if (out_overrides != nullptr) {
             out_overrides->clear();
         }
+        const int selector_nthread = params.nthread > 0 ?
+            params.nthread :
+            std::max(1, (int) std::thread::hardware_concurrency());
         return nvfp4_selector_choose_policy(
             fname_inp,
             seed_path,
             imatrix_data,
-            std::max(1, params.nthread),
+            selector_nthread,
             selector_kld,
             selector_kld_holdout.get(),
             selector_rank_cfg,
