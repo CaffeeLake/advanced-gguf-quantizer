@@ -7105,39 +7105,114 @@ static bool nvfp4_selector_choose_policy(
         }
     };
     if (have_runtime_eval) {
+        struct runtime_cache_task {
+            bool mxfp6 = false;
+            size_t index = 0;
+        };
+        std::vector<runtime_cache_task> runtime_cache_tasks;
+        runtime_cache_tasks.reserve(all_bindings.size() + mxfp6_bindings.size());
+        for (size_t i = 0; i < all_bindings.size(); ++i) {
+            runtime_cache_tasks.push_back({false, i});
+        }
+        for (size_t i = 0; i < mxfp6_bindings.size(); ++i) {
+            if (mxfp6_bindings[i].target != nullptr) {
+                runtime_cache_tasks.push_back({true, i});
+            }
+        }
         nvfp4_selector_progress_heartbeat runtime_cache_heartbeat(
             "selector stage-b runtime cache",
-            (int64_t) all_bindings.size() + (int64_t) mxfp6_bindings.size());
+            (int64_t) runtime_cache_tasks.size());
         runtime_cache_heartbeat.detail("caching original runtime tensors", true);
-        int64_t runtime_cache_done = 0;
-        for (auto & b : all_bindings) {
+        auto runtime_cache_name = [&](size_t pos) -> const char * {
+            const runtime_cache_task & task = runtime_cache_tasks[pos];
+            return task.mxfp6 ? mxfp6_bindings[task.index].name.c_str() : all_bindings[task.index].name.c_str();
+        };
+        auto runtime_cache_one = [&](size_t pos) -> const char * {
+            const runtime_cache_task & task = runtime_cache_tasks[pos];
+            if (task.mxfp6) {
+                auto & b = mxfp6_bindings[task.index];
+                return (!quantize_binding_ensure_target_bytes(b) || !quantize_binding_ensure_scale_bytes(b)) ?
+                    "MXFP6_E2M3 bytes" : nullptr;
+            }
+            auto & b = all_bindings[task.index];
             if (!quantize_binding_ensure_target_bytes(b)) {
-                fprintf(stderr, "%s: selector failed to cache original runtime tensor bytes for %s\n", __func__, b.name.c_str());
-                restore_all();
-                return false;
+                return "tensor bytes";
             }
             if (b.target_scale != nullptr && !quantize_binding_ensure_scale_bytes(b)) {
-                fprintf(stderr, "%s: selector failed to cache original runtime NVFP4 scale bytes for %s\n", __func__, b.name.c_str());
-                restore_all();
-                return false;
+                return "NVFP4 scale bytes";
             }
             if (b.target_input_scale != nullptr && !quantize_binding_ensure_input_scale_bytes(b)) {
-                fprintf(stderr, "%s: selector failed to cache original runtime NVFP4 input-scale bytes for %s\n", __func__, b.name.c_str());
-                restore_all();
-                return false;
+                return "NVFP4 input-scale bytes";
             }
-            runtime_cache_heartbeat.update(++runtime_cache_done, "caching original runtime tensors");
-        }
-        for (auto & b : mxfp6_bindings) {
-            if (b.target == nullptr) {
-                continue;
+            return nullptr;
+        };
+        auto runtime_cache_fail = [&](size_t pos, const char * what) {
+            fprintf(stderr,
+                "%s: selector failed to cache original runtime %s for %s\n",
+                __func__,
+                what != nullptr ? what : "tensor bytes",
+                runtime_cache_name(pos));
+            restore_all();
+            return false;
+        };
+        const int runtime_cache_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
+            (int64_t) runtime_cache_tasks.size(),
+            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", std::max(1, nthread))));
+        if (runtime_cache_threads <= 1 || runtime_cache_tasks.size() <= 1) {
+            int64_t runtime_cache_done = 0;
+            for (size_t pos = 0; pos < runtime_cache_tasks.size(); ++pos) {
+                const char * error = runtime_cache_one(pos);
+                if (error != nullptr) {
+                    return runtime_cache_fail(pos, error);
+                }
+                runtime_cache_heartbeat.update(++runtime_cache_done, "caching original runtime tensors");
             }
-            if (!quantize_binding_ensure_target_bytes(b) || !quantize_binding_ensure_scale_bytes(b)) {
-                fprintf(stderr, "%s: selector failed to cache original runtime MXFP6_E2M3 bytes for %s\n", __func__, b.name.c_str());
-                restore_all();
-                return false;
+        } else {
+            const size_t no_failed_cache = std::numeric_limits<size_t>::max();
+            std::atomic<size_t> next_cache{0};
+            std::atomic<size_t> failed_cache{no_failed_cache};
+            std::atomic<int64_t> runtime_cache_done{0};
+            std::vector<const char *> cache_errors(runtime_cache_tasks.size(), nullptr);
+            std::mutex cache_progress_mutex;
+            std::vector<std::thread> workers;
+            workers.reserve((size_t) runtime_cache_threads);
+            fprintf(stderr,
+                "selector stage-b runtime cache threads=%d tensors=%zu\n",
+                runtime_cache_threads,
+                runtime_cache_tasks.size());
+            for (int ti = 0; ti < runtime_cache_threads; ++ti) {
+                workers.emplace_back([&]() {
+                    while (true) {
+                        const size_t pos = next_cache.fetch_add(1, std::memory_order_relaxed);
+                        if (pos >= runtime_cache_tasks.size()) {
+                            break;
+                        }
+                        const char * error = runtime_cache_one(pos);
+                        if (error != nullptr) {
+                            cache_errors[pos] = error;
+                            size_t expected = no_failed_cache;
+                            (void) failed_cache.compare_exchange_strong(
+                                expected, pos, std::memory_order_acq_rel, std::memory_order_acquire);
+                            continue;
+                        }
+                        const int64_t done = runtime_cache_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (done == (int64_t) runtime_cache_tasks.size() || (done % 8) == 0) {
+                            std::lock_guard<std::mutex> lock(cache_progress_mutex);
+                            runtime_cache_heartbeat.update(done, "caching original runtime tensors");
+                        }
+                    }
+                });
             }
-            runtime_cache_heartbeat.update(++runtime_cache_done, "caching original runtime tensors");
+            for (auto & worker : workers) {
+                worker.join();
+            }
+            const size_t failed_pos = failed_cache.load(std::memory_order_acquire);
+            if (failed_pos != no_failed_cache) {
+                return runtime_cache_fail(failed_pos, cache_errors[failed_pos]);
+            }
+            runtime_cache_heartbeat.update(
+                (int64_t) runtime_cache_tasks.size(),
+                "caching original runtime tensors");
         }
         runtime_cache_heartbeat.finish("original runtime tensors cached");
         int64_t kld_metric_threads = nvfp4_selector_kld_threads_override();
