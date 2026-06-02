@@ -51,8 +51,7 @@ Core inputs:
 - `base.output_tensor_type`, `base.token_embedding_type`: optional explicit
   output/head and token embedding tensor types.
 - `base.mtp_tensor_type`: optional explicit MTP/NextN tensor type. Leave blank
-  to preserve the source MTP block. Use `MXFP6_E2M3`, `Q8_0`, `BF16`, or
-  `F16` for release MTP artifacts; `NVFP4` is refused for MTP/NextN.
+  to use `Q8_0` for MTP matrix weights and preserve MTP norm/vector tensors.
 - `target.precision_mode`: `nvfp4`, `mxfp6`, `nvfp4_mxfp6`, or
   `mxfp6-primary`.
 - `target.target_bpw`: final bits-per-weight goal for mixed allocation.

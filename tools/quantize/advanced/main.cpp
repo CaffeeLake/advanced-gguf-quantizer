@@ -350,7 +350,7 @@ static std::string profile_validation_summary(
         << ", mtp_preservation:" << (mtp_ok ? "pass" : "fail")
         << ", output_policy:" << (recipe.base.output_tensor_type.empty() ? "default" : recipe.base.output_tensor_type)
         << ", token_embedding_policy:" << (recipe.base.token_embedding_type.empty() ? "default" : recipe.base.token_embedding_type)
-        << ", mtp_policy:" << (recipe.base.mtp_tensor_type.empty() ? "source" : recipe.base.mtp_tensor_type)
+        << ", mtp_policy:" << (recipe.base.mtp_tensor_type.empty() ? "Q8_0" : recipe.base.mtp_tensor_type)
         << ", expected_scale_tensors:" << (scale_ok ? "pass" : "fail")
         << ", run_rc:" << rc
         << "}";
@@ -2639,7 +2639,7 @@ static void configure_standard_quantize_options(bq::Recipe & recipe) {
 
     recipe.base.output_tensor_type = sanitize_tensor_type_token(prompt("output.weight tensor type", recipe.base.output_tensor_type));
     recipe.base.token_embedding_type = sanitize_tensor_type_token(prompt("token embedding tensor type", recipe.base.token_embedding_type));
-    recipe.base.mtp_tensor_type = sanitize_tensor_type_token(prompt("MTP/NextN tensor type (blank preserves source; use MXFP6_E2M3/Q8_0/BF16)", recipe.base.mtp_tensor_type));
+    recipe.base.mtp_tensor_type = sanitize_tensor_type_token(prompt("MTP/NextN tensor type (blank defaults matrix weights to Q8_0)", recipe.base.mtp_tensor_type));
     recipe.base.leave_output_tensor = prompt_bool("leave output.weight unquantized", recipe.base.leave_output_tensor);
     recipe.stock_ftype.sweep_tensor_policy = prompt_bool("measure embeddings/output as candidates", recipe.stock_ftype.sweep_tensor_policy || recipe.stock_ftype.sweep_sensitive_tensors);
     recipe.stock_ftype.sweep_sensitive_tensors = recipe.stock_ftype.sweep_tensor_policy;
@@ -5044,7 +5044,7 @@ static void shell_configure_standard_quantize_options(ShellState & state) {
     const std::string title = "Project > Options > Standard Quantize Options";
     state.recipe.base.output_tensor_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "output.weight tensor type", state.recipe.base.output_tensor_type));
     state.recipe.base.token_embedding_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "token embedding tensor type", state.recipe.base.token_embedding_type));
-    state.recipe.base.mtp_tensor_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "MTP/NextN tensor type (blank preserves source; use MXFP6_E2M3/Q8_0/BF16)", state.recipe.base.mtp_tensor_type));
+    state.recipe.base.mtp_tensor_type = sanitize_tensor_type_token(shell_prompt_on_page(state, title, "MTP/NextN tensor type (blank defaults matrix weights to Q8_0)", state.recipe.base.mtp_tensor_type));
     state.recipe.base.leave_output_tensor = shell_prompt_bool_on_page(state, title, "leave output.weight unquantized", state.recipe.base.leave_output_tensor);
     state.recipe.stock_ftype.sweep_tensor_policy = shell_prompt_bool_on_page(
         state,

@@ -851,19 +851,6 @@ struct tensor_metadata {
     std::string     mxfp6_policy_name;
 };
 
-static ggml_type tensor_type_avoid_nvfp4_mtp(
-        const ggml_tensor * tensor,
-        const tensor_metadata & tm,
-        ggml_type target_type,
-        const char * source) {
-    if (tm.is_mtp && target_type == GGML_TYPE_NVFP4 && tensor->type != GGML_TYPE_NVFP4) {
-        LLAMA_LOG_WARN("%s: %-36s - refusing %s NVFP4 for MTP/NextN; preserving source type %s\n",
-                __func__, tensor->name, source, ggml_type_name(tensor->type));
-        return tensor->type;
-    }
-    return target_type;
-}
-
 //
 // dequantization
 //
@@ -3367,11 +3354,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         if (explicit_mtp_type) {
             metadata[i].target_type = tensor_type_fallback(qs, tensor, params->mtp_tensor_type);
-            metadata[i].target_type = tensor_type_avoid_nvfp4_mtp(tensor, metadata[i], metadata[i].target_type, "--mtp-tensor-type");
-        } else if (metadata[i].is_mtp && manual_type == GGML_TYPE_NVFP4) {
-            metadata[i].target_type = tensor_type_avoid_nvfp4_mtp(tensor, metadata[i], manual_type, "manual");
         } else if (metadata[i].is_mtp && manual_type == GGML_TYPE_COUNT) {
-            metadata[i].target_type = tensor->type;
+            metadata[i].target_type = tensor->ne[1] > 1 ? tensor_type_fallback(qs, tensor, GGML_TYPE_Q8_0) : tensor->type;
         } else if (manual_type != GGML_TYPE_COUNT) {
             metadata[i].target_type = tensor_type_fallback(qs, tensor, manual_type);
         } else if (explicit_token_type) {
@@ -3385,7 +3369,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         } else {
             metadata[i].target_type = tensor->type;
         }
-        metadata[i].target_type = tensor_type_avoid_nvfp4_mtp(tensor, metadata[i], metadata[i].target_type, "selected");
         metadata[i].target_type = tensor_type_avoid_nvfp4_token_embedding(qs, tensor, metadata[i], metadata[i].target_type);
 
         if (params->imatrix) {
