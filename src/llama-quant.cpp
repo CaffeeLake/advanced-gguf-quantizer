@@ -275,7 +275,7 @@ static const llama_model_loader::llama_tensor_weight * llama_nvfp4_find_input_sc
 static constexpr size_t LLAMA_QUANT_MIN_SAVINGS_BYTES = 4u * 1024u * 1024u;
 static constexpr size_t LLAMA_NVFP4_MIN_SAVINGS_BYTES = 2u * 1024u * 1024u;
 static constexpr size_t LLAMA_MXFP6_MIN_SAVINGS_BYTES = LLAMA_QUANT_MIN_SAVINGS_BYTES;
-static constexpr int64_t LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS_DEFAULT = 0;
+static constexpr int64_t LLAMA_NVFP4_ENCODER_MAX_BLOCKS_DEFAULT = 0;
 static constexpr int32_t NVFP4_CUDA_CHUNK_MIB_DEFAULT = 2;
 static constexpr int64_t LLAMA_MXFP6_TENSOR_SCALE_SAMPLE_BLOCKS_DEFAULT = 4096;
 static constexpr int32_t LLAMA_MXFP6_TENSOR_SCALE_STEPS_DEFAULT = 64;
@@ -299,11 +299,11 @@ static bool llama_nvfp4_trace_enabled() {
     return LLAMA_NVFP4_TRACE_ENABLED;
 }
 
-static int64_t llama_nvfp4_autotune_sample_cap_override(const llama_model_quantize_params * params) {
-    if (params == nullptr || params->nvfp4_autotune_max_blocks <= 0) {
-        return LLAMA_NVFP4_AUTOTUNE_MAX_BLOCKS_DEFAULT;
+static int64_t llama_nvfp4_encoder_sample_cap_override(const llama_model_quantize_params * params) {
+    if (params == nullptr || params->nvfp4_encoder_max_blocks <= 0) {
+        return LLAMA_NVFP4_ENCODER_MAX_BLOCKS_DEFAULT;
     }
-    return params->nvfp4_autotune_max_blocks;
+    return params->nvfp4_encoder_max_blocks;
 }
 
 static int llama_nvfp4_cuda_parallel_threads(int nthread, int64_t nchunk) {
@@ -348,11 +348,11 @@ static int64_t llama_mxfp6_e2m3_cuda_chunk_rows(int64_t nrows, int64_t rows) {
     return std::min<int64_t>(nrows, std::max<int64_t>(MXFP6_E2M3_TILE_ROWS, rows));
 }
 
-static int64_t llama_nvfp4_autotune_sample_blocks(const llama_model_quantize_params * params, const int64_t nb_total) {
+static int64_t llama_nvfp4_encoder_sample_blocks(const llama_model_quantize_params * params, const int64_t nb_total) {
     if (nb_total <= 0) {
         return 0;
     }
-    const int64_t override_cap = llama_nvfp4_autotune_sample_cap_override(params);
+    const int64_t override_cap = llama_nvfp4_encoder_sample_cap_override(params);
     if (override_cap > 0) {
         return std::min(nb_total, override_cap);
     }
@@ -825,6 +825,14 @@ static ggml_type llama_tensor_find_manual_type(const quantize_state_impl & qs, c
     return opt ? opt->type : GGML_TYPE_COUNT;
 }
 
+static bool llama_tensor_type_has_k_rsf(ggml_type type) {
+    return type == GGML_TYPE_Q2_K ||
+           type == GGML_TYPE_Q3_K ||
+           type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q5_K ||
+           type == GGML_TYPE_Q6_K;
+}
+
 // per-tensor metadata, computed in the preliminary loop and used in the main loop
 struct tensor_metadata {
     std::string     name;
@@ -846,9 +854,14 @@ struct tensor_metadata {
     };
     int64_t         nvfp4_sample_blocks = 0;
     std::string     nvfp4_policy_name;
+    bool            has_nvfp4_scale_overrides = false;
+    std::vector<float> nvfp4_base_scale_overrides;
+    std::vector<float> nvfp4_scale_overrides;
     bool            has_mxfp6_scale_mul = false;
     float           mxfp6_e2m3_scale_mul = 1.0f;
     std::string     mxfp6_policy_name;
+    bool            has_k_rsf_mode_override = false;
+    int32_t         k_rsf_mode_override = 0;
 };
 
 //
@@ -1431,7 +1444,10 @@ static size_t llama_tensor_quantize_impl(
 	        const char * tensor_name,
 	        const nvfp4_cuda_runtime_cfg * nvfp4_cfg_hint = nullptr,
 	        int64_t nvfp4_sample_blocks_override = 0,
-	        float * actual_tensor_scale_out = nullptr) {
+	        float * actual_tensor_scale_out = nullptr,
+	        float nvfp4_tune_tensor_scale_override = 0.0f,
+	        bool nvfp4_fixed_tensor_scale = false,
+            int32_t k_rsf_mode_override = 0) {
     const size_t row_size = ggml_row_size(new_type, n_per_row);
     if (actual_tensor_scale_out != nullptr) {
         *actual_tensor_scale_out = tensor_scale;
@@ -1447,6 +1463,10 @@ static size_t llama_tensor_quantize_impl(
         float nvfp4_scale_mul = 1.0f;
         float tensor_scale_eff =
             (std::isfinite(tensor_scale) && tensor_scale > 0.0f) ? tensor_scale : 1.0f;
+        const float tune_tensor_scale_eff =
+            (std::isfinite(nvfp4_tune_tensor_scale_override) && nvfp4_tune_tensor_scale_override > 0.0f)
+            ? nvfp4_tune_tensor_scale_override
+            : tensor_scale_eff;
         nvfp4_cuda_runtime_cfg nvfp4_cfg = {
             NVFP4_CUDA_CHOOSE46_ADAPTIVE,
             8,
@@ -1460,11 +1480,11 @@ static size_t llama_tensor_quantize_impl(
         const int64_t nb_total = (nrows * n_per_row) / LLAMA_NVFP4_BLOCK_SIZE;
         const int64_t sample_nb = nvfp4_sample_blocks_override > 0
             ? std::min<int64_t>(nb_total, nvfp4_sample_blocks_override)
-            : llama_nvfp4_autotune_sample_blocks(params, nb_total);
+            : llama_nvfp4_encoder_sample_blocks(params, nb_total);
         const int64_t sample_n = sample_nb * LLAMA_NVFP4_BLOCK_SIZE;
         double prep_ms = 0.0;
-        double autotune_ms = 0.0;
-        bool autotune_ok = false;
+        double encoder_ms = 0.0;
+        bool encoder_ok = false;
 
         if (nvfp4_get_runtime_cfg(&nvfp4_cfg, nvfp4_cfg_hint)) {
             nvfp4_cfg_valid = true;
@@ -1473,7 +1493,7 @@ static size_t llama_tensor_quantize_impl(
         if (sample_n > 0) {
             const auto prep_begin = std::chrono::steady_clock::now();
             const float inv_scale =
-                (std::isfinite(tensor_scale_eff) && tensor_scale_eff > 0.0f) ? (1.0f / tensor_scale_eff) : 1.0f;
+                (std::isfinite(tune_tensor_scale_eff) && tune_tensor_scale_eff > 0.0f) ? (1.0f / tune_tensor_scale_eff) : 1.0f;
             const int64_t nb_per_row = n_per_row / LLAMA_NVFP4_BLOCK_SIZE;
             const bool build_tune_qw = imatrix && nb_per_row > 0;
             const bool tune_unweighted_for_gate = tensor_name && strstr(tensor_name, "ffn_gate.weight") != nullptr;
@@ -1545,7 +1565,7 @@ static size_t llama_tensor_quantize_impl(
             }
             prep_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prep_begin).count();
 
-            const auto autotune_begin = std::chrono::steady_clock::now();
+            const auto encoder_begin = std::chrono::steady_clock::now();
             nvfp4_cuda_tune_result tune_result = {
                 /* a       = */ NVFP4_A0,
                 /* b       = */ NVFP4_B0,
@@ -1553,27 +1573,29 @@ static size_t llama_tensor_quantize_impl(
                 /* cfg     = */ nvfp4_cfg,
                 /* has_cfg = */ 0,
             };
-            autotune_ok = nvfp4_autotune_cuda_cfg(
+            encoder_ok = nvfp4_autotune_cuda_cfg(
                     tune_x_ptr,
                     tune_qw_ptr,
                     sample_n,
                     nvfp4_cfg_valid ? &nvfp4_cfg : nullptr,
                     &tune_result,
                     nvfp4_tune_stream);
-            if (autotune_ok) {
+            if (encoder_ok) {
                 nvfp4_a = tune_result.a;
                 nvfp4_b = tune_result.b;
                 nvfp4_scale_mul =
                     (std::isfinite(tune_result.scale_mul) && tune_result.scale_mul > 0.0f)
                     ? tune_result.scale_mul
                     : 1.0f;
-                tensor_scale_eff *= nvfp4_scale_mul;
+                if (!nvfp4_fixed_tensor_scale) {
+                    tensor_scale_eff *= nvfp4_scale_mul;
+                }
                 if (tune_result.has_cfg) {
                     nvfp4_cfg = tune_result.cfg;
                     nvfp4_cfg_valid = true;
                 }
             }
-            autotune_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - autotune_begin).count();
+            encoder_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - encoder_begin).count();
         }
 
         const void * src = bf16_data != nullptr ? (const void *) bf16_data : (const void *) f32_data;
@@ -1643,11 +1665,11 @@ static size_t llama_tensor_quantize_impl(
                 *actual_tensor_scale_out = tensor_scale_eff;
             }
             if (nvfp4_trace) {
-                LLAMA_LOG_INFO("%s: nvfp4 cuda ok tensor=%s rows=%" PRId64 " cols=%" PRId64 " sample_blocks=%" PRId64 " prep=%.2f ms autotune=%.2f ms total=%.2f ms tuned=%s cuda_threads=%d cuda_chunk_rows=%" PRId64 " scale_mul=%.8g final_scale=%.8g cfg={choose46=%d refit=%d compand=%d cap6=%.1f cap4=%.1f}\n",
+                LLAMA_LOG_INFO("%s: nvfp4 cuda ok tensor=%s rows=%" PRId64 " cols=%" PRId64 " sample_blocks=%" PRId64 " prep=%.2f ms encoder=%.2f ms total=%.2f ms tuned=%s cuda_threads=%d cuda_chunk_rows=%" PRId64 " scale_mul=%.8g final_scale=%.8g cfg={choose46=%d refit=%d compand=%d cap6=%.1f cap4=%.1f}\n",
                         __func__,
                         tensor_name ? tensor_name : "(unknown)",
-                        nrows, n_per_row, sample_nb, prep_ms, autotune_ms, total_cuda_ms,
-                        autotune_ok ? "yes" : "no",
+                        nrows, n_per_row, sample_nb, prep_ms, encoder_ms, total_cuda_ms,
+                        encoder_ok ? "yes" : "no",
                         cuda_threads, cuda_chunk_rows,
                         (double) nvfp4_scale_mul,
                         (double) tensor_scale_eff,
@@ -1663,11 +1685,11 @@ static size_t llama_tensor_quantize_impl(
             }
             return new_size;
         }
-        LLAMA_LOG_WARN("%s: nvfp4 cuda fallback tensor=%s rows=%" PRId64 " cols=%" PRId64 " sample_blocks=%" PRId64 " prep=%.2f ms autotune=%.2f ms total=%.2f ms tuned=%s cuda_threads=%d cuda_chunk_rows=%" PRId64 " cfg={choose46=%d refit=%d compand=%d cap6=%.1f cap4=%.1f}\n",
+        LLAMA_LOG_WARN("%s: nvfp4 cuda fallback tensor=%s rows=%" PRId64 " cols=%" PRId64 " sample_blocks=%" PRId64 " prep=%.2f ms encoder=%.2f ms total=%.2f ms tuned=%s cuda_threads=%d cuda_chunk_rows=%" PRId64 " cfg={choose46=%d refit=%d compand=%d cap6=%.1f cap4=%.1f}\n",
                 __func__,
                 tensor_name ? tensor_name : "(unknown)",
-                nrows, n_per_row, sample_nb, prep_ms, autotune_ms, total_cuda_ms,
-                autotune_ok ? "yes" : "no",
+                nrows, n_per_row, sample_nb, prep_ms, encoder_ms, total_cuda_ms,
+                encoder_ok ? "yes" : "no",
                 cuda_threads, cuda_chunk_rows,
                 nvfp4_cfg.choose46_mode,
                 nvfp4_cfg.refit_iters,
@@ -1795,8 +1817,8 @@ static size_t llama_tensor_quantize_impl(
         } else {
             ggml_bf16_to_fp32_row(bf16_data, f32_tmp.data(), nelements);
         }
-	        return llama_tensor_quantize_impl(new_type, params, f32_tmp.data(), nullptr, tensor_scale, new_data, chunk_size, nrows, n_per_row, imatrix, workers, nthread, tensor_name, nvfp4_cfg_hint, nvfp4_sample_blocks_override, actual_tensor_scale_out);
-	    }
+		        return llama_tensor_quantize_impl(new_type, params, f32_tmp.data(), nullptr, tensor_scale, new_data, chunk_size, nrows, n_per_row, imatrix, workers, nthread, tensor_name, nvfp4_cfg_hint, nvfp4_sample_blocks_override, actual_tensor_scale_out, nvfp4_tune_tensor_scale_override, nvfp4_fixed_tensor_scale, k_rsf_mode_override);
+		    }
 
     const bool normalize_native_tensor_scale_cpu =
         (new_type == GGML_TYPE_NVFP4 || new_type == GGML_TYPE_MXFP4 || new_type == GGML_TYPE_MXFP6_E2M3) &&
@@ -1804,15 +1826,21 @@ static size_t llama_tensor_quantize_impl(
         tensor_scale > 0.0f &&
         std::fabs(tensor_scale - 1.0f) > 1e-12f;
     const float inv_tensor_scale = normalize_native_tensor_scale_cpu ? (1.0f / tensor_scale) : 1.0f;
-    const int qk_rsf_mode = params != nullptr && params->q4_k_rsf ? std::max<int>(1, params->q4_k_rsf_mode) : 0;
+    int qk_rsf_mode = params != nullptr && params->q4_k_rsf ? std::max<int>(1, params->q4_k_rsf_mode) : 0;
+    if (k_rsf_mode_override > 0) {
+        qk_rsf_mode = std::max<int32_t>(1, std::min<int32_t>(3, k_rsf_mode_override));
+    }
     const bool use_qk_rsf_cpu =
         qk_rsf_mode > 0 &&
-        (new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_Q3_K || new_type == GGML_TYPE_Q4_K);
+        (new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_Q3_K || new_type == GGML_TYPE_Q4_K ||
+         new_type == GGML_TYPE_Q5_K || new_type == GGML_TYPE_Q6_K);
     auto quantize_k_rsf = [new_type, n_per_row, imatrix, qk_rsf_mode](const float * src, void * dst, int64_t rows) -> size_t {
         switch (new_type) {
             case GGML_TYPE_Q2_K: return quantize_q2_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
             case GGML_TYPE_Q3_K: return quantize_q3_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
             case GGML_TYPE_Q4_K: return quantize_q4_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
+            case GGML_TYPE_Q5_K: return quantize_q5_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
+            case GGML_TYPE_Q6_K: return quantize_q6_K_rsf(src, dst, rows, n_per_row, imatrix, qk_rsf_mode);
             default:             return 0;
         }
     };
@@ -2501,7 +2529,7 @@ static bool llama_nv4mx6_eval_quant_cuda_actual(
 
     if (qtype == GGML_TYPE_NVFP4) {
         const int64_t nb_total = (nrows * n_per_row) / LLAMA_NVFP4_BLOCK_SIZE;
-        const int64_t sample_nb = llama_nvfp4_autotune_sample_blocks(params, nb_total);
+        const int64_t sample_nb = llama_nvfp4_encoder_sample_blocks(params, nb_total);
         const int64_t sample_n = sample_nb * LLAMA_NVFP4_BLOCK_SIZE;
         if (sample_n > 0) {
             const float inv_scale = tensor_scale > 0.0f && std::isfinite(tensor_scale) ? 1.0f / tensor_scale : 1.0f;
@@ -2877,7 +2905,7 @@ static bool llama_nv4mx6_eval_tensor_proxy(
     int64_t sample_nb = params != nullptr && params->mixed_format_sample_blocks > 0 ?
         params->mixed_format_sample_blocks : 0;
     if (sample_nb <= 0) {
-        sample_nb = llama_nvfp4_autotune_sample_blocks(params, nb_total);
+        sample_nb = llama_nvfp4_encoder_sample_blocks(params, nb_total);
         const int64_t sample_cap = params != nullptr && params->mixed_format_sample_cap > 0 ?
             params->mixed_format_sample_cap : LLAMA_NV4MX6_SAMPLE_CAP_DEFAULT;
         if (sample_cap > 0) {
@@ -3452,10 +3480,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 	            metadata[i].nvfp4_cfg_override = manual_opt->nvfp4_cfg;
 	            metadata[i].nvfp4_sample_blocks = std::max<int64_t>(0, manual_opt->nvfp4_sample_blocks);
 	            metadata[i].nvfp4_policy_name = manual_opt->nvfp4_policy_name;
-        } else {
-            metadata[i].nvfp4_sample_blocks = 0;
-            metadata[i].nvfp4_policy_name.clear();
-        }
+	            const int64_t n_slices = std::max<int64_t>(1, tensor->ne[2]);
+	            metadata[i].has_nvfp4_scale_overrides =
+	                manual_opt->nvfp4_scale_overrides.size() == (size_t) n_slices &&
+	                manual_opt->nvfp4_base_scale_overrides.size() == (size_t) n_slices;
+	            if (metadata[i].has_nvfp4_scale_overrides) {
+	                metadata[i].nvfp4_base_scale_overrides = manual_opt->nvfp4_base_scale_overrides;
+	                metadata[i].nvfp4_scale_overrides = manual_opt->nvfp4_scale_overrides;
+	            } else {
+	                metadata[i].nvfp4_base_scale_overrides.clear();
+	                metadata[i].nvfp4_scale_overrides.clear();
+	            }
+	        } else {
+	            metadata[i].nvfp4_sample_blocks = 0;
+	            metadata[i].nvfp4_policy_name.clear();
+	            metadata[i].has_nvfp4_scale_overrides = false;
+	            metadata[i].nvfp4_base_scale_overrides.clear();
+	            metadata[i].nvfp4_scale_overrides.clear();
+	        }
         metadata[i].has_mxfp6_scale_mul =
             manual_opt != nullptr &&
             manual_opt->type == GGML_TYPE_MXFP6_E2M3 &&
@@ -3469,6 +3511,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].mxfp6_e2m3_scale_mul = 1.0f;
             metadata[i].mxfp6_policy_name.clear();
         }
+        metadata[i].has_k_rsf_mode_override =
+            manual_opt != nullptr &&
+            manual_opt->has_k_rsf_mode &&
+            manual_opt->type == metadata[i].target_type &&
+            llama_tensor_type_has_k_rsf(metadata[i].target_type);
+        metadata[i].k_rsf_mode_override = metadata[i].has_k_rsf_mode_override
+            ? std::max<int32_t>(1, std::min<int32_t>(3, manual_opt->k_rsf_mode))
+            : 0;
 
         if (patch_ml) {
             if (patch_weight != nullptr && patch_weight->tensor != nullptr) {
@@ -3493,7 +3543,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 metadata[i].copy_from_patch =
                     type_match && shape_match && aux_match &&
                     !metadata[i].has_nvfp4_cfg_override &&
-                    !metadata[i].has_mxfp6_scale_mul;
+                    !metadata[i].has_mxfp6_scale_mul &&
+                    !metadata[i].has_k_rsf_mode_override;
             }
         }
 
@@ -3967,15 +4018,31 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const float * f32_data_03 = f32_data ? (f32_data + i03 * nelements_matrix) : nullptr;
                     const ggml_bf16_t * bf16_data_03 = bf16_data ? (bf16_data + i03 * nelements_matrix) : nullptr;
                     void * new_data_03 = (char *) new_data + mxfp6_payload_offset + slice_storage_size * (size_t) i03;
-                    const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+	                    const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+	                    float nvfp4_base_tensor_scale_03 = 1.0f;
+	                    float nvfp4_tune_tensor_scale_03 = 0.0f;
+	                    bool nvfp4_fixed_tensor_scale_03 = false;
 
-                    if (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) {
-                        const float tensor_scale = llama_nvfp4_correction_scale(
-                                f32_data_03, bf16_data_03, nelements_matrix, slice_nthread, nvfp4_correction_denom);
-                        nvfp4_aux_info->scale_values[(size_t) i03] = tensor_scale;
+	                    if (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) {
+	                        const float tensor_scale = llama_nvfp4_correction_scale(
+	                                f32_data_03, bf16_data_03, nelements_matrix, slice_nthread, nvfp4_correction_denom);
+	                        nvfp4_base_tensor_scale_03 = tensor_scale;
+	                        nvfp4_aux_info->scale_values[(size_t) i03] = tensor_scale;
+	                        if (tm.has_nvfp4_scale_overrides &&
+	                                (size_t) i03 < tm.nvfp4_scale_overrides.size() &&
+	                                (size_t) i03 < tm.nvfp4_base_scale_overrides.size() &&
+	                                std::isfinite(tm.nvfp4_scale_overrides[(size_t) i03]) &&
+	                                tm.nvfp4_scale_overrides[(size_t) i03] > 0.0f &&
+	                                std::isfinite(tm.nvfp4_base_scale_overrides[(size_t) i03]) &&
+	                                tm.nvfp4_base_scale_overrides[(size_t) i03] > 0.0f) {
+	                            nvfp4_base_tensor_scale_03 = tm.nvfp4_base_scale_overrides[(size_t) i03];
+	                            nvfp4_aux_info->scale_values[(size_t) i03] = tm.nvfp4_scale_overrides[(size_t) i03];
+	                            nvfp4_tune_tensor_scale_03 = nvfp4_base_tensor_scale_03;
+	                            nvfp4_fixed_tensor_scale_03 = true;
+	                        }
 
-                        const float input_scale = llama_nvfp4_input_scale_from_imatrix(
-                                imatrix_03, tensor->ne[0], nvfp4_input_scale_policy);
+	                        const float input_scale = llama_nvfp4_input_scale_from_imatrix(
+	                                imatrix_03, tensor->ne[0], nvfp4_input_scale_policy);
                         nvfp4_aux_info->input_scale_values[(size_t) i03] = input_scale;
                     } else if (is_mxfp6 && !mxfp6_shared_tensor_scale) {
                         float tensor_scale =
@@ -4023,9 +4090,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const size_t written = llama_tensor_quantize_impl(
                             new_type, params, f32_data_03, bf16_data_03, tensor_scale_03,
                             new_data_03, chunk_size, nrows, n_per_row, imatrix_03,
-                            local_workers, slice_nthread, tensor->name,
-                            nvfp4_cfg_ptr, nvfp4_sample_blocks,
-                            (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) ? &actual_tensor_scale_03 : nullptr);
+	                            local_workers, slice_nthread, tensor->name,
+	                            nvfp4_cfg_ptr, nvfp4_sample_blocks,
+		                            (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) ? &actual_tensor_scale_03 : nullptr,
+		                            nvfp4_tune_tensor_scale_03,
+		                            nvfp4_fixed_tensor_scale_03,
+                                    md.has_k_rsf_mode_override ? md.k_rsf_mode_override : 0);
                     if (new_type == GGML_TYPE_NVFP4 && nvfp4_aux_info != nullptr) {
                         nvfp4_aux_info->scale_values[(size_t) i03] = actual_tensor_scale_03;
                     }
@@ -4193,7 +4263,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.nvfp4_correction_denom      =*/ 0.0f,
         /*.nvfp4_input_scale_policy    =*/ LLAMA_NVFP4_INPUT_SCALE_IMATRIX_RMS,
         /*.assignment_jsonl            =*/ nullptr,
-        /*.nvfp4_autotune_max_blocks   =*/ 0,
+        /*.nvfp4_encoder_max_blocks    =*/ 0,
         /*.mxfp6_input_scale_denom     =*/ 0.0f,
         /*.mxfp6_input_scale_quantile  =*/ 0.0f,
         /*.mxfp6_tensor_scale_sample_blocks =*/ 0,
@@ -4204,8 +4274,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.mixed_format_imatrix_power  =*/ -1.0f,
         /*.mixed_format_imatrix_min    =*/ -1.0f,
         /*.mixed_format_imatrix_max    =*/ -1.0f,
-        /*.q4_k_rsf                    =*/ false,
-        /*.q4_k_rsf_mode               =*/ 0,
+        /*.q4_k_rsf                    =*/ true,
+        /*.q4_k_rsf_mode               =*/ 1,
     };
 
     return result;

@@ -44,6 +44,44 @@ static bool parse_nvfp4_bool_value(const std::string & value) {
     return std::stoi(value) != 0;
 }
 
+static bool tensor_type_is_k_rsf_capable(ggml_type type) {
+    return type == GGML_TYPE_Q2_K ||
+           type == GGML_TYPE_Q3_K ||
+           type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q5_K ||
+           type == GGML_TYPE_Q6_K;
+}
+
+static bool parse_k_rsf_mode_value(const std::string & value, int32_t & out) {
+    if (striequals(value.c_str(), "1") ||
+            striequals(value.c_str(), "scale") ||
+            striequals(value.c_str(), "normal") ||
+            striequals(value.c_str(), "default") ||
+            striequals(value.c_str(), "rsf")) {
+        out = 1;
+        return true;
+    }
+    if (striequals(value.c_str(), "2") || striequals(value.c_str(), "awq")) {
+        out = 2;
+        return true;
+    }
+    if (striequals(value.c_str(), "3") ||
+            striequals(value.c_str(), "sq") ||
+            striequals(value.c_str(), "smooth")) {
+        out = 3;
+        return true;
+    }
+    return false;
+}
+
+static const char * k_rsf_mode_name(int32_t mode) {
+    switch (mode) {
+        case 2: return "awq";
+        case 3: return "sq";
+        default: return "scale";
+    }
+}
+
 struct quant_option {
     std::string name;
     llama_ftype ftype;
@@ -131,7 +169,7 @@ bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, std:
     return false;
 }
 
-bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
+bool ftype_is_mixed_nvfp4_mxfp6(const std::string & ftype_str) {
     return ftype_str == "NVFP4_MXFP6";
 }
 
@@ -139,7 +177,7 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--mtp-tensor-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--patch-base]\n");
-    printf("       [--nvfp4-fast-quantize] [--nvfp4-selector-kld] [--nvfp4-selector-auto-rescue] [--dry-run]\n");
+    printf("       [--mode fast|normal|deep] [--nvfp4-selector-kld] [--nvfp4-selector-auto-rescue] [--dry-run]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -181,7 +219,7 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --patch-base model.gguf\n");
     printf("                                      reuse unchanged tensor bytes from an existing quantized GGUF.\n");
     printf("                                      useful for surgical tensor rescues without a full requantization pass.\n");
-    printf("  --nvfp4-cfg NVFP4{choose46=...,refit=...,compand=...,cap6=...,cap4=...,rsf=0|1,rsf_depth=...}\n");
+    printf("  --nvfp4-cfg NVFP4{choose46=...,refit=...,compand=...,cap6=...,cap4=...,rsf_depth=...}\n");
     printf("                                      set the global NVFP4 CUDA encoder policy directly.\n");
     printf("  --nvfp4-preset name\n");
     printf("                                      set a named global NVFP4 encoder policy, e.g. baseline or asym_tail.\n");
@@ -190,18 +228,16 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("  --nvfp4-input-scale-policy name\n");
     printf("                                      set NVFP4 input scale policy: imatrix-rms, identity, imatrix-sqrtmax,\n");
     printf("                                      imatrix-sqrtp99, imatrix-sqrtp999.\n");
-    printf("  --nvfp4-autotune-max-blocks N / --nvfp4-autotune-threads N\n");
-    printf("                                      set CUDA NVFP4 encoder autotune sample cap and worker count.\n");
-    printf("  --nvfp4-fast-quantize\n");
-    printf("                                      use the default full-KLD exhaustive NVFP4 RSF selector/autotune budget.\n");
-    printf("  --nvfp4-selector-rsf-mode tensor|slice|expert|group / --nvfp4-selector-rsf-depth normal|deep|deeper|exhaustive / --nvfp4-selector-no-rsf\n");
-    printf("                                      set refined scale fit (RSF) granularity/search depth, or disable default RSF selector variants for diagnostics.\n");
+    printf("  --nvfp4-encoder-max-blocks N / --nvfp4-encoder-threads N\n");
+    printf("                                      set CUDA NVFP4 encoder sample cap and worker count.\n");
+    printf("  --mode fast|normal|deep\n");
+    printf("                                      choose quantizer work mode; required for saved-logit selector runs.\n");
+    printf("  --nvfp4-selector-rsf-mode tensor|slice|expert|group / --nvfp4-selector-rsf-depth normal|deep|deeper|exhaustive\n");
+    printf("                                      set refined scale fit (RSF) granularity/search depth.\n");
     printf("  --nvfp4-selector-rsf-report file.txt\n");
     printf("                                      write the RSF policy summary, tensor rows, and scale-multiplier histograms.\n");
     printf("  --nvfp4-selector-tensor-policy-map / --nvfp4-selector-no-tensor-policy-map\n");
-    printf("                                      allow guarded per-tensor policy selection after whole-model ranking.\n");
-    printf("  --nvfp4-selector-tensor-policy-map-max N\n");
-    printf("                                      cap per-tensor policy switches; default: 128, 0 disables switches.\n");
+    printf("                                      allow first-pass per-tensor NVFP4 policy planning; enabled by default.\n");
     printf("  --mxfp6_e2m3-tensor-scale on|off\n");
     printf("                                      write MXFP6_E2M3 tensor correction scales. default: on.\n");
     printf("                                      WARNING: MXFP6_E2M3 is experimental and unsupported by NVIDIA/llama.cpp.\n");
@@ -234,12 +270,6 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      enables true KLD/PPL ranking for the selected KLD subset.\n");
     printf("  --nvfp4-selector-ledger file.jsonl\n");
     printf("                                      append raw selector evidence rows to a JSONL ledger.\n");
-    printf("  --nvfp4-selector-search mode / --nvfp4-selector-local-top-k N\n");
-    printf("                                      enable ledger/planner search controls for tensor-local policy reuse.\n");
-    printf("  --nvfp4-selector-group-units mode / --nvfp4-selector-beam-width N / --nvfp4-selector-exact-budget N|auto|off\n");
-    printf("                                      shape fused tensor-unit planning and exact guard budget.\n");
-    printf("  --nvfp4-selector-delta-mode mode\n");
-    printf("                                      record the planner delta mode used for evidence and reports.\n");
     printf("  --nvfp4-selector-checkpoint-model model.gguf\n");
     printf("                                      existing quantized checkpoint used by candidate search instead of creating one.\n");
     printf("  --nvfp4-selector-cache-dir dir / --nvfp4-selector-keep-checkpoint\n");
@@ -250,10 +280,6 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      if file appears during selector tuning, use the best available policy.\n");
     printf("  --nvfp4-selector-skip-remaining\n");
     printf("                                      skip optional selector tuning now and use the best available policy.\n");
-    printf("  --nvfp4-selector-chunks N / --nvfp4-selector-chunk-start N\n");
-    printf("                                      KLD chunks used for the selector search. defaults: 32 chunks from 0.\n");
-    printf("  --nvfp4-selector-holdout-chunks N / --nvfp4-selector-holdout-start N\n");
-    printf("                                      independent KLD holdout chunks for selector ranking. defaults: 16 after search chunks.\n");
     printf("  --nvfp4-selector-stagea-sample-blocks N\n");
     printf("                                      NVFP4 blocks sampled per tensor during coarse selector policy ranking.\n");
     printf("  --nvfp4-selector-stagea-max-policies N\n");
@@ -284,17 +310,17 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      run selector analysis and exit without writing a final model.\n");
     printf("  --nvfp4-selector-candidate-type T / --nvfp4-selector-candidate-types A,B\n");
     printf("                                      main-path tensor type candidates for high-error NVFP4 tensors.\n");
-    printf("                                      defaults with --nvfp4-fast-quantize: Q4_K,Q6_K,Q8_0; mixed adds MXFP6_E2M3 first.\n");
+    printf("                                      defaults with saved-logit KLD selector: Q5_0,Q4_K,Q5_K,Q6_K,Q8_0; mixed adds MXFP6_E2M3 first.\n");
     printf("  --nvfp4-selector-candidate-fraction F / --nvfp4-selector-candidate-top N\n");
     printf("                                      cap type candidates to the worst NVFP4-error tensor fraction or exact count.\n");
     printf("  --nvfp4-selector-candidate-budget-mb N / --nvfp4-selector-candidate-class-limit N\n");
     printf("                                      cap extra size and per-class use for main-path type candidates.\n");
     printf("  --nvfp4-selector-candidate-report file.csv / --nvfp4-selector-candidate-tensor-types file.txt\n");
     printf("                                      write main-path candidate ranking and final exact tensor-type map.\n");
-    printf("  --nvfp4-selector-eval-top N / --nvfp4-selector-eval-chunks N\n");
-    printf("                                      number of policies/chunks used for KLD full PPL/KLD evaluation. defaults: 16/32.\n");
+    printf("  --nvfp4-selector-eval-top N\n");
+    printf("                                      number of policies used for full-base KLD/PPL evaluation. default: 16.\n");
     printf("  --nvfp4-selector-n-seq N\n");
-    printf("                                      sequence count used during selector KLD full PPL/KLD evaluation. default: 2.\n");
+    printf("                                      override selector KLD sequence count. default: auto from free CUDA memory.\n");
     printf("  --nvfp4-selector-eval-batch N\n");
     printf("                                      token batch size used during selector KLD eval; values below ctx exercise multi-batch KLD.\n");
     printf("  --nvfp4-selector-n-gpu-layers N\n");
@@ -305,8 +331,6 @@ bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str) {
     printf("                                      limit exact what-if sensitivity probes by count or layer.\n");
     printf("  --nvfp4-selector-sensitivity-tensor text\n");
     printf("                                      only probe tensors whose name contains text.\n");
-    printf("  --nvfp4-selector-rescue-type ggml_type\n");
-    printf("                                      legacy repair alias for a single candidate type. Prefer --nvfp4-selector-candidate-types.\n");
     printf("  --nvfp4-selector-rescue-top N\n");
     printf("                                      maximum exact tensor rescue overrides to apply.\n");
     printf("  --nvfp4-selector-rescue-nvfp4-top N / --nvfp4-selector-rescue-report-top N\n");
@@ -515,6 +539,59 @@ bool parse_tensor_type_nvfp4_cfg(const std::string & spec, tensor_type_option & 
     return true;
 }
 
+static bool parse_tensor_type_k_rsf_cfg(const std::string & spec, tensor_type_option & out) {
+    const size_t open = spec.find('{');
+    if (open == std::string::npos || spec.empty() || spec.back() != '}') {
+        return false;
+    }
+
+    const std::string type_name = trim_copy(spec.substr(0, open));
+    const ggml_type type = parse_ggml_type(type_name.c_str());
+    if (!tensor_type_is_k_rsf_capable(type)) {
+        return false;
+    }
+
+    out.type = type;
+    out.has_k_rsf_mode = true;
+    out.k_rsf_mode = 1;
+
+    const std::string body = spec.substr(open + 1, spec.size() - open - 2);
+    std::stringstream ss(body);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        token = trim_copy(token);
+        if (token.empty()) {
+            continue;
+        }
+        const size_t eq = token.find('=');
+        if (eq == std::string::npos) {
+            fprintf(stderr, "%s: malformed K-RSF tensor override token '%s'\n", __func__, token.c_str());
+            return false;
+        }
+        const std::string key = trim_copy(token.substr(0, eq));
+        const std::string value = trim_copy(token.substr(eq + 1));
+        if (key.empty() || value.empty()) {
+            fprintf(stderr, "%s: malformed K-RSF tensor override token '%s'\n", __func__, token.c_str());
+            return false;
+        }
+        if (striequals(key.c_str(), "rsf") ||
+                striequals(key.c_str(), "k_rsf") ||
+                striequals(key.c_str(), "k-rsf") ||
+                striequals(key.c_str(), "mode") ||
+                striequals(key.c_str(), "scale_fit")) {
+            if (!parse_k_rsf_mode_value(value, out.k_rsf_mode)) {
+                fprintf(stderr, "%s: invalid K-RSF mode '%s'\n", __func__, value.c_str());
+                return false;
+            }
+        } else {
+            fprintf(stderr, "%s: unknown K-RSF tensor override key '%s'\n", __func__, key.c_str());
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool parse_tensor_type_mxfp6_cfg(const std::string & spec, tensor_type_option & out) {
     static constexpr const char * prefix = "MXFP6_E2M3{";
     static constexpr size_t prefix_len = 11;
@@ -684,6 +761,11 @@ std::string format_tensor_type_value(const tensor_type_option & opt) {
         os << "}";
         return os.str();
     }
+    if (tensor_type_is_k_rsf_capable(opt.type) && opt.has_k_rsf_mode && opt.k_rsf_mode > 0) {
+        std::ostringstream os;
+        os << ggml_type_name(opt.type) << "{rsf=" << k_rsf_mode_name(opt.k_rsf_mode) << "}";
+        return os.str();
+    }
     return ggml_type_name(opt.type);
 }
 
@@ -712,6 +794,7 @@ bool parse_tensor_type(const char * data, std::vector<tensor_type_option> & tens
     tensor_type_option tensor_type_opt;
     tensor_type_opt.name = tn;
     if (!parse_tensor_type_nvfp4_cfg(sep, tensor_type_opt) &&
+        !parse_tensor_type_k_rsf_cfg(sep, tensor_type_opt) &&
         !parse_tensor_type_mxfp6_cfg(sep, tensor_type_opt)) {
         tensor_type_opt.type = parse_ggml_type(sep);
     }

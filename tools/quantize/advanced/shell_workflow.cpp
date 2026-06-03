@@ -316,19 +316,10 @@ std::vector<std::string> shell_preflight_errors(const ShellState & state) {
         if (!info.valid) {
             errors.push_back("KLD input file is not a valid logits/KLD file: " + kld + " (" + format_kld_info(info) + ")");
         } else if (!info.complete) {
-            const int chunk_start = std::max(0, parse_int_or_default(recipe.selector.chunk_start, 0));
-            const int requested_chunks = std::max({
-                1,
-                parse_int_or_default(recipe.selector.chunks, 1),
-                parse_int_or_default(recipe.selector.eval_chunks, 1),
-                parse_int_or_default(recipe.selector.holdout_chunks, 0),
-            });
-            if (chunk_start + requested_chunks > info.available_chunks) {
-                errors.push_back("KLD base is incomplete and selected chunks exceed the available prefix: " + format_kld_info(info));
-            }
+            errors.push_back("KLD base is incomplete; selector evaluation requires the full saved-logit base: " + format_kld_info(info));
         }
     }
-    if ((!recipe.selector.eval_top.empty() || !recipe.selector.eval_chunks.empty()) && kld.empty()) {
+    if (!recipe.selector.eval_top.empty() && kld.empty()) {
         errors.push_back("PPL/KLD candidate evaluation needs a KLD base file");
     }
     if (recipe.evaluation.kld_mode == "bundle" && recipe.evaluation.bundle.empty()) {
@@ -359,10 +350,10 @@ std::vector<tui::MenuOption> shell_project_menu_options(const ShellState & state
         (std::filesystem::exists(state.recipe.calibration.imatrix) ||
          (!state.recipe.calibration.corpus.empty() &&
           (!state.recipe.evaluation.bf16_reference.empty() || !state.input_model.empty())));
-    const bool kld_ready = !state.recipe.autotune.require_kld || kld_planned;
-    const bool imatrix_ready = !state.recipe.autotune.require_imatrix || imatrix_planned;
+    const bool kld_ready = !state.recipe.quantizer.require_kld || kld_planned;
+    const bool imatrix_ready = !state.recipe.quantizer.require_imatrix || imatrix_planned;
     const bool quality_ready = kld_ready && imatrix_ready;
-    const std::string quality_note = !state.recipe.autotune.require_kld && !state.recipe.autotune.require_imatrix ?
+    const std::string quality_note = !state.recipe.quantizer.require_kld && !state.recipe.quantizer.require_imatrix ?
         "not required for current effort" :
         (kld.empty() ? "KLD not selected" : display_path(kld));
 
@@ -371,7 +362,7 @@ std::vector<tui::MenuOption> shell_project_menu_options(const ShellState & state
         { step("Choose quant type", quant_ready),
             state.recipe.target.precision_mode + (recipe_uses_mxfp6(state.recipe) ? " / MXFP6 experimental" : ""),
             "quant" },
-        { step("Choose options", true), state.recipe.autotune.mode + " / " + state.recipe.selector.effort, "options" },
+        { step("Choose options", true), state.recipe.quantizer.mode + " / " + state.recipe.selector.effort, "options" },
         { step("Choose quality inputs", quality_ready), quality_note, "quality" },
         { step("Review and start pipeline", shell_ready_to_quantize(state)), "", "start" },
     };
@@ -426,7 +417,7 @@ std::vector<tui::MenuOption> shell_options_menu_options(const ShellState & state
         { step("Set target BPW / VRAM", has_target_budget), "", "budget" },
     };
     if (uses_nvfp4) {
-        options.push_back({ step("NVFP4 4/6 and autotune", nvfp4_ready), "", "nvfp4" });
+        options.push_back({ step("NVFP4 4/6 policy", nvfp4_ready), "", "nvfp4" });
     }
     options.push_back({ step("Native candidate search", native_ready), "", "candidate-search" });
     options.push_back({ step("PPL/KLD scoring gates", gates_ready), "", "gates" });

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // Parsed tensor override passed from the CLI front-end into the quantizer core.
 struct tensor_type_option {
@@ -20,6 +21,10 @@ struct tensor_type_option {
     };
     int64_t nvfp4_sample_blocks = 0;
     std::string nvfp4_policy_name;
+    std::vector<float> nvfp4_base_scale_overrides;
+    std::vector<float> nvfp4_scale_overrides;
+    bool has_k_rsf_mode = false;
+    int32_t k_rsf_mode = 0;
     bool has_mxfp6_scale_mul = false;
     float mxfp6_e2m3_scale_mul = 1.0f;
     std::string mxfp6_policy_name;

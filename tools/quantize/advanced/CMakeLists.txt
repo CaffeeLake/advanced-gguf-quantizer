@@ -15,7 +15,7 @@ add_executable(${TARGET}
     utils.cpp
 )
 
-target_link_libraries(${TARGET} PRIVATE llama-quantize-impl)
+target_link_libraries(${TARGET} PRIVATE llama-quantize-impl llama-perplexity-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 if(LLAMA_TOOLS_INSTALL)

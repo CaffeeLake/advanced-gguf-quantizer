@@ -11,6 +11,7 @@
 #include "terminal_ui.h"
 #include "tui.h"
 #include "utils.h"
+#include "log.h"
 #include "../../../src/llama-quant.h"
 #include "quantize-selector-ledger.h"
 
@@ -34,6 +35,13 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+int llama_perplexity(int argc, char ** argv);
 
 namespace {
 
@@ -106,7 +114,7 @@ static void usage() {
         "  advanced-gguf-quantizer project add-candidates <project.bwqproj> <manifest.jsonl>\n"
         "  advanced-gguf-quantizer project record-metrics <project.bwqproj> --variant ID --json '{...}'\n"
         "  advanced-gguf-quantizer project export-metrics <project.bwqproj> [--output metrics.jsonl]\n"
-        "  advanced-gguf-quantizer size --params-b N [--mode NVFP4|MXFP6|NVFP4_MXFP6] [--vram-gb N] [--ram-gb N]\n"
+        "  advanced-gguf-quantizer size --params-b N [--precision-mode NVFP4|MXFP6|NVFP4_MXFP6] [--vram-gb N] [--ram-gb N]\n"
         "  advanced-gguf-quantizer run <recipe.toml> [--yes] [--project project] [--variant id] [--set path=value...]\n"
         "  advanced-gguf-quantizer shell\n"
         "  advanced-gguf-quantizer wizard [--output recipe.toml] [--run] [--yes]\n\n"
@@ -321,7 +329,7 @@ static std::string pipeline_stage_json(const bq::Recipe & recipe) {
     const bool has_kld = !recipe.selector.kld.empty() || !recipe.evaluation.kld_base.empty();
     out << "["
         << "{\"name\":\"probe\",\"status\":\"enabled\",\"detail\":\"GGUF inspect and model-profile validation\"},"
-        << "{\"name\":\"candidate_search\",\"status\":\"" << (recipe.autotune.enabled ? "enabled" : "disabled")
+        << "{\"name\":\"candidate_search\",\"status\":\"" << (recipe.quantizer.enabled ? "enabled" : "disabled")
         << "\",\"detail\":\"proxy policy survey and non-dominated shortlist\"},"
         << "{\"name\":\"measured_ppl_kld_eval\",\"status\":\"" << (has_kld ? "enabled" : "missing-input")
         << "\",\"detail\":\"saved-logit PPL/KLD measured ranking\"},"
@@ -382,15 +390,9 @@ static void write_assignment_jsonl(
             << ",\"file_bytes\":" << output->file_bytes;
     }
     out << "}\n";
-    out << "{\"schema\":\"advanced-gguf-quantizer-assignment-v1\",\"event\":\"selector_planner\""
-        << ",\"evidence_ledger\":\"" << json_escape(recipe.selector.ledger) << "\""
-        << ",\"search\":\"" << json_escape(recipe.selector.search) << "\""
-        << ",\"local_top_k\":\"" << json_escape(recipe.selector.local_top_k) << "\""
-        << ",\"group_units\":\"" << json_escape(recipe.selector.group_units) << "\""
-        << ",\"beam_width\":\"" << json_escape(recipe.selector.beam_width) << "\""
-        << ",\"exact_budget\":\"" << json_escape(recipe.selector.exact_budget) << "\""
-        << ",\"delta_mode\":\"" << json_escape(recipe.selector.delta_mode) << "\""
-        << ",\"note\":\"ledger planner estimates are not release evidence; exact PPL/KLD gates still apply\"}\n";
+    out << "{\"schema\":\"advanced-gguf-quantizer-assignment-v1\",\"event\":\"selector_evidence\""
+        << ",\"selector_ledger\":\"" << json_escape(recipe.selector.ledger) << "\""
+        << ",\"note\":\"exact PPL/KLD gates and final artifact evaluation are release evidence\"}\n";
     out << "{\"schema\":\"advanced-gguf-quantizer-assignment-v1\",\"event\":\"fused_decision_units\""
         << ",\"units\":[\"qkv\",\"gate_up\",\"expert_pairs\",\"mtp_heads\",\"lm_head_and_embeddings\"]"
         << ",\"policy\":\"record groups as coherent layer decisions before per-tensor overrides\"}\n";
@@ -404,6 +406,254 @@ static void write_assignment_jsonl(
         << "}\n";
 }
 
+struct FinalQualityEvidence {
+    bool attempted = false;
+    bool available = false;
+    int rc = -1;
+    std::string reason;
+    std::string command;
+    std::string log_path;
+    std::string summary_block;
+    std::vector<std::pair<std::string, std::string>> summary_values;
+};
+
+static std::string trim_copy_local(std::string value) {
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+static std::string read_text_file_or_empty(const std::filesystem::path & path) {
+    std::ifstream in(path);
+    if (!in) {
+        return {};
+    }
+    std::ostringstream out;
+    out << in.rdbuf();
+    return out.str();
+}
+
+static std::string value_after_metric_label(const std::string & line, const std::string & label) {
+    const size_t pos = line.find(label);
+    if (pos == std::string::npos) {
+        return {};
+    }
+    const size_t colon = line.find(':', pos + label.size());
+    if (colon == std::string::npos) {
+        return {};
+    }
+    return trim_copy_local(line.substr(colon + 1));
+}
+
+static void add_metric_value_if_found(
+        std::vector<std::pair<std::string, std::string>> & values,
+        const std::string & line,
+        const std::string & label,
+        const std::string & display) {
+    const std::string value = value_after_metric_label(line, label);
+    if (!value.empty()) {
+        values.emplace_back(display, value);
+    }
+}
+
+static void parse_final_quality_log(FinalQualityEvidence & evidence) {
+    const std::string text = read_text_file_or_empty(evidence.log_path);
+    if (text.empty()) {
+        return;
+    }
+
+    std::istringstream in(text);
+    std::string line;
+    bool in_summary = false;
+    std::ostringstream summary;
+    while (std::getline(in, line)) {
+        if (line.find("====== Perplexity statistics ======") != std::string::npos) {
+            in_summary = true;
+        }
+        if (in_summary) {
+            summary << line << '\n';
+        }
+
+        add_metric_value_if_found(evidence.summary_values, line, "Mean PPL(Q)", "Mean PPL(Q)");
+        add_metric_value_if_found(evidence.summary_values, line, "Mean PPL(base)", "Mean PPL(base)");
+        add_metric_value_if_found(evidence.summary_values, line, "Mean ln(PPL(Q)/PPL(base))", "Mean ln(PPL ratio)");
+        add_metric_value_if_found(evidence.summary_values, line, "Mean PPL(Q)/PPL(base)", "Mean PPL ratio");
+        add_metric_value_if_found(evidence.summary_values, line, "Mean PPL(Q)-PPL(base)", "Mean PPL delta");
+        add_metric_value_if_found(evidence.summary_values, line, "Mean    KLD", "Mean KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "Maximum KLD", "Maximum KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "99.9%   KLD", "99.9% KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "99.0%   KLD", "99.0% KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "95.0%   KLD", "95.0% KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "90.0%   KLD", "90.0% KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "Median  KLD", "Median KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "Minimum KLD", "Minimum KLD");
+        add_metric_value_if_found(evidence.summary_values, line, "RMS ", "RMS probability delta");
+        add_metric_value_if_found(evidence.summary_values, line, "Same top p", "Same top probability");
+        add_metric_value_if_found(evidence.summary_values, line, "Top flip weight", "Top flip weight");
+        add_metric_value_if_found(evidence.summary_values, line, "Top prob RMSE", "Top probability RMSE");
+        add_metric_value_if_found(evidence.summary_values, line, "Entropy RMSE", "Entropy RMSE");
+
+        if (in_summary && line.find("Entropy RMSE") != std::string::npos) {
+            in_summary = false;
+        }
+    }
+    evidence.summary_block = summary.str();
+    evidence.available = evidence.rc == 0 && !evidence.summary_block.empty();
+}
+
+#ifndef _WIN32
+class ScopedOutputRedirect {
+public:
+    explicit ScopedOutputRedirect(const std::filesystem::path & path) {
+        fflush(stdout);
+        fflush(stderr);
+        fd_ = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        if (fd_ < 0) {
+            return;
+        }
+        stdout_fd_ = dup(STDOUT_FILENO);
+        stderr_fd_ = dup(STDERR_FILENO);
+        if (stdout_fd_ < 0 || stderr_fd_ < 0) {
+            restore();
+            return;
+        }
+        if (dup2(fd_, STDOUT_FILENO) < 0 || dup2(fd_, STDERR_FILENO) < 0) {
+            restore();
+            return;
+        }
+        active_ = true;
+    }
+
+    ScopedOutputRedirect(const ScopedOutputRedirect &) = delete;
+    ScopedOutputRedirect & operator=(const ScopedOutputRedirect &) = delete;
+
+    ~ScopedOutputRedirect() {
+        restore();
+    }
+
+    bool active() const {
+        return active_;
+    }
+
+    void restore() {
+        if (active_) {
+            fflush(stdout);
+            fflush(stderr);
+            if (stdout_fd_ >= 0) {
+                dup2(stdout_fd_, STDOUT_FILENO);
+            }
+            if (stderr_fd_ >= 0) {
+                dup2(stderr_fd_, STDERR_FILENO);
+            }
+        }
+        if (stdout_fd_ >= 0) {
+            close(stdout_fd_);
+            stdout_fd_ = -1;
+        }
+        if (stderr_fd_ >= 0) {
+            close(stderr_fd_);
+            stderr_fd_ = -1;
+        }
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+        active_ = false;
+    }
+
+private:
+    int fd_ = -1;
+    int stdout_fd_ = -1;
+    int stderr_fd_ = -1;
+    bool active_ = false;
+};
+#endif
+
+static int call_llama_perplexity_logged(
+        const std::vector<std::string> & args,
+        const std::filesystem::path & log_path) {
+    std::vector<std::string> owned_args = args;
+    std::vector<char *> argv;
+    argv.reserve(owned_args.size());
+    for (std::string & arg : owned_args) {
+        argv.push_back(arg.data());
+    }
+
+#ifndef _WIN32
+    ScopedOutputRedirect redirect(log_path);
+    if (!redirect.active()) {
+        return 1;
+    }
+#else
+    (void) log_path;
+#endif
+    const int rc = llama_perplexity((int) argv.size(), argv.data());
+    common_log_flush(common_log_main());
+    return rc;
+}
+
+static FinalQualityEvidence run_final_quality_eval(
+        const bq::Recipe & recipe,
+        const bq::QuantizeRunPlan & plan,
+        const std::filesystem::path & run_dir) {
+    FinalQualityEvidence evidence;
+    const std::string kld = !recipe.evaluation.kld_base.empty() ? recipe.evaluation.kld_base : recipe.selector.kld;
+    if (plan.output.empty()) {
+        evidence.reason = "no output model";
+        return evidence;
+    }
+    if (recipe.evaluation.corpus.empty()) {
+        evidence.reason = "evaluation.corpus is not set";
+        return evidence;
+    }
+    if (kld.empty()) {
+        evidence.reason = "evaluation.kld_base/selector.kld is not set";
+        return evidence;
+    }
+
+    const KldBaseInfo info = read_kld_base_info(kld);
+    if (!info.valid) {
+        evidence.reason = "KLD base is invalid: " + format_kld_info(info);
+        return evidence;
+    }
+    if (!info.complete) {
+        evidence.reason = "KLD base is incomplete: " + format_kld_info(info);
+        return evidence;
+    }
+
+    const int threads = recipe.base.threads > 0 ? recipe.base.threads : default_worker_threads();
+    const int ctx = info.n_ctx > 0 ? info.n_ctx : 512;
+    const int batch = std::max(2048, ctx);
+    const int ubatch = std::min(batch, std::max(512, ctx));
+    evidence.log_path = (run_dir / "final-ppl-kld.log").string();
+    std::vector<std::string> args = {
+        recipe.evaluation.perplexity_bin.empty() ? "llama-perplexity" : recipe.evaluation.perplexity_bin,
+        "-m", plan.output,
+        "-f", recipe.evaluation.corpus,
+        "-c", std::to_string(ctx),
+        "-b", std::to_string(batch),
+        "-ub", std::to_string(ubatch),
+        "-np", std::to_string(std::max(1, batch / std::max(1, ctx))),
+        "-t", std::to_string(threads),
+        "-tb", std::to_string(threads),
+        "-ngl", "9999",
+        "--kl-divergence",
+        "--kl-divergence-base", kld,
+        "--log-colors", "off",
+        "--no-log-prefix",
+        "--no-log-timestamps",
+    };
+    evidence.attempted = true;
+    evidence.command = shellish_args(args);
+    evidence.rc = call_llama_perplexity_logged(args, evidence.log_path);
+    parse_final_quality_log(evidence);
+    if (!evidence.available && evidence.reason.empty()) {
+        evidence.reason = evidence.rc == 0 ? "final evaluator did not produce a summary block" : "final evaluator failed";
+    }
+    return evidence;
+}
+
 static void write_run_manifest_and_report(
         const bq::Recipe & recipe,
         const bq::QuantizeRunPlan & plan,
@@ -411,6 +661,7 @@ static void write_run_manifest_and_report(
         const RunKey & key,
         const bq::InspectSummary * input,
         const bq::InspectSummary * output,
+        const FinalQualityEvidence * final_quality,
         int rc) {
     write_assignment_jsonl(recipe, plan, run_dir, output);
 
@@ -427,6 +678,9 @@ static void write_run_manifest_and_report(
     manifest << "    \"run_log\": \"" << json_escape((run_dir / "run.jsonl").string()) << "\",\n";
     manifest << "    \"assignment\": \"" << json_escape((run_dir / "assignment.jsonl").string()) << "\",\n";
     manifest << "    \"report\": \"" << json_escape((run_dir / "quantization-report.md").string()) << "\",\n";
+    if (final_quality != nullptr && final_quality->attempted) {
+        manifest << "    \"final_ppl_kld_log\": \"" << json_escape(final_quality->log_path) << "\",\n";
+    }
     manifest << "    \"checkpoint_key\": \"" << json_escape((run_dir / "checkpoint-key.json").string()) << "\",\n";
     manifest << "    \"validation_smoke\": \"" << json_escape((run_dir / "validate-output-smoke.sh").string()) << "\"\n";
     manifest << "  },\n";
@@ -459,6 +713,27 @@ static void write_run_manifest_and_report(
                << "`, MXFP6_E2M3: `" << output->mxfp6_tensors << "`, scale tensors: `"
                << output->scale_tensors << "`, input scales: `" << output->input_scale_tensors << "`\n";
     }
+    report << "\n## Final PPL/KLD\n\n";
+    if (final_quality != nullptr && final_quality->attempted) {
+        report << "- Command: `" << final_quality->command << "`\n";
+        report << "- Return code: `" << final_quality->rc << "`\n";
+        report << "- Raw output: `" << final_quality->log_path << "`\n";
+        if (final_quality->available) {
+            report << "\n| Metric | Value |\n";
+            report << "| --- | --- |\n";
+            for (const auto & item : final_quality->summary_values) {
+                report << "| " << item.first << " | `" << item.second << "` |\n";
+            }
+            report << "\n```text\n" << final_quality->summary_block << "```\n\n";
+        } else {
+            report << "- Result: unavailable (" << final_quality->reason << ")\n\n";
+        }
+    } else {
+        const std::string reason = final_quality != nullptr && !final_quality->reason.empty()
+            ? final_quality->reason
+            : "evaluation.corpus and evaluation.kld_base/selector.kld are required";
+        report << "- Result: unavailable (" << reason << ")\n\n";
+    }
     report << "\n## Tail Gates\n\n";
     report << "- p99 penalty: `" << recipe.selector.ranking.p99_penalty << "`, hard gate: `"
            << (recipe.selector.ranking.p99_hard_gate ? "on" : "off") << "`, threshold: `"
@@ -466,15 +741,9 @@ static void write_run_manifest_and_report(
     report << "- p999 penalty: `" << recipe.selector.ranking.p999_penalty << "`, hard gate: `"
            << (recipe.selector.ranking.p999_hard_gate ? "on" : "off") << "`, threshold: `"
            << (recipe.selector.ranking.p999_threshold.empty() ? "baseline" : recipe.selector.ranking.p999_threshold) << "`\n\n";
-    report << "## Selector Planner\n\n";
+    report << "## Selector Evidence\n\n";
     report << "- Evidence ledger: `" << (recipe.selector.ledger.empty() ? "disabled" : recipe.selector.ledger) << "`\n";
-    report << "- Search: `" << (recipe.selector.search.empty() ? "legacy" : recipe.selector.search)
-           << "`, local top-k: `" << recipe.selector.local_top_k
-           << "`, group units: `" << recipe.selector.group_units << "`\n";
-    report << "- Beam width: `" << recipe.selector.beam_width
-           << "`, exact budget: `" << recipe.selector.exact_budget
-           << "`, delta mode: `" << recipe.selector.delta_mode << "`\n";
-    report << "- Planner estimates are for search only; release evidence still comes from exact PPL/KLD gates and final artifact evaluation.\n\n";
+    report << "- Exact PPL/KLD gates and final artifact evaluation are release evidence.\n\n";
     report << "## Keys\n\n";
     report << "- Source: `" << key.source.hash64 << "` (" << key.source.mode << ", " << key.source.bytes << " bytes)\n";
     report << "- Imatrix: `" << key.imatrix.hash64 << "` (" << key.imatrix.mode << ", " << key.imatrix.bytes << " bytes)\n";
@@ -502,61 +771,25 @@ static size_t rendered_line_count(const std::string & text) {
 }
 static void print_project_summary_clean(const std::string & path, std::ostream & out);
 
-static bool selector_looks_like_full_quality(const bq::Recipe & recipe) {
-    return recipe.autotune.enabled &&
-        recipe.autotune.mode == "quality" &&
-        recipe.autotune.evidence == "real-ppl-kld" &&
-        (recipe.selector.effort.empty() || recipe.selector.effort == "full-best");
-}
-
 static void apply_selector_kld_evidence_defaults(bq::Recipe & recipe) {
-    const bool auto_search = string_is_auto(recipe.selector.chunks);
-    const bool auto_holdout = string_is_auto(recipe.selector.holdout_chunks);
-    const bool auto_eval = string_is_auto(recipe.selector.eval_chunks);
-    if (!auto_search && !auto_holdout && !auto_eval) {
-        return;
-    }
-
-    const std::string kld = !recipe.selector.kld.empty() ? recipe.selector.kld : recipe.evaluation.kld_base;
-    if (kld.empty() || !selector_looks_like_full_quality(recipe)) {
-        return;
-    }
-
-    const KldBaseInfo info = read_kld_base_info(kld);
-    if (!info.valid || info.available_chunks <= 0) {
-        return;
-    }
-
-    const int total = info.available_chunks;
-
-    if (auto_search) {
-        recipe.selector.chunk_start = string_is_auto(recipe.selector.chunk_start) ? "0" : recipe.selector.chunk_start;
-        recipe.selector.chunks = std::to_string(total);
-    }
-    if (auto_holdout) {
-        recipe.selector.holdout_chunks = "0";
-        recipe.selector.holdout_start.clear();
-    }
-    if (auto_eval) {
-        recipe.selector.eval_chunks = std::to_string(total);
-    }
+    (void) recipe;
 }
 
 static void apply_search_effort_preset(bq::Recipe & recipe, const std::string & effort) {
-    const bool diagnostic = effort == "diagnostic";
-    const bool fast = effort == "fast" || effort == "fast-minimal" || effort == "minimal";
-    recipe.autotune.enabled = true;
-    recipe.autotune.mode = diagnostic ? "diagnostic" : (fast ? "fast" : (effort == "balanced" || effort == "real-best" ? "balanced" : "quality"));
-    recipe.autotune.objective = "kld-first";
-    recipe.autotune.evidence = "real-ppl-kld";
-    recipe.autotune.require_kld = !fast;
-    recipe.autotune.require_corpus = !fast;
-    recipe.autotune.require_imatrix = !fast;
-    recipe.autotune.allow_diagnostic = diagnostic;
+    const bool fast = effort == "fast";
+    const bool normal = effort == "normal";
+    recipe.quantizer.enabled = true;
+    recipe.quantizer.mode = fast ? "fast" : (normal ? "normal" : "deep");
+    recipe.quantizer.objective = "kld-first";
+    recipe.quantizer.evidence = "real-ppl-kld";
+    recipe.quantizer.require_kld = !fast;
+    recipe.quantizer.require_corpus = !fast;
+    recipe.quantizer.require_imatrix = !fast;
+    recipe.quantizer.allow_diagnostic = false;
     const std::string threads = std::to_string(default_worker_threads());
     set_if_empty(recipe.selector.kld, recipe.evaluation.kld_base);
     recipe.base.threads = recipe.base.threads > 0 ? recipe.base.threads : default_worker_threads();
-    set_if_empty(recipe.nvfp4.autotune.threads, threads);
+    set_if_empty(recipe.nvfp4.encoder.threads, threads);
     set_if_empty(recipe.selector.kld_threads, threads);
     recipe.selector.keep_checkpoint = true;
     recipe.selector.require_runtime_cache = !fast;
@@ -565,7 +798,7 @@ static void apply_search_effort_preset(bq::Recipe & recipe, const std::string & 
     }
     recipe.stock_ftype.sweep_tensor_policy = true;
     recipe.stock_ftype.sweep_sensitive_tensors = true;
-    if (fast || effort == "balanced" || effort == "real-best") {
+    if (fast || normal) {
         recipe.selector.ranking.kld_penalty = "4.0";
         recipe.selector.ranking.p99_penalty = "1.5";
         recipe.selector.ranking.p999_penalty = "0.75";
@@ -585,7 +818,7 @@ static void apply_search_effort_preset(bq::Recipe & recipe, const std::string & 
         recipe.selector.ranking.max_kld_hard_gate = false;
     }
     set_if_empty(recipe.mxfp6.min_savings_bytes, "2097152");
-    bq::apply_master_autotune(recipe);
+    bq::apply_quantizer_mode(recipe);
 }
 
 static void apply_execution_defaults(bq::Recipe & recipe) {
@@ -595,10 +828,10 @@ static void apply_execution_defaults(bq::Recipe & recipe) {
         recipe.base.threads = threads;
     }
     set_if_empty(recipe.selector.kld, recipe.evaluation.kld_base);
-    set_if_empty(recipe.nvfp4.autotune.threads, thread_text);
+    set_if_empty(recipe.nvfp4.encoder.threads, thread_text);
     set_if_empty(recipe.selector.kld_threads, thread_text);
-    if (recipe.autotune.enabled) {
-        bq::apply_master_autotune(recipe);
+    if (recipe.quantizer.enabled) {
+        bq::apply_quantizer_mode(recipe);
     }
     apply_selector_kld_evidence_defaults(recipe);
 }
@@ -643,33 +876,6 @@ static std::vector<std::string> recipe_file_preflight_errors(const bq::Recipe & 
         errors.push_back("KLD base is not a valid logits/KLD file: " + kld + " (" + format_kld_info(info) + ")");
         return errors;
     }
-    const int available = std::max<int>(0, info.available_chunks);
-    const auto check_range = [&](const std::string & label, int start, int count) {
-        if (count <= 0) {
-            return;
-        }
-        if (start < 0) {
-            errors.push_back(label + " KLD start is negative");
-            return;
-        }
-        if (start >= available) {
-            errors.push_back(label + " KLD start " + std::to_string(start) +
-                    " is outside available chunks: " + format_kld_info(info));
-            return;
-        }
-        if (start + count > available) {
-            errors.push_back(label + " KLD range " + std::to_string(start) + "+" +
-                    std::to_string(count) + " exceeds available chunks: " + format_kld_info(info));
-        }
-    };
-
-    check_range("selector search",
-            parse_int_or_default(recipe.selector.chunk_start, 0),
-            parse_int_or_default(recipe.selector.chunks, 0));
-    check_range("selector holdout",
-            parse_int_or_default(recipe.selector.holdout_start,
-                parse_int_or_default(recipe.selector.chunk_start, 0) + parse_int_or_default(recipe.selector.chunks, 0)),
-            parse_int_or_default(recipe.selector.holdout_chunks, 0));
     return errors;
 }
 
@@ -783,10 +989,6 @@ static std::string imatrix_command_shell(const bq::Recipe & recipe) {
     if (!n_gpu_layers.empty()) {
         args.push_back("-ngl");
         args.push_back(n_gpu_layers);
-    }
-    if (!recipe.calibration.chunks.empty()) {
-        args.push_back("--chunks");
-        args.push_back(recipe.calibration.chunks);
     }
 
     std::string command = shellish_args(args);
@@ -939,7 +1141,7 @@ static int run_recipe(
                 events << "{\"event\":\"input_inspect_failed\",\"error\":\"" << json_escape(e.what()) << "\"}\n";
                 events << "{\"event\":\"finished\",\"return_code\":3}\n";
             }
-            write_run_manifest_and_report(loaded.recipe, plan, run_dir, run_key, nullptr, nullptr, 3);
+            write_run_manifest_and_report(loaded.recipe, plan, run_dir, run_key, nullptr, nullptr, nullptr, 3);
             std::cerr << "input inspect failed: " << e.what() << "\n";
             return 3;
         }
@@ -961,7 +1163,7 @@ static int run_recipe(
                         project_quality_inputs_from_recipe(loaded.recipe));
             }
             write_run_manifest_and_report(loaded.recipe, plan, run_dir, run_key,
-                    have_input_summary ? &input_summary : nullptr, nullptr, 0);
+                    have_input_summary ? &input_summary : nullptr, nullptr, nullptr, 0);
             return 0;
         }
     }
@@ -1003,8 +1205,32 @@ static int run_recipe(
                 events << "{\"event\":\"output_inspect_failed\",\"error\":\"" << json_escape(e.what()) << "\"}\n";
             }
         }
+    }
+    FinalQualityEvidence final_quality;
+    if (rc == 0 && writes_output && have_output_summary) {
+        std::cout << "final PPL/KLD evaluation:\n";
+        final_quality = run_final_quality_eval(loaded.recipe, plan, run_dir);
+        if (final_quality.attempted) {
+            std::cout << "  " << final_quality.log_path << " (rc=" << final_quality.rc << ")\n";
+        } else {
+            std::cout << "  skipped: " << final_quality.reason << "\n";
+        }
+        if (events) {
+            events << "{\"event\":\"final_ppl_kld\""
+                   << ",\"attempted\":" << (final_quality.attempted ? "true" : "false")
+                   << ",\"available\":" << (final_quality.available ? "true" : "false")
+                   << ",\"return_code\":" << final_quality.rc
+                   << ",\"log\":\"" << json_escape(final_quality.log_path) << "\""
+                   << ",\"reason\":\"" << json_escape(final_quality.reason) << "\""
+                   << "}\n";
+        }
+    } else {
+        final_quality.reason = "quantization did not complete with an inspected output model";
+    }
+    if (events) {
         events << "{\"event\":\"finished\",\"return_code\":" << rc << "}\n";
     }
+
     if (!project_path.empty()) {
         bq::project_append_run_event(
                 project_path, "run_finished", variant.empty() ? std::filesystem::path(recipe_path).stem().string() : variant,
@@ -1014,6 +1240,7 @@ static int run_recipe(
     write_run_manifest_and_report(loaded.recipe, plan, run_dir, run_key,
             have_input_summary ? &input_summary : nullptr,
             have_output_summary ? &output_summary : nullptr,
+            &final_quality,
             rc);
     return rc;
 }
@@ -1225,29 +1452,11 @@ static int plan_recipe(int argc, char ** argv) {
         const KldBaseInfo info = read_kld_base_info(selected_kld);
         std::cout << "KLD base: " << selected_kld << " (" << format_kld_info(info) << ")\n";
         if (info.valid) {
-            const int search_start = parse_int_or_default(loaded.recipe.selector.chunk_start, 0);
-            const int search_chunks = parse_int_or_default(loaded.recipe.selector.chunks, 0);
-            const int holdout_chunks = parse_int_or_default(loaded.recipe.selector.holdout_chunks, 0);
-            const int holdout_start = parse_int_or_default(
-                    loaded.recipe.selector.holdout_start,
-                    search_start + search_chunks);
-            const int covered_chunks = holdout_chunks > 0 && holdout_start == search_start + search_chunks
-                ? search_chunks + holdout_chunks
-                : search_chunks;
-            std::cout << "selector_evidence: search=" << search_start << "+" << search_chunks
-                      << ", validation=" << holdout_start << "+" << holdout_chunks
-                      << ", covered=" << covered_chunks << "/" << info.available_chunks
-                      << ", eval_budget_per_subset=" << loaded.recipe.selector.eval_chunks << "\n";
+            std::cout << "selector_evidence: full KLD base (" << info.available_chunks << " chunks)\n";
         }
     }
-    std::cout << "selector_planner: ledger="
-              << (loaded.recipe.selector.ledger.empty() ? "disabled" : loaded.recipe.selector.ledger)
-              << ", search=" << (loaded.recipe.selector.search.empty() ? "legacy" : loaded.recipe.selector.search)
-              << ", local_top_k=" << loaded.recipe.selector.local_top_k
-              << ", group_units=" << loaded.recipe.selector.group_units
-              << ", beam_width=" << loaded.recipe.selector.beam_width
-              << ", exact_budget=" << loaded.recipe.selector.exact_budget
-              << ", delta_mode=" << loaded.recipe.selector.delta_mode << "\n";
+    std::cout << "selector_evidence: ledger="
+              << (loaded.recipe.selector.ledger.empty() ? "disabled" : loaded.recipe.selector.ledger) << "\n";
     std::cout << "internal quantize call:\n  " << shellish_args(plan.argv) << "\n";
     const std::string kld_command = kld_base_command_shell(loaded.recipe);
     if (!kld_command.empty()) {
@@ -1547,7 +1756,7 @@ static int candidates_main(int argc, char ** argv) {
                     r.nvfp4.four_six.compand = "1";
                     r.nvfp4.four_six.cap6 = "448";
                     r.nvfp4.four_six.cap4 = "256";
-                    r.nvfp4.autotune.max_blocks = r.nvfp4.autotune.max_blocks.empty() ? "32768" : r.nvfp4.autotune.max_blocks;
+                    r.nvfp4.encoder.max_blocks = r.nvfp4.encoder.max_blocks.empty() ? "32768" : r.nvfp4.encoder.max_blocks;
                     r.selector.effort = "awq-full-local";
                 });
     }
@@ -1579,7 +1788,7 @@ static int candidates_main(int argc, char ** argv) {
                     r.nvfp4.four_six.compand = "1";
                     r.nvfp4.four_six.cap6 = "448";
                     r.nvfp4.four_six.cap4 = "224";
-                    r.nvfp4.autotune.max_blocks = r.nvfp4.autotune.max_blocks.empty() ? "32768" : r.nvfp4.autotune.max_blocks;
+                    r.nvfp4.encoder.max_blocks = r.nvfp4.encoder.max_blocks.empty() ? "32768" : r.nvfp4.encoder.max_blocks;
                     r.selector.effort = "mse-scale-sweep";
                 });
     }
@@ -1611,9 +1820,6 @@ static int candidates_main(int argc, char ** argv) {
                     r.selector.require_runtime_cache = true;
                     if (r.selector.eval_top.empty()) {
                         r.selector.eval_top = "4";
-                    }
-                    if (r.selector.eval_chunks.empty() && !r.selector.chunks.empty()) {
-                        r.selector.eval_chunks = r.selector.chunks;
                     }
                 });
     }
@@ -2709,7 +2915,7 @@ static void configure_four_six_mixed(bq::Recipe & recipe) {
 }
 
 static int size_main(int argc, char ** argv) {
-    std::string mode = bq::Recipe().target.precision_mode;
+    std::string precision_mode = bq::Recipe().target.precision_mode;
     double params_b = 0.0;
     int vram_gb = 0;
     int ram_gb = 0;
@@ -2719,8 +2925,8 @@ static int size_main(int argc, char ** argv) {
 
     for (int i = 0; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--mode" && i + 1 < argc) {
-            mode = argv[++i];
+        if (arg == "--precision-mode" && i + 1 < argc) {
+            precision_mode = argv[++i];
         } else if (arg == "--params-b" && i + 1 < argc) {
             params_b = std::stod(argv[++i]);
         } else if (arg == "--vram-gb" && i + 1 < argc) {
@@ -2738,13 +2944,13 @@ static int size_main(int argc, char ** argv) {
         }
     }
 
-    mode = canonical_quant_type(mode);
+    precision_mode = canonical_quant_type(precision_mode);
     if (params_b <= 0.0) {
         throw std::runtime_error("size requires --params-b N");
     }
 
     bq::Recipe recipe;
-    apply_vram_target(recipe, mode, params_b, vram_gb, ram_gb, kv_cache_gib, activation_headroom_gib);
+    apply_vram_target(recipe, precision_mode, params_b, vram_gb, ram_gb, kv_cache_gib, activation_headroom_gib);
 
     std::cout << recipe.target.sizing_note << "\n";
     std::cout << "estimated NVFP4 weights: " << estimate_gib(params_b, 4.5) << " GiB\n";
@@ -2752,7 +2958,7 @@ static int size_main(int argc, char ** argv) {
     if (recipe.target.target_bpw > 0.0) {
         std::cout << "target average BPW: " << recipe.target.target_bpw << "\n";
     }
-    if (mode == "NVFP4_MXFP6") {
+    if (precision_mode == "NVFP4_MXFP6") {
         std::cout << "suggested MXFP6 edit budget: " << recipe.rescue.budget_mb << " MiB\n";
     }
     if (!inspect_path.empty()) {
@@ -3901,15 +4107,6 @@ static std::string default_output_model_path(const std::string & input_model, co
     return path.string();
 }
 
-static std::string legacy_blackwell_output_model_path(const std::string & input_model) {
-    if (input_model.empty()) {
-        return {};
-    }
-    std::filesystem::path path(input_model);
-    path.replace_filename(path.stem().string() + "-blackwell.gguf");
-    return path.string();
-}
-
 static bool same_model_path_string(const std::string & lhs, const std::string & rhs) {
     if (lhs.empty() || rhs.empty()) {
         return lhs == rhs;
@@ -3922,9 +4119,6 @@ static bool output_model_is_auto_default(
         const std::string & output_model,
         const std::string & current_quant_type) {
     if (output_model.empty()) {
-        return true;
-    }
-    if (same_model_path_string(output_model, legacy_blackwell_output_model_path(input_model))) {
         return true;
     }
     if (same_model_path_string(output_model, default_output_model_path(input_model, current_quant_type))) {
@@ -4594,7 +4788,6 @@ static void shell_configure_kld_files(ShellState & state) {
         state.recipe.calibration.batch_size = shell_prompt_on_page(state, title, "imatrix batch size", state.recipe.calibration.batch_size);
         state.recipe.calibration.ubatch_size = shell_prompt_on_page(state, title, "imatrix ubatch size", state.recipe.calibration.ubatch_size);
         state.recipe.calibration.n_gpu_layers = shell_prompt_on_page(state, title, "imatrix GPU layers (auto/all/N)", state.recipe.calibration.n_gpu_layers);
-        state.recipe.calibration.chunks = shell_prompt_on_page(state, title, "chunks to process (blank = full corpus)", state.recipe.calibration.chunks);
         state.recipe.calibration.extra_args = shell_prompt_on_page(state, title, "extra llama-imatrix args", state.recipe.calibration.extra_args);
         const std::string command = imatrix_command_shell(state.recipe);
         if (!command.empty()) {
@@ -4709,8 +4902,8 @@ static void shell_configure_target_budget(ShellState & state) {
     state.status = "Target budget updated";
 }
 
-static void shell_configure_nvfp4_46_autotune(ShellState & state) {
-    const std::string title = "Project > Options > NVFP4 4/6 and Autotune";
+static void shell_configure_nvfp4_46_policy(ShellState & state) {
+    const std::string title = "Project > Options > NVFP4 4/6 Policy";
     state.recipe.nvfp4.preset = shell_prompt_on_page(state, title, "NVFP4 preset", state.recipe.nvfp4.preset);
     state.recipe.nvfp4.cfg = shell_prompt_on_page(state, title, "raw NVFP4 cfg override", state.recipe.nvfp4.cfg);
     const int mode = shell_submenu_select(state, "Project > Options > NVFP4 4/6 > Lane Selection", {
@@ -4718,19 +4911,19 @@ static void shell_configure_nvfp4_46_autotune(ShellState & state) {
         "Back",
     });
     if (mode < 0 || mode == 1) {
-        state.status = "NVFP4 autotune unchanged";
+        state.status = "NVFP4 4/6 policy unchanged";
         return;
     }
     state.recipe.nvfp4.four_six.choose46 = "adaptive";
-    const std::string params_title = "Project > Options > NVFP4 4/6 and Autotune > Parameters";
+    const std::string params_title = "Project > Options > NVFP4 4/6 Policy > Parameters";
     state.recipe.nvfp4.four_six.refit_iters = shell_prompt_on_page(state, params_title, "4/6 refit iterations", state.recipe.nvfp4.four_six.refit_iters);
     state.recipe.nvfp4.four_six.compand = shell_prompt_on_page(state, params_title, "4/6 companding enabled (0/1)", state.recipe.nvfp4.four_six.compand);
     state.recipe.nvfp4.four_six.cap6 = shell_prompt_on_page(state, params_title, "6-bit lane cap", state.recipe.nvfp4.four_six.cap6);
     state.recipe.nvfp4.four_six.cap4 = shell_prompt_on_page(state, params_title, "4-bit lane cap", state.recipe.nvfp4.four_six.cap4);
     state.recipe.nvfp4.correction_denom = shell_prompt_on_page(state, params_title, "NVFP4 scale correction denominator", state.recipe.nvfp4.correction_denom);
     state.recipe.nvfp4.input_scale_policy = shell_prompt_on_page(state, params_title, "input scale policy", state.recipe.nvfp4.input_scale_policy);
-    state.recipe.nvfp4.autotune.max_blocks = shell_prompt_on_page(state, params_title, "autotune max sample blocks", state.recipe.nvfp4.autotune.max_blocks);
-    state.recipe.nvfp4.autotune.threads = shell_prompt_on_page(state, params_title, "autotune CPU threads", state.recipe.nvfp4.autotune.threads);
+    state.recipe.nvfp4.encoder.max_blocks = shell_prompt_on_page(state, params_title, "max sample blocks", state.recipe.nvfp4.encoder.max_blocks);
+    state.recipe.nvfp4.encoder.threads = shell_prompt_on_page(state, params_title, "CPU worker threads", state.recipe.nvfp4.encoder.threads);
     state.recipe.nvfp4.calibration_families = split_type_csv(shell_prompt_on_page(
         state,
         params_title,
@@ -4738,7 +4931,7 @@ static void shell_configure_nvfp4_46_autotune(ShellState & state) {
         join_type_csv(state.recipe.nvfp4.calibration_families)));
     state.recipe.nvfp4.scale_tie = shell_prompt_on_page(state, params_title, "scale/group tie policy", state.recipe.nvfp4.scale_tie);
     shell_remember_recipe(state, state.last_recipe, state.recipe);
-    state.status = "NVFP4 autotune updated";
+    state.status = "NVFP4 4/6 policy updated";
 }
 
 static void shell_configure_native_techniques(ShellState & state) {
@@ -4792,7 +4985,7 @@ static void shell_configure_native_techniques(ShellState & state) {
             shell_begin_page(state, "Project > Options > Native Technique Families");
             const bq::tui::TerminalCapabilities caps = bq::tui::detect_terminal(stdout);
             std::vector<std::string> lines;
-            lines.push_back("Policy set         " + (state.recipe.autotune.policy_set.empty() ? std::string("native-full") : state.recipe.autotune.policy_set));
+            lines.push_back("Policy set         " + (state.recipe.quantizer.policy_set.empty() ? std::string("native-full") : state.recipe.quantizer.policy_set));
             lines.push_back("Technique list     " + join_type_csv(state.recipe.stock_ftype.technique_candidates));
             lines.push_back("Calibration list   " + join_type_csv(state.recipe.nvfp4.calibration_families));
             lines.push_back("Tensor sweep       " + std::string(tensor_sweep ? "on" : "off"));
@@ -4803,14 +4996,14 @@ static void shell_configure_native_techniques(ShellState & state) {
             state.status = "Native technique families unchanged";
             shell_pause(caps);
         } else if (choice == 1) {
-            state.recipe.autotune.policy_set = "native-core";
+            state.recipe.quantizer.policy_set = "native-core";
             state.recipe.stock_ftype.technique_candidates = { "ptq", "kld-best" };
             state.recipe.nvfp4.calibration_families = { "max", "kld_best" };
             state.recipe.nvfp4.scale_tie = "none";
             state.recipe.stock_ftype.sweep_tensor_policy = true;
             state.recipe.stock_ftype.sweep_sensitive_tensors = true;
         } else if (choice == 2) {
-            state.recipe.autotune.policy_set = "native-full";
+            state.recipe.quantizer.policy_set = "native-full";
             state.recipe.stock_ftype.technique_candidates = {
                 "ptq",
                 "kld-best",
@@ -4839,14 +5032,14 @@ static void shell_configure_native_techniques(ShellState & state) {
             state.recipe.stock_ftype.sweep_tensor_policy = true;
             state.recipe.stock_ftype.sweep_sensitive_tensors = true;
         } else if (choice == 3) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "auto_search" }, !auto_search);
         } else if (choice == 4) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             state.recipe.stock_ftype.sweep_tensor_policy = !tensor_sweep;
             state.recipe.stock_ftype.sweep_sensitive_tensors = !tensor_sweep;
         } else if (choice == 5) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "no_quantize_choice" }, !no_quantize);
             if (!no_quantize) {
                 append_unique_type(state.recipe.stock_ftype.token_embedding_candidates, "BF16");
@@ -4855,19 +5048,19 @@ static void shell_configure_native_techniques(ShellState & state) {
                 state.recipe.stock_ftype.sweep_sensitive_tensors = true;
             }
         } else if (choice == 6) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "awq_lite", "awq_clip", "awq_full" }, !awq);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "awq_lite", "awq_clip", "awq_full" }, !awq);
         } else if (choice == 7) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "smoothquant" }, !smoothquant);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "smoothquant" }, !smoothquant);
         } else if (choice == 8) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "mse_scale_sweep" }, !mse);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "mse_scale_sweep" }, !mse);
         } else if (choice == 9) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "nvfp4_rsf" }, !rsf);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "nvfp4_rsf" }, !rsf);
             if (!rsf) {
@@ -4877,21 +5070,21 @@ static void shell_configure_native_techniques(ShellState & state) {
                 }
             }
         } else if (choice == 10) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "kl_div_sensitivity" }, !kl);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "kl_div_sensitivity" }, !kl);
             if (!kl) {
                 state.recipe.selector.require_runtime_cache = true;
             }
         } else if (choice == 11) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             set_type_tokens(state.recipe.stock_ftype.technique_candidates, { "gradient_or_hessian_sidecar" }, !gradient);
             set_type_tokens(state.recipe.nvfp4.calibration_families, { "gradient_or_hessian_sidecar" }, !gradient);
         } else if (choice == 12) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             state.recipe.nvfp4.scale_tie = grouped ? "none" : "qkv_gate_up_expert";
         } else if (choice == 13) {
-            state.recipe.autotune.policy_set = "manual";
+            state.recipe.quantizer.policy_set = "manual";
             const std::string title = "Project > Options > Native Technique Families > Manual";
             state.recipe.stock_ftype.technique_candidates = split_type_csv(shell_prompt_on_page(
                 state,
@@ -4910,13 +5103,13 @@ static void shell_configure_native_techniques(ShellState & state) {
 
 static void shell_configure_candidate_search(ShellState & state) {
     const std::string current_effort = state.recipe.selector.effort.empty() ? std::string("unset") : state.recipe.selector.effort;
-    const std::string current_mode = state.recipe.autotune.mode.empty() ? std::string("unset") : state.recipe.autotune.mode;
+    const std::string current_mode = state.recipe.quantizer.mode.empty() ? std::string("unset") : state.recipe.quantizer.mode;
     const int effort = shell_submenu_select(state, "Candidate Search - current " + current_mode + " / " + current_effort, {
         "Select native technique families",
         "Keep current search settings",
-        "Default RSF - deep search, no required KLD/imatrix",
-        "Balanced quality - real KLD-first, smaller search",
-        "Full quality - real KLD-first, broad search",
+        "Fast - compact tensor-policy search",
+        "Normal - real KLD-first tensor-policy search",
+        "Deep - broad KLD-first tensor-policy search",
         "Advanced low-level knobs",
         "Back",
     });
@@ -4932,11 +5125,11 @@ static void shell_configure_candidate_search(ShellState & state) {
         return;
     }
     if (effort == 2) {
-        apply_search_effort_preset(state.recipe, "fast-minimal");
+        apply_search_effort_preset(state.recipe, "fast");
     } else if (effort == 3) {
-        apply_search_effort_preset(state.recipe, "balanced");
+        apply_search_effort_preset(state.recipe, "normal");
     } else if (effort == 4) {
-        apply_search_effort_preset(state.recipe, "full-best");
+        apply_search_effort_preset(state.recipe, "deep");
     }
     if (effort > 1 && effort < 5) {
         state.status = state.recipe.selector.effort + " search preset selected";
@@ -4945,23 +5138,13 @@ static void shell_configure_candidate_search(ShellState & state) {
     }
 
     const std::string title = "Project > Options > Candidate Search";
-    state.recipe.autotune.enabled = false;
+    state.recipe.quantizer.enabled = false;
     state.recipe.selector.kld = shell_prompt_on_page(state, title, "KLD base file", state.recipe.selector.kld.empty() ? state.recipe.evaluation.kld_base : state.recipe.selector.kld);
     state.recipe.selector.ledger = shell_prompt_on_page(state, title, "selector evidence ledger", state.recipe.selector.ledger);
-    state.recipe.selector.search = shell_prompt_on_page(state, title, "ledger planner search mode", state.recipe.selector.search);
-    state.recipe.selector.local_top_k = shell_prompt_on_page(state, title, "local alternatives per unit", state.recipe.selector.local_top_k);
-    state.recipe.selector.group_units = shell_prompt_on_page(state, title, "planner grouping units", state.recipe.selector.group_units);
-    state.recipe.selector.beam_width = shell_prompt_on_page(state, title, "planner beam width", state.recipe.selector.beam_width);
-    state.recipe.selector.exact_budget = shell_prompt_on_page(state, title, "exact planner budget", state.recipe.selector.exact_budget);
-    state.recipe.selector.delta_mode = shell_prompt_on_page(state, title, "planner delta mode", state.recipe.selector.delta_mode);
     state.recipe.selector.checkpoint_model = shell_prompt_on_page(state, title, "candidate search checkpoint GGUF", state.recipe.selector.checkpoint_model);
     state.recipe.selector.cache_dir = shell_prompt_on_page(state, title, "checkpoint cache directory", state.recipe.selector.cache_dir);
     state.recipe.selector.skip_file = shell_prompt_on_page(state, title, "skip remaining tuning request file", state.recipe.selector.skip_file);
     state.recipe.selector.effort = shell_prompt_on_page(state, title, "effort label", state.recipe.selector.effort);
-    state.recipe.selector.chunks = shell_prompt_on_page(state, title, "KLD chunks to score", state.recipe.selector.chunks);
-    state.recipe.selector.chunk_start = shell_prompt_on_page(state, title, "KLD chunk start", state.recipe.selector.chunk_start);
-    state.recipe.selector.holdout_chunks = shell_prompt_on_page(state, title, "validation chunks", state.recipe.selector.holdout_chunks);
-    state.recipe.selector.holdout_start = shell_prompt_on_page(state, title, "validation start", state.recipe.selector.holdout_start);
     state.recipe.selector.stagea_sample_blocks = shell_prompt_on_page(state, title, "stage A sample blocks", state.recipe.selector.stagea_sample_blocks);
     state.recipe.selector.stagea_max_policies = shell_prompt_on_page(state, title, "stage A max policies", state.recipe.selector.stagea_max_policies);
     state.recipe.selector.refine_top = shell_prompt_on_page(state, title, "refine top policies", state.recipe.selector.refine_top);
@@ -4970,7 +5153,6 @@ static void shell_configure_candidate_search(ShellState & state) {
     state.recipe.selector.survey_sample_blocks = shell_prompt_on_page(state, title, "survey sample blocks", state.recipe.selector.survey_sample_blocks);
     state.recipe.selector.max_tensors = shell_prompt_on_page(state, title, "max tensors to search", state.recipe.selector.max_tensors);
     state.recipe.selector.eval_top = shell_prompt_on_page(state, title, "full PPL/KLD candidates", state.recipe.selector.eval_top);
-    state.recipe.selector.eval_chunks = shell_prompt_on_page(state, title, "full PPL/KLD chunks", state.recipe.selector.eval_chunks);
     state.recipe.selector.n_seq = shell_prompt_on_page(state, title, "eval sequences", state.recipe.selector.n_seq);
     state.recipe.selector.policy_threads = shell_prompt_on_page(state, title, "policy search threads", state.recipe.selector.policy_threads);
     state.recipe.selector.threads = shell_prompt_on_page(state, title, "selector threads", state.recipe.selector.threads);
@@ -5176,7 +5358,7 @@ static void shell_options_menu(ShellState & state) {
             } else if (command == "budget") {
                 shell_configure_target_budget(state);
             } else if (command == "nvfp4") {
-                shell_configure_nvfp4_46_autotune(state);
+                shell_configure_nvfp4_46_policy(state);
             } else if (command == "candidate-search") {
                 shell_configure_candidate_search(state);
             } else if (command == "gates") {
@@ -5406,7 +5588,7 @@ static void shell_start_quantization(ShellState & state) {
         options.push_back({ "Edit model files", display_path(state.input_model) + " -> " + display_path(state.output_model), "models" });
         options.push_back({ "Edit quant type and options", shell_active_quant_type(state), "options" });
         options.push_back({ "Edit quality inputs", display_path(!state.recipe.selector.kld.empty() ? state.recipe.selector.kld : state.recipe.evaluation.kld_base), "quality" });
-        options.push_back({ "Edit candidate search", state.recipe.autotune.mode + " / " + state.recipe.selector.effort, "candidate-search" });
+        options.push_back({ "Edit candidate search", state.recipe.quantizer.mode + " / " + state.recipe.selector.effort, "candidate-search" });
         options.push_back({ "Save config", display_path(state.last_recipe), "save" });
         options.push_back({ "Back", "", "back" });
 

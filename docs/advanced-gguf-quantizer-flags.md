@@ -36,9 +36,9 @@ available for direct quantization and GGUF inspection.
 ## No Fake Production Runs
 
 For model-production requests, use `run`. Use `plan`, `recipe validate`, and
-`inspect` only for no-write inspection. Fast mode is still a real quantization
-run; it now uses the default full-evidence NVFP4 RSF search and caps
-speed-aware tensor type candidates instead of replacing the whole model.
+`inspect` only for no-write inspection. `fast`, `normal`, and `deep` are all
+real quantization runs; they differ by search breadth and tensor-plan evidence
+thresholds, not by replacing the model with a fake or partial artifact.
 
 ## Recipe Fields
 
@@ -91,6 +91,18 @@ Runtime and memory:
 Stream counts, row chunk sizes, selector workers, and logits workspace internals
 are resolved implementation details. They may appear in locked run manifests for
 reproducibility, but they are not public tuning knobs.
+
+## Work Modes
+
+Production selector runs use one work mode:
+
+- `fast`: compact KLD-guided search for quick iteration.
+- `normal`: default production search.
+- `deep`: broader search for final comparisons or difficult models.
+
+Direct `llama-quantize` saved-logit selector runs use
+`--mode fast|normal|deep`. Recipe runs store the same value in
+`quantizer.mode`.
 
 ## Profiles
 
@@ -155,22 +167,19 @@ overall evidence.
 
 ## Native NVFP4 Candidate Families
 
-NVFP4 refined scale fit (RSF) variants are part of the normal NVFP4 selector
-candidate set by default: each tensor can refine its tensor scale while the
-existing per-16 block fit remains imatrix-weighted. The local refinement uses
-calibration weights, and final ranking still comes from the normal PPL/KLD
-selector machinery. RSF is a modifier on the normal candidate set, not a
-standalone policy lane. Set the granularity or report path directly:
+Refined scale fit (RSF) is part of the normal quantization path by default. Each
+tensor can refine its tensor scale while the local block/subblock fit remains
+imatrix-weighted. RSF is a first-pass scale-fitting strategy, not a late
+repair-only path. Set the granularity, search depth, or report path directly:
 
 ```bash
 ./build/bin/llama-quantize ... --nvfp4-selector-rsf-mode tensor \
+  --nvfp4-selector-rsf-depth deeper \
   --nvfp4-selector-rsf-report runs/model/rsf-report.txt
 ```
 
-Use `--nvfp4-selector-no-rsf` only for diagnostic comparisons that intentionally
-remove the default RSF variants from the selector candidate set.
-
-Recipe files can set the RSF granularity explicitly:
+Recipe files can set the RSF granularity explicitly for diagnostics or
+reproduction:
 
 ```toml
 [nvfp4.rsf]
@@ -178,10 +187,11 @@ mode = "tensor"       # tensor | slice | expert | group
 depth = "exhaustive"  # normal | deep | deeper | exhaustive
 ```
 
-RSF variants are shortlisted by the existing proxy path and, when a KLD base is
-available, scored by the same full PPL/KLD selector machinery as other NVFP4
-policies. Adaptive four-over-six remains the default NVFP4 encoder path for
-these variants and the base policies they extend.
+RSF variants are shortlisted by the existing proxy path and measured directly
+instead of carrying parallel non-RSF siblings through the selector. When a KLD
+base is available, the full-base exact KLD score validates the composed tensor
+plan. Adaptive four-over-six remains the default NVFP4 encoder path for these
+variants and the base policies they extend.
 During measured Stage-B policy materialization, direct runtime patching skips
 the extra tensor reconstruction-stat pass by default because the policy rank is
 computed from saved-logit runtime metrics: PPL, mean and tail KLD, RMS
@@ -192,12 +202,12 @@ Use `--nvfp4-selector-stageb-direct-verify` or
 `--nvfp4-selector-no-stageb-direct-verify` to override direct-patch readback
 verification for runtime-patch diagnostics.
 
-The default NVFP4 RSF selector budget is the full-evidence real-artifact search
-used for current production candidates: all available KLD chunks, exhaustive
-RSF depth with a 131k-block tensor sample cap, 64 survey policies, 24 measured
-candidates, 2-way selector eval batching, and a 192-policy refinement budget.
-Use explicit selector fields only when intentionally running a smaller
-diagnostic or a targeted reproduction.
+The default RSF selector budget is a compact KLD-guided real-artifact search:
+proxy-ranked seeds are refined into a small RSF scale-fit frontier,
+duplicate-equivalent policies are removed before measured survey/eval, and
+Stage B spends its KLD budget on the most distinct candidates. Use explicit
+selector fields only when intentionally broadening the search or running a
+targeted reproduction.
 Proxy-only survey passes may use a bounded RSF depth so that expensive
 exhaustive scale fitting is reserved for measured KLD/PPL candidate evaluation
 and final materialization.
@@ -205,12 +215,13 @@ and final materialization.
 After the selected NVFP4 policy is materialized, the main selector can also
 consider speed-aware tensor type candidates for the worst NVFP4-error tensors.
 This is not a separate repair pass: it is part of the final exact tensor map.
-With `--nvfp4-fast-quantize`, the default cap is the worst 10% of NVFP4
-candidate tensors. NVFP4/RSF tensor-local repairs are tried first; only tensors
-where NVFP4 still has high error are allowed to move to fallback types.
+With a saved-logit KLD selector, the default cap is mode-dependent and based on
+outlier error rather than an arbitrary fixed fraction. NVFP4/RSF tensor-local
+repairs are tried first; only tensors where NVFP4 still has high error are
+allowed to move to stronger tensor types.
 
 ```bash
-./build/bin/llama-quantize ... --nvfp4-selector-candidate-types Q4_K,Q6_K,Q8_0
+./build/bin/llama-quantize ... --nvfp4-selector-candidate-types Q5_0,Q4_K,Q5_K,Q6_K,Q8_0
 ```
 
 Mixed NVFP4/MXFP6 runs prepend `MXFP6_E2M3` to that candidate list by default,
@@ -223,43 +234,34 @@ For targeted diagnostics, `--nvfp4-selector-include-policy name` and
 `--nvfp4-selector-include-policies a,b` limit selector work to exact policy
 names while still allowing the internal `seed_keep` checkpoint policy.
 
-After whole-model ranking, the selector can also emit a guarded per-tensor
-policy map. The global winner remains the baseline, but individual tensors can
-switch to another measured, passing policy when their tensor-local proxy score
-improves enough. This is enabled by default for measured selector runs; use
-`--nvfp4-selector-no-tensor-policy-map` for diagnostics or
-`--nvfp4-selector-tensor-policy-map-max N` to cap the number of tensor switches.
+Fresh NVFP4 selector runs build a per-tensor policy plan before final
+materialization. Tensor-local proxy evidence chooses policy changes across the
+full tensor set, then the loaded runtime scores the whole plan against the KLD
+base before writing the final GGUF. This is enabled by default for measured
+selector runs; use `--nvfp4-selector-no-tensor-policy-map` only for diagnostics
+or whole-policy comparison runs.
 
-## Assignment-Ledger Planner
+The tensor-policy proxy gate is tied to work mode: `fast` uses a 0.0005
+absolute gain floor, `normal` uses 0.0002, and `deep` uses 0.0001, with a small
+relative guard to avoid floating-point noise.
 
-The recipe surface includes experimental planner fields for assignment-ledger
-search:
+## Selector Ledger
+
+The recipe surface can keep a selector evidence ledger:
 
 ```toml
 [selector]
 ledger = "runs/model/selector-ledger.jsonl"
-search = "legacy"
-local_top_k = "0"
-group_units = "auto"
-beam_width = "1"
-exact_budget = "auto"
-delta_mode = "estimate"
 ```
 
 `selector.ledger` passes through to `--nvfp4-selector-ledger` when set and
 appends raw selector evidence rows to JSONL. When exact stage-B KLD rows in the
 ledger match the current cache key, the selector can reuse them as a read-through
 cache before remeasuring a policy. Leave it empty for normal runs.
-`selector.search`, `selector.local_top_k`, `selector.group_units`,
-`selector.beam_width`, `selector.exact_budget`, and `selector.delta_mode` are
-planner controls. The default `legacy` search keeps the existing selector path.
-Set `selector.search` to a non-legacy value to pass the planner knobs through to
-the low-level quantizer, where grouped tensor-policy planning can spend an exact
-KLD budget on ranked local assignment prefixes.
 
-Ledger estimates are not release-quality evidence. They can help prune or order
-candidate assignments, but final claims still need the same exact artifact
-evaluation and completion smoke required for any production run.
+Ledger estimates are not release-quality evidence. They can help avoid
+recomputing matching exact rows, but final claims still need the same exact
+artifact evaluation and completion smoke required for any production run.
 
 Inspect a ledger without running model evaluation:
 

@@ -161,8 +161,8 @@ static std::string display_menu_label(const std::string & label) {
     if (label == "Set target BPW / VRAM") {
         return "Set Target BPW / VRAM";
     }
-    if (label == "NVFP4 4/6 and autotune") {
-        return "NVFP4 4/6 and Autotune";
+    if (label == "NVFP4 4/6 Policy") {
+        return "NVFP4 4/6 Policy";
     }
     if (label == "Native candidate search") {
         return "Native Candidate Search";

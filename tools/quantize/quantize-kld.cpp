@@ -68,7 +68,7 @@ static std::shared_ptr<nvfp4_selector_kld_subset::mmap_file> nvfp4_selector_try_
 #endif
 }
 
-bool nvfp4_selector_load_kld_subset(const std::string & path, int32_t chunk_start, int32_t n_chunks, nvfp4_selector_kld_subset & out) {
+bool nvfp4_selector_load_kld_subset(const std::string & path, nvfp4_selector_kld_subset & out) {
     out.source_path = path;
     std::error_code file_ec;
     out.source_size = std::filesystem::file_size(path, file_ec);
@@ -99,33 +99,26 @@ bool nvfp4_selector_load_kld_subset(const std::string & path, int32_t chunk_star
         return false;
     }
 
-    if (chunk_start >= out.n_chunk_total) {
-        fprintf(stderr, "%s: selector chunk_start=%d out of range (chunks=%d)\n", __func__, chunk_start, out.n_chunk_total);
-        return false;
-    }
-
-    out.chunk_start = chunk_start;
-    out.n_chunk = std::min(n_chunks, out.n_chunk_total - chunk_start);
+    out.n_chunk = out.n_chunk_total;
     out.first = out.n_ctx / 2;
     out.n_score = out.n_ctx - 1 - out.first;
     out.nv = 2 * ((out.n_vocab + 1) / 2) + 4;
 
     const std::streamoff header_sz = 8 + 3 * (std::streamoff) sizeof(int32_t);
     const std::streamoff tokens_all_sz = (std::streamoff) out.n_chunk_total * out.n_ctx * (std::streamoff) sizeof(llama_token);
-    const std::streamoff chunk_tokens_sz = (std::streamoff) out.n_ctx * (std::streamoff) sizeof(llama_token);
     const std::streamoff chunk_logp_sz = (std::streamoff) out.n_score * out.nv * (std::streamoff) sizeof(uint16_t);
 
     out.tokens.resize((size_t) out.n_chunk * (size_t) out.n_ctx);
 
-    in.seekg(header_sz + (std::streamoff) chunk_start * chunk_tokens_sz, std::ios::beg);
+    in.seekg(header_sz, std::ios::beg);
     in.read((char *) out.tokens.data(), (std::streamsize) out.tokens.size() * (std::streamsize) sizeof(llama_token));
     if (!in) {
         fprintf(stderr, "%s: failed reading selector tokens\n", __func__);
         return false;
     }
 
-    in.seekg(header_sz + tokens_all_sz + (std::streamoff) chunk_start * chunk_logp_sz, std::ios::beg);
-    const std::streamoff logp_offset = header_sz + tokens_all_sz + (std::streamoff) chunk_start * chunk_logp_sz;
+    in.seekg(header_sz + tokens_all_sz, std::ios::beg);
+    const std::streamoff logp_offset = header_sz + tokens_all_sz;
     const std::streamoff logp_bytes = (std::streamoff) out.n_chunk * chunk_logp_sz;
     out.log_probs_mapping = nvfp4_selector_try_mmap_kld_file(path);
     if (out.log_probs_mapping != nullptr &&
@@ -135,8 +128,8 @@ bool nvfp4_selector_load_kld_subset(const std::string & path, int32_t chunk_star
         out.log_probs_u16.clear();
         out.log_probs_u16.shrink_to_fit();
         out.log_probs_u16_mapped = (const uint16_t *) (out.log_probs_mapping->data + (size_t) logp_offset);
-        fprintf(stderr, "%s: selector mmap kld chunks start=%d count=%d ctx=%d vocab=%d virtual=%.2f GiB\n",
-            __func__, out.chunk_start, out.n_chunk, out.n_ctx, out.n_vocab,
+        fprintf(stderr, "%s: selector mmap full kld chunks=%d ctx=%d vocab=%d virtual=%.2f GiB\n",
+            __func__, out.n_chunk, out.n_ctx, out.n_vocab,
             (double) out.log_probs_mapping->size / (1024.0 * 1024.0 * 1024.0));
     } else {
         if (out.log_probs_mapping != nullptr) {
@@ -153,30 +146,6 @@ bool nvfp4_selector_load_kld_subset(const std::string & path, int32_t chunk_star
     }
 
     return true;
-}
-
-nvfp4_selector_kld_subset nvfp4_selector_make_kld_budget_subset(const nvfp4_selector_kld_subset & src, int32_t max_chunks) {
-    if (max_chunks <= 0 || src.n_chunk <= max_chunks) {
-        return src;
-    }
-    nvfp4_selector_kld_subset out = src;
-    out.n_chunk = std::max<int32_t>(1, std::min<int32_t>(max_chunks, src.n_chunk));
-    out.tokens.assign(
-        src.tokens.begin(),
-        src.tokens.begin() + (size_t) out.n_chunk * (size_t) src.n_ctx);
-    if (src.log_probs_u16_mapped != nullptr) {
-        out.log_probs_mapping = src.log_probs_mapping;
-        out.log_probs_u16_mapped = src.log_probs_u16_mapped;
-        out.log_probs_u16.clear();
-        out.log_probs_u16.shrink_to_fit();
-    } else {
-        out.log_probs_u16.assign(
-            src.log_probs_u16.begin(),
-            src.log_probs_u16.begin() + (size_t) out.n_chunk * (size_t) src.n_score * (size_t) src.nv);
-        out.log_probs_mapping.reset();
-        out.log_probs_u16_mapped = nullptr;
-    }
-    return out;
 }
 
 void nvfp4_selector_eval_one_token(

@@ -1036,6 +1036,80 @@ static __device__ __forceinline__ float nvfp4_cuda_subblock_sse_w_best(
     return sse;
 }
 
+static __device__ __forceinline__ float nvfp4_cuda_subblock_max_werr_w_best(
+        const float * x16,
+        const float * qw16,
+        const float scale) {
+    if (!(scale > 0.0f) || !isfinite(scale)) {
+        return 0.0f;
+    }
+
+    float max_werr = 0.0f;
+    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+        const float w = nvfp4_cuda_qw16(qw16, j);
+        if (w == 0.0f) {
+            continue;
+        }
+
+        const float v = x16[j];
+        const uint8_t code = nvfp4_cuda_best_index(v, scale);
+        const float q = scale * nvfp4_cuda_kvalue(code);
+        const float e = v - q;
+        const float werr = w * e * e;
+        max_werr = fmaxf(max_werr, werr);
+    }
+
+    return max_werr;
+}
+
+static __device__ __forceinline__ bool nvfp4_cuda_scale_candidate_better(
+        const float sse,
+        const float max_werr,
+        const float best_sse,
+        const float best_max_werr) {
+    const float scale = fmaxf(fmaxf(fabsf(sse), fabsf(best_sse)), 1.0e-20f);
+    const float near_tie = 0.002f * scale;
+    if (sse + near_tie < best_sse) {
+        return true;
+    }
+    if (fabsf(sse - best_sse) <= near_tie && max_werr < best_max_werr) {
+        return true;
+    }
+    return false;
+}
+
+static __device__ __forceinline__ float nvfp4_cuda_subblock_fit_scale_w_codes(
+        const float * x16,
+        const float * qw16,
+        const float q_scale,
+        const float fallback) {
+    if (!(q_scale > 0.0f) || !isfinite(q_scale)) {
+        return fallback;
+    }
+
+    double num = 0.0;
+    double den = 0.0;
+    for (int i = 0; i < QK_NVFP4_SUB; ++i) {
+        const float w = nvfp4_cuda_qw16(qw16, i);
+        const float v = x16[i];
+        if (w == 0.0f || !isfinite(v)) {
+            continue;
+        }
+
+        const uint8_t code = nvfp4_cuda_best_index(v, q_scale);
+        const double q = (double) nvfp4_cuda_kvalue(code);
+        num += (double) w * (double) v * q;
+        den += (double) w * q * q;
+    }
+
+    if (!(den > 1e-30) || !isfinite(num) || !isfinite(den)) {
+        return fallback;
+    }
+
+    const float fitted = (float) (num / den);
+    return (fitted > 0.0f && isfinite(fitted)) ? fitted : fallback;
+}
+
 static __device__ __forceinline__ void nvfp4_cuda_add_unique_scale_candidate(
         uint8_t * candidates,
         int * n_candidates,
@@ -1055,6 +1129,43 @@ static __device__ __forceinline__ void nvfp4_cuda_add_unique_scale_candidate(
     ++(*n_candidates);
 }
 
+static __device__ __forceinline__ void nvfp4_cuda_add_fitted_scale_candidates(
+        const float * x16,
+        const float * qw16,
+        const float d,
+        const uint8_t from_b,
+        const uint8_t cap_b,
+        const int radius,
+        uint8_t * candidates,
+        int * n_candidates,
+        const int max_candidates) {
+    if (!(d > 0.0f) || !isfinite(d) || from_b == 0) {
+        return;
+    }
+
+    const float raw = nvfp4_cuda_ue4m3_to_fp32(from_b);
+    if (!(raw > 0.0f) || !isfinite(raw)) {
+        return;
+    }
+
+    const float scale = d * (2.0f * raw);
+    const float fitted = nvfp4_cuda_subblock_fit_scale_w_codes(x16, qw16, scale, scale);
+    const float fitted_raw = fitted / (2.0f * d);
+    if (!(fitted_raw > 0.0f) || !isfinite(fitted_raw)) {
+        return;
+    }
+
+    uint8_t fit_b = nvfp4_cuda_fp32_to_ue4m3(fitted_raw);
+    if (fit_b > cap_b) {
+        fit_b = cap_b;
+    }
+
+    const int r = radius < 0 ? 0 : radius;
+    for (int delta = -r; delta <= r; ++delta) {
+        nvfp4_cuda_add_unique_scale_candidate(candidates, n_candidates, max_candidates, (int) fit_b + delta, cap_b);
+    }
+}
+
 static __device__ __forceinline__ uint8_t nvfp4_cuda_refine_sbscale_fp8_rich_cap(
         const float * x16,
         const float * qw16,
@@ -1066,7 +1177,7 @@ static __device__ __forceinline__ uint8_t nvfp4_cuda_refine_sbscale_fp8_rich_cap
         return 0;
     }
 
-    constexpr int max_candidates = 48;
+    constexpr int max_candidates = 64;
     constexpr int topk = 4;
     uint8_t candidates[max_candidates];
     int n_candidates = 0;
@@ -1075,6 +1186,11 @@ static __device__ __forceinline__ uint8_t nvfp4_cuda_refine_sbscale_fp8_rich_cap
     const int local_radius = refit_iters > 0 ? ((2 + refit_iters) < 8 ? (2 + refit_iters) : 8) : 2;
     for (int delta = -local_radius; delta <= local_radius; ++delta) {
         nvfp4_cuda_add_unique_scale_candidate(candidates, &n_candidates, max_candidates, (int) b0 + delta, cap_b);
+    }
+    if (refit_iters > 0) {
+        nvfp4_cuda_add_fitted_scale_candidates(
+            x16, qw16, d, b0, cap_b, 2,
+            candidates, &n_candidates, max_candidates);
     }
 
     float top[topk] = { 0.0f };
@@ -1111,19 +1227,61 @@ static __device__ __forceinline__ uint8_t nvfp4_cuda_refine_sbscale_fp8_rich_cap
             }
         }
     }
+    static const float boundaries[] = { 3.5f, 2.5f, 1.75f, 1.25f, 0.75f };
+    for (int t = 0; t < 2 && t < topk; ++t) {
+        if (!(top[t] > 0.0f)) {
+            break;
+        }
+        for (int s = 0; s < (int) (sizeof(boundaries) / sizeof(boundaries[0])); ++s) {
+            const float anchor = top[t] / boundaries[s];
+            if (!(anchor > 0.0f) || !isfinite(anchor)) {
+                continue;
+            }
+            const uint8_t b = nvfp4_cuda_fp32_to_ue4m3(anchor);
+            nvfp4_cuda_add_unique_scale_candidate(candidates, &n_candidates, max_candidates, (int) b, cap_b);
+        }
+    }
 
     if (n_candidates <= 0) {
         return b0;
     }
 
     uint8_t best_b = candidates[0];
-    float best_sse = nvfp4_cuda_subblock_sse_w_best(x16, qw16, d * (2.0f * nvfp4_cuda_ue4m3_to_fp32(best_b)));
+    const float best_scale0 = d * (2.0f * nvfp4_cuda_ue4m3_to_fp32(best_b));
+    float best_score = nvfp4_cuda_subblock_sse_w_best(x16, qw16, best_scale0);
+    float best_max_werr = nvfp4_cuda_subblock_max_werr_w_best(x16, qw16, best_scale0);
     for (int i = 1; i < n_candidates; ++i) {
         const uint8_t b = candidates[i];
-        const float sse = nvfp4_cuda_subblock_sse_w_best(x16, qw16, d * (2.0f * nvfp4_cuda_ue4m3_to_fp32(b)));
-        if (sse < best_sse) {
-            best_sse = sse;
+        const float scale = d * (2.0f * nvfp4_cuda_ue4m3_to_fp32(b));
+        const float score = nvfp4_cuda_subblock_sse_w_best(x16, qw16, scale);
+        const float max_werr = nvfp4_cuda_subblock_max_werr_w_best(x16, qw16, scale);
+        if (nvfp4_cuda_scale_candidate_better(score, max_werr, best_score, best_max_werr)) {
+            best_score = score;
+            best_max_werr = max_werr;
             best_b = b;
+        }
+    }
+
+    const int fit_rounds = refit_iters >= 16 ? 2 : (refit_iters > 0 ? 1 : 0);
+    for (int round = 0; round < fit_rounds; ++round) {
+        const int before_n = n_candidates;
+        const uint8_t before_b = best_b;
+        nvfp4_cuda_add_fitted_scale_candidates(
+            x16, qw16, d, best_b, cap_b, 1,
+            candidates, &n_candidates, max_candidates);
+        for (int i = before_n; i < n_candidates; ++i) {
+            const uint8_t b = candidates[i];
+            const float scale = d * (2.0f * nvfp4_cuda_ue4m3_to_fp32(b));
+            const float score = nvfp4_cuda_subblock_sse_w_best(x16, qw16, scale);
+            const float max_werr = nvfp4_cuda_subblock_max_werr_w_best(x16, qw16, scale);
+            if (nvfp4_cuda_scale_candidate_better(score, max_werr, best_score, best_max_werr)) {
+                best_score = score;
+                best_max_werr = max_werr;
+                best_b = b;
+            }
+        }
+        if (best_b == before_b) {
+            break;
         }
     }
 
@@ -2018,6 +2176,22 @@ static double nvfp4_host_robust_score(
         0.04 * safe_ratio(cand.abs_mean_err_rel, base.abs_mean_err_rel);
 }
 
+static double nvfp4_host_scale_mul_prior(float scale_mul, int rsf_depth) {
+    if (!(scale_mul > 0.0f) || !std::isfinite(scale_mul)) {
+        return 0.0;
+    }
+    const double distance = std::fabs(std::log((double) scale_mul));
+    const double soft_radius = rsf_depth >= NVFP4_CUDA_RSF_DEPTH_DEEP
+        ? std::log(1.1875)
+        : std::log(1.125);
+    if (!(distance > soft_radius)) {
+        return 0.0;
+    }
+    const double excess = (distance - soft_radius) / std::max(soft_radius, 1e-12);
+    const double weight = rsf_depth >= NVFP4_CUDA_RSF_DEPTH_DEEP ? 0.006 : 0.012;
+    return weight * excess * excess;
+}
+
 static bool nvfp4_host_eval_better(
         const nvfp4_tune_eval_stats & cand,
         const nvfp4_tune_eval_stats & best) {
@@ -2139,8 +2313,52 @@ static double nvfp4_host_subblock_sse_w_best(
     return sse;
 }
 
+static float nvfp4_host_subblock_fit_scale_w_codes(
+        const float * x16,
+        const float * qw16,
+        float q_scale,
+        float fallback) {
+    if (!(q_scale > 0.0f) || !std::isfinite(q_scale)) {
+        return fallback;
+    }
+
+    double num = 0.0;
+    double den = 0.0;
+    for (int i = 0; i < QK_NVFP4_SUB; ++i) {
+        const float w = nvfp4_host_qw(qw16, i);
+        const float v = x16[i];
+        if (w == 0.0f || !std::isfinite(v)) {
+            continue;
+        }
+
+        uint8_t best = 0;
+        float best_err = FLT_MAX;
+        for (int qi = 0; qi < 16; ++qi) {
+            const float q = q_scale * nvfp4_host_kvalue(qi);
+            const float e = q - v;
+            const float err = e * e;
+            if (err < best_err) {
+                best_err = err;
+                best = (uint8_t) qi;
+            }
+        }
+
+        const double q = (double) nvfp4_host_kvalue(best);
+        num += (double) w * (double) v * q;
+        den += (double) w * q * q;
+    }
+
+    if (!(den > 1e-30) || !std::isfinite(num) || !std::isfinite(den)) {
+        return fallback;
+    }
+
+    const float fitted = (float) (num / den);
+    return (fitted > 0.0f && std::isfinite(fitted)) ? fitted : fallback;
+}
+
 struct nvfp4_rsf_subblock_hint {
     float ideal;
+    float fitted;
     float cap;
     uint8_t code;
     double priority;
@@ -2194,9 +2412,17 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
         return {};
     }
     const int rsf_depth = nvfp4_cuda_rsf_depth(&cfg);
-    const int analytic_top_subblocks = nvfp4_cuda_rsf_analytic_top_subblocks(rsf_depth);
-    const int analytic_pool_size = nvfp4_cuda_rsf_analytic_pool_size(rsf_depth);
-    const int code_radius = nvfp4_cuda_rsf_code_radius(rsf_depth);
+    const bool compact_rsf = (cfg.reserved_i32 & NVFP4_CUDA_FLAG_RSF) != 0;
+    const bool compact_scale_search = compact_rsf && rsf_depth <= NVFP4_CUDA_RSF_DEPTH_NORMAL;
+    const int analytic_top_subblocks = compact_scale_search
+        ? std::min(nvfp4_cuda_rsf_analytic_top_subblocks(rsf_depth), 768)
+        : nvfp4_cuda_rsf_analytic_top_subblocks(rsf_depth);
+    const int analytic_pool_size = compact_scale_search
+        ? std::min(nvfp4_cuda_rsf_analytic_pool_size(rsf_depth), 16)
+        : nvfp4_cuda_rsf_analytic_pool_size(rsf_depth);
+    const int code_radius = compact_scale_search
+        ? std::min(nvfp4_cuda_rsf_code_radius(rsf_depth), 2)
+        : nvfp4_cuda_rsf_code_radius(rsf_depth);
     hints.reserve((size_t) std::min<int64_t>(
         sample_nb * (QK_NVFP4 / QK_NVFP4_SUB) * 2,
         analytic_top_subblocks * 2));
@@ -2240,12 +2466,17 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
         }
 
         const double sse = nvfp4_host_subblock_sse_w_best(x16, qw16, raw);
+        const float fitted = nvfp4_host_subblock_fit_scale_w_codes(x16, qw16, raw, ideal);
+        const double fitted_sse = nvfp4_host_subblock_sse_w_best(x16, qw16, fitted);
         const double rel = std::isfinite(sse) ? sse / std::max(x2, 1e-30) : 0.0;
         const double rms = std::sqrt(x2 / std::max(wsum, 1e-30));
         const double tail = (double) max_abs / std::max(rms, 1e-30);
         const double top2 = max_abs > 0.0f ? (double) max2 / (double) max_abs : 0.0;
-        const double priority = rel * (1.0 + 0.08 * std::min(tail, 8.0)) + 0.02 * top2 + 1e-18 * x2;
-        hints.push_back({ ideal, cap, code, priority });
+        double priority = rel * (1.0 + 0.08 * std::min(tail, 8.0)) + 0.02 * top2 + 1e-18 * x2;
+        if (std::isfinite(fitted_sse) && fitted_sse < sse) {
+            priority += 0.5 * (sse - fitted_sse) / std::max(x2, 1e-30);
+        }
+        hints.push_back({ ideal, fitted, cap, code, priority });
     };
 
     const float cap_m6 = (std::isfinite(cfg.cap_m6) && cfg.cap_m6 > 0.0f) ? cfg.cap_m6 : 448.0f;
@@ -2303,19 +2534,32 @@ static std::vector<float> nvfp4_host_collect_rsf_scale_muls(
         candidates.push_back({ scale_mul, score });
     };
 
-    for (const nvfp4_rsf_subblock_hint & hint : hints) {
-        const int center = (int) hint.code;
+    auto add_candidate_window = [&](float target, int center, float cap, double priority, int radius) {
+        if (!(target > 0.0f) || !std::isfinite(target)) {
+            return;
+        }
         for (int delta = -code_radius; delta <= code_radius; ++delta) {
+            if (std::abs(delta) > radius) {
+                continue;
+            }
             const int code = center + delta;
             if (code <= 0 || code >= 0x7F) {
                 continue;
             }
             const float raw = nvfp4_host_ue4m3_raw((uint8_t) code);
-            if (!(raw > 0.0f) || raw > hint.cap * 1.001f) {
+            if (!(raw > 0.0f) || raw > cap * 1.001f) {
                 continue;
             }
-            const double weight = hint.priority / (1.0 + (double) std::abs(delta));
-            add_candidate(hint.ideal / raw, weight);
+            const double weight = priority / (1.0 + (double) std::abs(delta));
+            add_candidate(target / raw, weight);
+        }
+    };
+
+    for (const nvfp4_rsf_subblock_hint & hint : hints) {
+        add_candidate_window(hint.ideal, (int) hint.code, hint.cap, hint.priority, code_radius);
+        if (hint.fitted > 0.0f && std::isfinite(hint.fitted)) {
+            const uint8_t fit_code = nvfp4_host_fp32_to_ue4m3(std::min(hint.fitted, hint.cap));
+            add_candidate_window(hint.fitted, (int) fit_code, hint.cap, 1.25 * hint.priority, std::max(1, code_radius / 2));
         }
     }
 
@@ -3714,10 +3958,20 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     const bool enable_rsf_scale_tune =
         cfg_hint == nullptr ||
         ((cfg_hint->reserved_i32 & NVFP4_CUDA_FLAG_RSF) != 0);
+    const bool compact_rsf =
+        cfg_hint != nullptr &&
+        (cfg_hint->reserved_i32 & NVFP4_CUDA_FLAG_RSF) != 0;
     const int rsf_depth = enable_rsf_scale_tune ? nvfp4_cuda_rsf_depth(cfg_hint) : NVFP4_CUDA_RSF_DEPTH_NORMAL;
-    const int64_t coarse_cap = nvfp4_cuda_rsf_coarse_cap(rsf_depth);
-    const int64_t refine_cap = nvfp4_cuda_rsf_refine_cap(rsf_depth);
-    const int coarse_topk = nvfp4_cuda_rsf_coarse_topk(rsf_depth);
+    const bool compact_scale_search = compact_rsf && rsf_depth <= NVFP4_CUDA_RSF_DEPTH_NORMAL;
+    const int64_t coarse_cap = compact_scale_search
+        ? std::min<int64_t>(nvfp4_cuda_rsf_coarse_cap(rsf_depth), 1024)
+        : nvfp4_cuda_rsf_coarse_cap(rsf_depth);
+    const int64_t refine_cap = compact_scale_search
+        ? std::min<int64_t>(nvfp4_cuda_rsf_refine_cap(rsf_depth), 32768)
+        : nvfp4_cuda_rsf_refine_cap(rsf_depth);
+    const int coarse_topk = compact_scale_search
+        ? std::min(nvfp4_cuda_rsf_coarse_topk(rsf_depth), 12)
+        : nvfp4_cuda_rsf_coarse_topk(rsf_depth);
 
     const int64_t coarse_nb = std::min<int64_t>(nb_total, coarse_cap);
     const int64_t refine_nb = std::min<int64_t>(nb_total, refine_cap);
@@ -3833,20 +4087,33 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         for (float cand_scale : rsf_scale_mul_candidates) {
             add_scale_mul_candidate(cand_scale);
         }
-        for (int si = 0; si < rsf_fixed_n; ++si) {
-            add_scale_mul_candidate(NVFP4_RSF_FIXED_SCALE_POOL[si]);
+        if (compact_scale_search) {
+            constexpr float compact_fixed[] = {
+                0.875f, 0.9375f, 0.96875f, 0.984375f,
+                1.015625f, 1.03125f, 1.0625f, 1.125f,
+            };
+            for (float cand_scale : compact_fixed) {
+                add_scale_mul_candidate(cand_scale);
+            }
+        } else {
+            for (int si = 0; si < rsf_fixed_n; ++si) {
+                add_scale_mul_candidate(NVFP4_RSF_FIXED_SCALE_POOL[si]);
+            }
         }
         if (trace && !rsf_scale_mul_candidates.empty()) {
             fprintf(stderr,
-                "NVFP4_TUNE (CUDA RSF) analytic_scale_mul=%d total_scale_mul=%d\n",
+                "NVFP4_TUNE (CUDA RSF) analytic_scale_mul=%d total_scale_mul=%d compact=%d compact_scales=%d\n",
                 (int) rsf_scale_mul_candidates.size(),
-                (int) scale_mul_candidates.size());
+                (int) scale_mul_candidates.size(),
+                compact_rsf ? 1 : 0,
+                compact_scale_search ? 1 : 0);
         }
     }
 
     std::vector<nvfp4_cuda_eval_request> coarse_requests;
+    const bool skip_ab_grid = compact_rsf;
     const size_t coarse_request_limit =
-        1 + scale_mul_candidates.size() + (size_t) a_candidates_n * (size_t) b_candidates_n;
+        1 + scale_mul_candidates.size() + (skip_ab_grid ? 0 : (size_t) a_candidates_n * (size_t) b_candidates_n);
     coarse_requests.reserve(coarse_request_limit);
     coarse_requests.push_back(make_ab_request(NVFP4_A0, NVFP4_B0));
     if (enable_rsf_scale_tune) {
@@ -3854,16 +4121,18 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
             coarse_requests.push_back(make_ab_request(NVFP4_A0, NVFP4_B0, cand_scale));
         }
     }
-    for (int ai = 0; ai < a_candidates_n; ++ai) {
-        const float cand_a = a_candidates[ai];
-        for (int bi = 0; bi < b_candidates_n; ++bi) {
+    if (!skip_ab_grid) {
+        for (int ai = 0; ai < a_candidates_n; ++ai) {
+            const float cand_a = a_candidates[ai];
+            for (int bi = 0; bi < b_candidates_n; ++bi) {
+                if (coarse_requests.size() >= coarse_request_limit) {
+                    break;
+                }
+                coarse_requests.push_back(make_ab_request(cand_a, b_candidates[bi]));
+            }
             if (coarse_requests.size() >= coarse_request_limit) {
                 break;
             }
-            coarse_requests.push_back(make_ab_request(cand_a, b_candidates[bi]));
-        }
-        if (coarse_requests.size() >= coarse_request_limit) {
-            break;
         }
     }
 
@@ -3884,7 +4153,9 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
             continue;
         }
         const nvfp4_tune_eval_stats & coarse_stats = coarse_results[ci];
-        const double rank_score = nvfp4_host_robust_score(coarse_stats, base_coarse);
+        const double rank_score =
+            nvfp4_host_robust_score(coarse_stats, base_coarse) +
+            nvfp4_host_scale_mul_prior(coarse_requests[ci].scale_mul, rsf_depth);
         insert_topk(coarse_requests[ci].a, coarse_requests[ci].b, coarse_requests[ci].scale_mul, coarse_stats, rank_score);
         if (nvfp4_host_eval_better(coarse_stats, best_coarse)) {
             best_coarse = coarse_stats;
@@ -3894,7 +4165,7 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
         }
     }
 
-    if (enable_rsf_scale_tune && !scale_mul_candidates.empty()) {
+    if (enable_rsf_scale_tune && !compact_rsf && !scale_mul_candidates.empty()) {
         struct ranked_scale {
             float scale_mul;
             double rank_score;
@@ -3942,7 +4213,9 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
                 continue;
             }
             const auto & req = coarse_requests[ci];
-            const double rank_score = nvfp4_host_robust_score(coarse_results[ci], base_coarse);
+            const double rank_score =
+                nvfp4_host_robust_score(coarse_results[ci], base_coarse) +
+                nvfp4_host_scale_mul_prior(req.scale_mul, rsf_depth);
             const bool scale_changed = std::fabs(req.scale_mul - 1.0f) > 1e-5f;
             const bool ab_changed =
                 std::fabs(req.a - NVFP4_A0) > 1e-12f ||
@@ -3987,7 +4260,9 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
                     continue;
                 }
                 const nvfp4_tune_eval_stats & joint_stats = joint_results[ji];
-                const double rank_score = nvfp4_host_robust_score(joint_stats, base_coarse);
+                const double rank_score =
+                    nvfp4_host_robust_score(joint_stats, base_coarse) +
+                    nvfp4_host_scale_mul_prior(joint_requests[ji].scale_mul, rsf_depth);
                 insert_topk(joint_requests[ji].a, joint_requests[ji].b, joint_requests[ji].scale_mul, joint_stats, rank_score);
                 if (nvfp4_host_eval_better(joint_stats, best_coarse)) {
                     best_coarse = joint_stats;
@@ -4046,7 +4321,9 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
                     base_refine_ready = true;
                 }
 
-                const double score = nvfp4_host_robust_score(refine_stats, base_refine);
+                const double score =
+                    nvfp4_host_robust_score(refine_stats, base_refine) +
+                    nvfp4_host_scale_mul_prior(refine_requests[ri].scale_mul, rsf_depth);
                 if (score < best_refine_score ||
                     (std::fabs(score - best_refine_score) <= 1e-12 * std::max(1.0, std::max(std::fabs(score), std::fabs(best_refine_score))) &&
                      nvfp4_host_eval_better(refine_stats, best_refine))) {
@@ -4450,7 +4727,9 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     }
 
     if (std::isfinite(base_stats.obj_norm) && std::isfinite(final_stats.obj_norm)) {
-        const double best_score = nvfp4_host_robust_score(final_stats, base_stats);
+        const double best_score =
+            nvfp4_host_robust_score(final_stats, base_stats) +
+            nvfp4_host_scale_mul_prior(final_scale_mul, rsf_depth);
         if (!(best_score < (1.0 - NVFP4_AUTOTUNE_MIN_IMPROVE_FRAC))) {
             best_a_now = NVFP4_A0;
             best_b_now = NVFP4_B0;

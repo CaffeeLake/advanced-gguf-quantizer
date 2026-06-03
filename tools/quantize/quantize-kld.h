@@ -22,7 +22,6 @@ struct nvfp4_selector_kld_subset {
     int32_t n_ctx = 0;
     int32_t n_vocab = 0;
     int32_t n_chunk_total = 0;
-    int32_t chunk_start = 0;
     int32_t n_chunk = 0;
     int32_t first = 0;
     int32_t n_score = 0;
@@ -79,8 +78,7 @@ struct nvfp4_selector_derived_metrics {
 };
 
 const uint16_t * nvfp4_selector_kld_log_probs_data(const nvfp4_selector_kld_subset & kld);
-bool nvfp4_selector_load_kld_subset(const std::string & path, int32_t chunk_start, int32_t n_chunks, nvfp4_selector_kld_subset & out);
-nvfp4_selector_kld_subset nvfp4_selector_make_kld_budget_subset(const nvfp4_selector_kld_subset & src, int32_t max_chunks);
+bool nvfp4_selector_load_kld_subset(const std::string & path, nvfp4_selector_kld_subset & out);
 
 void nvfp4_selector_eval_one_token(
     int n_vocab,

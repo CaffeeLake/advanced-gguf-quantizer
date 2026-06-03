@@ -650,7 +650,7 @@ def run_quality_choice(session: PtySession, index: int, files: dict[str, Path], 
         )
         assert_contextual_prompt(session, "imatrix GPU layers", "Make Imatrix")
         session.line("auto", "imatrix GPU layers")
-        press_prompt_defaults(session, ["chunks to process", "extra llama-imatrix args"])
+        press_prompt_defaults(session, ["extra llama-imatrix args"])
     elif index == 4:
         picker_select_typed_path(session, files["eval"], "bundle corpus")
         press_prompt_defaults(session, ["KLD base output", "perplexity executable", "eval bundle path"])
@@ -949,7 +949,7 @@ def case_nvfp4_options_prompt_pages(session: PtySession, case_dir: Path) -> None
     press_prompt_defaults(session, ["Target final average BPW", "KV/cache reserve GiB", "activation/headroom reserve GiB"])
     continue_if_paused(session, "Project > Options")
 
-    open_options_item(session, 4, "NVFP4 4/6 and autotune")
+    open_options_item(session, 4, "NVFP4 4/6 Policy")
     press_prompt_defaults(session, ["NVFP4 preset", "raw NVFP4 cfg override"])
     session.wait_screen("Lane Selection")
     session.key(KEY_ENTER, "Adaptive lane selection")
@@ -963,8 +963,8 @@ def case_nvfp4_options_prompt_pages(session: PtySession, case_dir: Path) -> None
             "4-bit lane cap",
             "NVFP4 scale correction denominator",
             "input scale policy",
-            "autotune max sample blocks",
-            "autotune CPU threads",
+            "max sample blocks",
+            "CPU worker threads",
             "calibration/search families",
             "scale/group tie policy",
         ],
@@ -1108,7 +1108,7 @@ def case_candidate_search_all_paths(session: PtySession, case_dir: Path) -> None
     continue_if_paused(session, "Project > Options")
     open_options_item(session, 5, "Native candidate search")
 
-    for index, label in [(1, "Keep current search settings"), (2, "Fast smoke"), (3, "Balanced quality"), (4, "Full quality")]:
+    for index, label in [(1, "Keep current search settings"), (2, "Fast"), (3, "Normal"), (4, "Deep")]:
         session.wait_screen("Candidate Search")
         select_down(session, index, label)
         if index == 1:
@@ -1124,20 +1124,10 @@ def case_candidate_search_all_paths(session: PtySession, case_dir: Path) -> None
         [
             "KLD base file",
             "selector evidence ledger",
-            "ledger planner search mode",
-            "local alternatives per unit",
-            "planner grouping units",
-            "planner beam width",
-            "exact planner budget",
-            "planner delta mode",
             "candidate search checkpoint GGUF",
             "checkpoint cache directory",
             "skip remaining tuning request file",
             "effort label",
-            "KLD chunks to score",
-            "KLD chunk start",
-            "validation chunks",
-            "validation start",
             "stage A sample blocks",
             "stage A max policies",
             "refine top policies",
@@ -1146,7 +1136,6 @@ def case_candidate_search_all_paths(session: PtySession, case_dir: Path) -> None
             "survey sample blocks",
             "max tensors to search",
             "full PPL/KLD candidates",
-            "full PPL/KLD chunks",
             "eval sequences",
             "policy search threads",
             "selector threads",

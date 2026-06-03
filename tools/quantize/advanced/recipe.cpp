@@ -161,15 +161,15 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "target.fit_to_vram") { r.target.fit_to_vram = parse_bool_value(value); return; }
     if (path == "target.sizing_note") { r.target.sizing_note = value; return; }
 
-    if (path == "autotune.enabled") { r.autotune.enabled = parse_bool_value(value); return; }
-    if (path == "autotune.mode") { r.autotune.mode = value; return; }
-    if (path == "autotune.objective") { r.autotune.objective = value; return; }
-    if (path == "autotune.evidence") { r.autotune.evidence = value; return; }
-    if (path == "autotune.policy_set") { r.autotune.policy_set = value; return; }
-    if (path == "autotune.require_kld") { r.autotune.require_kld = parse_bool_value(value); return; }
-    if (path == "autotune.require_corpus") { r.autotune.require_corpus = parse_bool_value(value); return; }
-    if (path == "autotune.require_imatrix") { r.autotune.require_imatrix = parse_bool_value(value); return; }
-    if (path == "autotune.allow_diagnostic") { r.autotune.allow_diagnostic = parse_bool_value(value); return; }
+    if (path == "quantizer.enabled") { r.quantizer.enabled = parse_bool_value(value); return; }
+    if (path == "quantizer.mode") { r.quantizer.mode = value; return; }
+    if (path == "quantizer.objective") { r.quantizer.objective = value; return; }
+    if (path == "quantizer.evidence") { r.quantizer.evidence = value; return; }
+    if (path == "quantizer.policy_set") { r.quantizer.policy_set = value; return; }
+    if (path == "quantizer.require_kld") { r.quantizer.require_kld = parse_bool_value(value); return; }
+    if (path == "quantizer.require_corpus") { r.quantizer.require_corpus = parse_bool_value(value); return; }
+    if (path == "quantizer.require_imatrix") { r.quantizer.require_imatrix = parse_bool_value(value); return; }
+    if (path == "quantizer.allow_diagnostic") { r.quantizer.allow_diagnostic = parse_bool_value(value); return; }
 
     if (path == "stock_ftype.source") { r.stock_ftype.source = value; return; }
     if (path == "stock_ftype.mostly_type") { r.stock_ftype.mostly_type = value; return; }
@@ -212,7 +212,6 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "calibration.n_gpu_layers") { r.calibration.n_gpu_layers = value; return; }
     if (path == "calibration.threads") { r.calibration.threads = value; return; }
     if (path == "calibration.threads_batch") { r.calibration.threads_batch = value; return; }
-    if (path == "calibration.chunks") { r.calibration.chunks = value; return; }
     if (path == "calibration.extra_args") { r.calibration.extra_args = value; return; }
     if (path == "calibration.include_weights") { r.calibration.include_weights = parse_string_list(raw_value); return; }
     if (path == "calibration.exclude_weights") { r.calibration.exclude_weights = parse_string_list(raw_value); return; }
@@ -235,8 +234,8 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "nvfp4.scale_tie") { r.nvfp4.scale_tie = value; return; }
     if (path == "nvfp4.rsf.mode") { r.nvfp4.rsf.mode = value; return; }
     if (path == "nvfp4.rsf.depth") { r.nvfp4.rsf.depth = value; return; }
-    if (path == "nvfp4.autotune.max_blocks") { r.nvfp4.autotune.max_blocks = value; return; }
-    if (path == "nvfp4.autotune.threads") { r.nvfp4.autotune.threads = value; return; }
+    if (path == "nvfp4.encoder.max_blocks") { r.nvfp4.encoder.max_blocks = value; return; }
+    if (path == "nvfp4.encoder.threads") { r.nvfp4.encoder.threads = value; return; }
 
     if (path == "nvfp4.four_six.choose46") { r.nvfp4.four_six.choose46 = value; return; }
     if (path == "nvfp4.four_six.refit_iters") { r.nvfp4.four_six.refit_iters = value; return; }
@@ -253,22 +252,22 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "mxfp6.selector_scale_top") { r.mxfp6.selector_scale_top = value; return; }
     if (path == "mxfp6.selector_scale_candidates") { r.mxfp6.selector_scale_candidates = value; return; }
 
-    if (path == "mixed.policy" || path == "mixed_format.policy" || path == "nv4mx6.policy") { r.nv4mx6.policy = canonical_mixed_policy(value); return; }
-    if (path == "mixed.mx6_penalty" || path == "mixed_format.mx6_penalty" || path == "nv4mx6.mx6_penalty") { r.nv4mx6.mx6_penalty = value; return; }
-    if (path == "mixed.bf16_mx6_threshold" || path == "mixed_format.bf16_mx6_threshold" || path == "nv4mx6.bf16_mx6_threshold") { r.nv4mx6.bf16_mx6_threshold = value; return; }
-    if (path == "mixed.sample_blocks" || path == "mixed_format.sample_blocks" || path == "nv4mx6.sample_blocks") { r.nv4mx6.sample_blocks = value; return; }
-    if (path == "mixed.sample_cap" || path == "mixed_format.sample_cap" || path == "nv4mx6.sample_cap") { r.nv4mx6.sample_cap = value; return; }
-    if (path == "mixed.imatrix_weight_blend" || path == "mixed_format.imatrix_weight_blend" || path == "nv4mx6.imatrix_weight_blend") { r.nv4mx6.imatrix_weight_blend = value; return; }
-    if (path == "mixed.imatrix_weight_power" || path == "mixed_format.imatrix_weight_power" || path == "nv4mx6.imatrix_weight_power") { r.nv4mx6.imatrix_weight_power = value; return; }
-    if (path == "mixed.imatrix_weight_min" || path == "mixed_format.imatrix_weight_min" || path == "nv4mx6.imatrix_weight_min") { r.nv4mx6.imatrix_weight_min = value; return; }
-    if (path == "mixed.imatrix_weight_max" || path == "mixed_format.imatrix_weight_max" || path == "nv4mx6.imatrix_weight_max") { r.nv4mx6.imatrix_weight_max = value; return; }
+    if (path == "mixed.policy") { r.nv4mx6.policy = canonical_mixed_policy(value); return; }
+    if (path == "mixed.mx6_penalty") { r.nv4mx6.mx6_penalty = value; return; }
+    if (path == "mixed.bf16_mx6_threshold") { r.nv4mx6.bf16_mx6_threshold = value; return; }
+    if (path == "mixed.sample_blocks") { r.nv4mx6.sample_blocks = value; return; }
+    if (path == "mixed.sample_cap") { r.nv4mx6.sample_cap = value; return; }
+    if (path == "mixed.imatrix_weight_blend") { r.nv4mx6.imatrix_weight_blend = value; return; }
+    if (path == "mixed.imatrix_weight_power") { r.nv4mx6.imatrix_weight_power = value; return; }
+    if (path == "mixed.imatrix_weight_min") { r.nv4mx6.imatrix_weight_min = value; return; }
+    if (path == "mixed.imatrix_weight_max") { r.nv4mx6.imatrix_weight_max = value; return; }
 
     if (path == "selector.effort") { r.selector.effort = value; return; }
     if (path == "selector.kld") { r.selector.kld = value; return; }
-    if (path == "selector.checkpoint_model" || path == "selector.seed_model") { r.selector.checkpoint_model = value; return; }
+    if (path == "selector.checkpoint_model") { r.selector.checkpoint_model = value; return; }
     if (path == "selector.cache_dir") { r.selector.cache_dir = value; return; }
     if (path == "selector.skip_file") { r.selector.skip_file = value; return; }
-    if (path == "selector.ledger" || path == "selector.evidence_ledger") { r.selector.ledger = value; return; }
+    if (path == "selector.ledger") { r.selector.ledger = value; return; }
     if (path == "selector.search") { r.selector.search = value; return; }
     if (path == "selector.local_top_k") { r.selector.local_top_k = value; return; }
     if (path == "selector.group_units") { r.selector.group_units = value; return; }
@@ -277,10 +276,6 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.delta_mode") { r.selector.delta_mode = value; return; }
     if (path == "selector.keep_checkpoint") { r.selector.keep_checkpoint = parse_bool_value(value); return; }
     if (path == "selector.require_runtime_cache") { r.selector.require_runtime_cache = parse_bool_value(value); return; }
-    if (path == "selector.chunks") { r.selector.chunks = value; return; }
-    if (path == "selector.chunk_start") { r.selector.chunk_start = value; return; }
-    if (path == "selector.holdout_chunks") { r.selector.holdout_chunks = value; return; }
-    if (path == "selector.holdout_start") { r.selector.holdout_start = value; return; }
     if (path == "selector.stagea_sample_blocks") { r.selector.stagea_sample_blocks = value; return; }
     if (path == "selector.stagea_max_policies") { r.selector.stagea_max_policies = value; return; }
     if (path == "selector.refine_top") { r.selector.refine_top = value; return; }
@@ -294,7 +289,6 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "selector.kld_threads") { r.selector.kld_threads = value; return; }
     if (path == "selector.only") { r.selector.only = parse_bool_value(value); return; }
     if (path == "selector.eval_top") { r.selector.eval_top = value; return; }
-    if (path == "selector.eval_chunks") { r.selector.eval_chunks = value; return; }
     if (path == "selector.n_seq") { r.selector.n_seq = value; return; }
     if (path == "selector.sensitivity_report") { r.selector.sensitivity_report = value; return; }
     if (path == "selector.sensitivity_top") { r.selector.sensitivity_top = value; return; }
@@ -419,7 +413,7 @@ static void append_unique(std::vector<std::string> & values, const std::string &
 }
 
 static void apply_native_policy_set(Recipe & r) {
-    const std::string policy = lower_copy(trim(r.autotune.policy_set));
+    const std::string policy = lower_copy(trim(r.quantizer.policy_set));
     if (policy == "manual" || policy == "custom") {
         return;
     }
@@ -565,7 +559,7 @@ std::string canonical_quant_type(std::string value) {
     value = trim(value);
     std::replace(value.begin(), value.end(), '-', '_');
     const std::string lower = lower_copy(value);
-    if (lower == "mixed" || lower == "nvfp4_mxfp6") {
+    if (lower == "nvfp4_mxfp6") {
         return "NVFP4_MXFP6";
     }
     if (lower == "nvfp4") {
@@ -703,20 +697,23 @@ std::vector<std::string> validate_recipe(const Recipe & recipe, bool require_io)
         quant_type_uses_mxfp6(recipe.base.ftype) ||
         quant_type_uses_nvfp4(recipe.target.precision_mode) ||
         quant_type_uses_mxfp6(recipe.target.precision_mode);
-    if (recipe.autotune.mode == "diagnostic" && !recipe.autotune.allow_diagnostic) {
-        errors.push_back("autotune.mode=diagnostic requires autotune.allow_diagnostic=true and must not be used for model evidence");
+    const std::string quantizer_mode = lower_copy(trim(recipe.quantizer.mode));
+    if (quantizer_mode != "fast" &&
+            quantizer_mode != "normal" &&
+            quantizer_mode != "deep") {
+        errors.push_back("quantizer.mode must be one of: fast, normal, deep");
     }
-    if (advanced_precision_quant && recipe.autotune.require_kld && recipe.evaluation.kld_base.empty() && recipe.selector.kld.empty()) {
-        errors.push_back("real Blackwell autotune requires evaluation.kld_base or selector.kld");
+    if (advanced_precision_quant && recipe.quantizer.require_kld && recipe.evaluation.kld_base.empty() && recipe.selector.kld.empty()) {
+        errors.push_back("real Blackwell quantizer evidence requires evaluation.kld_base or selector.kld");
     }
-    if (advanced_precision_quant && recipe.autotune.require_corpus && recipe.evaluation.corpus.empty()) {
-        errors.push_back("quality Blackwell autotune requires evaluation.corpus so PPL/KLD uses a named corpus");
+    if (advanced_precision_quant && recipe.quantizer.require_corpus && recipe.evaluation.corpus.empty()) {
+        errors.push_back("quality Blackwell quantizer evidence requires evaluation.corpus so PPL/KLD uses a named corpus");
     }
-    if (advanced_precision_quant && recipe.autotune.require_imatrix && recipe.calibration.imatrix.empty()) {
-        errors.push_back("quality Blackwell autotune requires calibration.imatrix; generate or select an imatrix for the same corpus before claiming a best-quality run");
+    if (advanced_precision_quant && recipe.quantizer.require_imatrix && recipe.calibration.imatrix.empty()) {
+        errors.push_back("quality Blackwell quantizer evidence requires calibration.imatrix; generate or select an imatrix for the same corpus before claiming a best-quality run");
     }
-    if (advanced_precision_quant && recipe.autotune.require_imatrix && recipe.calibration.corpus.empty()) {
-        errors.push_back("quality Blackwell autotune requires calibration.corpus so imatrix and local calibration use the same training corpus");
+    if (advanced_precision_quant && recipe.quantizer.require_imatrix && recipe.calibration.corpus.empty()) {
+        errors.push_back("quality Blackwell quantizer evidence requires calibration.corpus so imatrix and local calibration use the same training corpus");
     }
     if (recipe.calibration.include_weights.size() > 0 && recipe.calibration.exclude_weights.size() > 0) {
         errors.push_back("calibration.include_weights and calibration.exclude_weights cannot both be set");
@@ -766,16 +763,16 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_bool(out, "fit_to_vram", r.target.fit_to_vram);
     dump_string(out, "sizing_note", r.target.sizing_note);
 
-    out << "\n[autotune]\n";
-    dump_bool(out, "enabled", r.autotune.enabled);
-    dump_string(out, "mode", r.autotune.mode);
-    dump_string(out, "objective", r.autotune.objective);
-    dump_string(out, "evidence", r.autotune.evidence);
-    dump_string(out, "policy_set", r.autotune.policy_set);
-    dump_bool(out, "require_kld", r.autotune.require_kld);
-    dump_bool(out, "require_corpus", r.autotune.require_corpus);
-    dump_bool(out, "require_imatrix", r.autotune.require_imatrix);
-    dump_bool(out, "allow_diagnostic", r.autotune.allow_diagnostic);
+    out << "\n[quantizer]\n";
+    dump_bool(out, "enabled", r.quantizer.enabled);
+    dump_string(out, "mode", r.quantizer.mode);
+    dump_string(out, "objective", r.quantizer.objective);
+    dump_string(out, "evidence", r.quantizer.evidence);
+    dump_string(out, "policy_set", r.quantizer.policy_set);
+    dump_bool(out, "require_kld", r.quantizer.require_kld);
+    dump_bool(out, "require_corpus", r.quantizer.require_corpus);
+    dump_bool(out, "require_imatrix", r.quantizer.require_imatrix);
+    dump_bool(out, "allow_diagnostic", r.quantizer.allow_diagnostic);
 
     out << "\n[stock_ftype]\n";
     dump_string(out, "source", r.stock_ftype.source);
@@ -824,7 +821,6 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "n_gpu_layers", r.calibration.n_gpu_layers);
     dump_string(out, "threads", r.calibration.threads);
     dump_string(out, "threads_batch", r.calibration.threads_batch);
-    dump_string(out, "chunks", r.calibration.chunks);
     dump_string(out, "extra_args", r.calibration.extra_args);
     dump_string_list(out, "include_weights", r.calibration.include_weights);
     dump_string_list(out, "exclude_weights", r.calibration.exclude_weights);
@@ -853,11 +849,11 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "mode", r.nvfp4.rsf.mode);
     dump_string(out, "depth", r.nvfp4.rsf.depth);
 
-    const bool show_low_level = !r.autotune.enabled || r.autotune.allow_diagnostic;
+    const bool show_low_level = !r.quantizer.enabled || r.quantizer.allow_diagnostic;
     if (show_low_level) {
-        out << "\n[nvfp4.autotune]\n";
-        dump_string(out, "max_blocks", r.nvfp4.autotune.max_blocks);
-        dump_string(out, "threads", r.nvfp4.autotune.threads);
+        out << "\n[nvfp4.encoder]\n";
+        dump_string(out, "max_blocks", r.nvfp4.encoder.max_blocks);
+        dump_string(out, "threads", r.nvfp4.encoder.threads);
 
         out << "\n[nvfp4.four_six]\n";
         dump_string(out, "choose46", r.nvfp4.four_six.choose46);
@@ -905,19 +901,15 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "cache_dir", r.selector.cache_dir);
     dump_string(out, "skip_file", r.selector.skip_file);
     dump_string(out, "ledger", r.selector.ledger);
-    dump_string(out, "search", r.selector.search);
-    dump_string(out, "local_top_k", r.selector.local_top_k);
-    dump_string(out, "group_units", r.selector.group_units);
-    dump_string(out, "beam_width", r.selector.beam_width);
-    dump_string(out, "exact_budget", r.selector.exact_budget);
-    dump_string(out, "delta_mode", r.selector.delta_mode);
     if (show_low_level) {
+        dump_string(out, "search", r.selector.search);
+        dump_string(out, "local_top_k", r.selector.local_top_k);
+        dump_string(out, "group_units", r.selector.group_units);
+        dump_string(out, "beam_width", r.selector.beam_width);
+        dump_string(out, "exact_budget", r.selector.exact_budget);
+        dump_string(out, "delta_mode", r.selector.delta_mode);
         dump_bool(out, "keep_checkpoint", r.selector.keep_checkpoint);
         dump_bool(out, "require_runtime_cache", r.selector.require_runtime_cache);
-        dump_string(out, "chunks", r.selector.chunks);
-        dump_string(out, "chunk_start", r.selector.chunk_start);
-        dump_string(out, "holdout_chunks", r.selector.holdout_chunks);
-        dump_string(out, "holdout_start", r.selector.holdout_start);
         dump_string(out, "stagea_sample_blocks", r.selector.stagea_sample_blocks);
         dump_string(out, "stagea_max_policies", r.selector.stagea_max_policies);
         dump_string(out, "refine_top", r.selector.refine_top);
@@ -931,7 +923,6 @@ std::string dump_recipe_toml(const Recipe & r) {
         dump_string(out, "kld_threads", r.selector.kld_threads);
         dump_bool(out, "only", r.selector.only);
         dump_string(out, "eval_top", r.selector.eval_top);
-        dump_string(out, "eval_chunks", r.selector.eval_chunks);
         dump_string(out, "n_seq", r.selector.n_seq);
     }
     dump_string(out, "sensitivity_report", r.selector.sensitivity_report);
@@ -981,40 +972,34 @@ std::string default_recipe_toml(const std::string & profile) {
     return dump_recipe_toml(default_recipe(profile));
 }
 
-void apply_master_autotune(Recipe & r) {
-    if (!r.autotune.enabled) {
+void apply_quantizer_mode(Recipe & r) {
+    if (!r.quantizer.enabled) {
         return;
     }
 
-    const std::string mode = lower_copy(trim(r.autotune.mode));
-    const bool diagnostic = mode == "diagnostic";
-    const bool fast =
-        mode == "fast" ||
-        mode == "minimal" ||
-        mode == "fast-minimal" ||
-        mode == "minimal-autotune";
-    if (diagnostic) {
-        r.selector.effort = "diagnostic";
-    } else if (fast) {
-        r.autotune.mode = "fast";
-        r.selector.effort = "fast-minimal";
-    } else if (mode == "balanced") {
-        r.autotune.mode = "balanced";
-        r.selector.effort = "real-best";
+    const std::string mode = lower_copy(trim(r.quantizer.mode));
+    const bool fast = mode == "fast";
+    const bool normal = mode == "normal";
+    if (fast) {
+        r.quantizer.mode = "fast";
+        r.selector.effort = "fast";
+    } else if (normal) {
+        r.quantizer.mode = "normal";
+        r.selector.effort = "normal";
     } else {
-        r.autotune.mode = "quality";
-        r.selector.effort = "full-best";
+        r.quantizer.mode = "deep";
+        r.selector.effort = "deep";
     }
 
-    if (r.autotune.objective.empty()) {
-        r.autotune.objective = "kld-first";
+    if (r.quantizer.objective.empty()) {
+        r.quantizer.objective = "kld-first";
     }
-    if (r.autotune.evidence.empty()) {
-        r.autotune.evidence = "real-ppl-kld";
+    if (r.quantizer.evidence.empty()) {
+        r.quantizer.evidence = "real-ppl-kld";
     }
-    r.autotune.require_kld = !fast;
-    r.autotune.require_corpus = !fast;
-    r.autotune.require_imatrix = !fast;
+    r.quantizer.require_kld = !fast;
+    r.quantizer.require_corpus = !fast;
+    r.quantizer.require_imatrix = !fast;
 
     apply_native_policy_set(r);
 
@@ -1026,47 +1011,19 @@ void apply_master_autotune(Recipe & r) {
     }
 
     r.selector.keep_checkpoint = true;
-    r.selector.require_runtime_cache = !fast && r.autotune.evidence == "real-ppl-kld";
+    r.selector.require_runtime_cache = !fast && r.quantizer.evidence == "real-ppl-kld";
     auto assign_if_empty = [](std::string & value, const std::string & fallback) {
         if (value.empty()) {
             value = fallback;
         }
     };
-    assign_if_empty(r.selector.search, "legacy");
+    assign_if_empty(r.selector.search, "tensor-policy");
     assign_if_empty(r.selector.local_top_k, "0");
     assign_if_empty(r.selector.group_units, "auto");
     assign_if_empty(r.selector.beam_width, "1");
     assign_if_empty(r.selector.exact_budget, "auto");
     assign_if_empty(r.selector.delta_mode, "estimate");
-    if (diagnostic) {
-        assign_if_empty(r.selector.chunks, "4");
-        assign_if_empty(r.selector.holdout_chunks, "1");
-        assign_if_empty(r.selector.stagea_sample_blocks, "2048");
-        assign_if_empty(r.selector.stagea_max_policies, "16");
-        assign_if_empty(r.selector.refine_top, "8");
-        assign_if_empty(r.selector.refine_budget, "64");
-        assign_if_empty(r.selector.survey_top, "64");
-        assign_if_empty(r.selector.survey_sample_blocks, "2048");
-        assign_if_empty(r.selector.max_tensors, "0");
-        assign_if_empty(r.selector.eval_top, "4");
-        assign_if_empty(r.selector.eval_chunks, "4");
-        assign_if_empty(r.selector.n_seq, "1");
-        assign_if_empty(r.nvfp4.autotune.max_blocks, "8192");
-        assign_if_empty(r.nvfp4.rsf.depth, "normal");
-        assign_if_empty(r.nvfp4.four_six.refit_iters, "8");
-        if (uses_mxfp6) {
-            if (uses_nvfp4) {
-                assign_if_empty(r.nv4mx6.policy, "nv4_promote_mx6");
-                assign_if_empty(r.nv4mx6.mx6_penalty, "3.0");
-            }
-            assign_if_empty(r.mxfp6.selector_scale_top, "64");
-        }
-        return;
-    }
-
     if (fast) {
-        assign_if_empty(r.selector.chunks, "32");
-        assign_if_empty(r.selector.holdout_chunks, "16");
         assign_if_empty(r.selector.stagea_sample_blocks, "2048");
         assign_if_empty(r.selector.stagea_max_policies, "0");
         assign_if_empty(r.selector.refine_top, "12");
@@ -1075,8 +1032,6 @@ void apply_master_autotune(Recipe & r) {
         assign_if_empty(r.selector.survey_sample_blocks, "2048");
         assign_if_empty(r.selector.max_tensors, "0");
         assign_if_empty(r.selector.eval_top, "16");
-        assign_if_empty(r.selector.eval_chunks, "32");
-        assign_if_empty(r.selector.n_seq, "2");
         assign_if_empty(r.selector.ranking.kld_penalty, "4.0");
         assign_if_empty(r.selector.ranking.p99_penalty, "1.5");
         assign_if_empty(r.selector.ranking.p999_penalty, "0.75");
@@ -1086,7 +1041,7 @@ void apply_master_autotune(Recipe & r) {
         r.selector.ranking.p999_hard_gate = false;
         r.selector.ranking.max_kld_hard_gate = false;
         if (uses_nvfp4) {
-            assign_if_empty(r.nvfp4.autotune.max_blocks, "8192");
+        assign_if_empty(r.nvfp4.encoder.max_blocks, "8192");
             assign_if_empty(r.nvfp4.rsf.depth, "deeper");
             assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
             assign_if_empty(r.nvfp4.four_six.refit_iters, "8");
@@ -1107,23 +1062,19 @@ void apply_master_autotune(Recipe & r) {
         return;
     }
 
-    const bool balanced = r.autotune.mode == "balanced";
-    assign_if_empty(r.selector.chunks, balanced ? "96" : "auto");
-    assign_if_empty(r.selector.holdout_chunks, balanced ? "48" : "auto");
-    assign_if_empty(r.selector.stagea_sample_blocks, balanced ? "8192" : "16384");
+    const bool normal_mode = r.quantizer.mode == "normal";
+    assign_if_empty(r.selector.stagea_sample_blocks, normal_mode ? "8192" : "16384");
     assign_if_empty(r.selector.stagea_max_policies, "0");
     assign_if_empty(r.selector.refine_top, "24");
     assign_if_empty(r.selector.refine_budget, "192");
     assign_if_empty(r.selector.survey_top, "64");
-    assign_if_empty(r.selector.survey_sample_blocks, balanced ? "8192" : "16384");
+    assign_if_empty(r.selector.survey_sample_blocks, normal_mode ? "8192" : "16384");
     assign_if_empty(r.selector.max_tensors, "0");
     assign_if_empty(r.selector.eval_top, "24");
-    assign_if_empty(r.selector.eval_chunks, balanced ? "96" : "auto");
-    assign_if_empty(r.selector.n_seq, "2");
 
     if (uses_nvfp4) {
-        assign_if_empty(r.nvfp4.autotune.max_blocks, balanced ? "32768" : "65536");
-        assign_if_empty(r.nvfp4.rsf.depth, balanced ? "deeper" : "exhaustive");
+        assign_if_empty(r.nvfp4.encoder.max_blocks, normal_mode ? "32768" : "65536");
+        assign_if_empty(r.nvfp4.rsf.depth, normal_mode ? "deeper" : "exhaustive");
         assign_if_empty(r.nvfp4.four_six.choose46, "adaptive");
         assign_if_empty(r.nvfp4.four_six.refit_iters, "16");
         assign_if_empty(r.nvfp4.four_six.compand, "1");
@@ -1134,8 +1085,8 @@ void apply_master_autotune(Recipe & r) {
         assign_if_empty(r.selector.ranking.p999_penalty, "1.5");
         assign_if_empty(r.selector.ranking.max_kld_penalty, "0.35");
         r.selector.ranking.kld_hard_gate = false;
-        r.selector.ranking.p99_hard_gate = !balanced;
-        r.selector.ranking.p999_hard_gate = !balanced;
+        r.selector.ranking.p99_hard_gate = !normal_mode;
+        r.selector.ranking.p999_hard_gate = !normal_mode;
         r.selector.ranking.max_kld_hard_gate = false;
     } else if (uses_mxfp6) {
         assign_if_empty(r.selector.ranking.kld_penalty, "8.0");
@@ -1149,9 +1100,9 @@ void apply_master_autotune(Recipe & r) {
     if (uses_mxfp6) {
         if (uses_nvfp4) {
             assign_if_empty(r.nv4mx6.policy, "nv4_promote_mx6");
-            assign_if_empty(r.nv4mx6.mx6_penalty, balanced ? "3.0" : "3.5");
+            assign_if_empty(r.nv4mx6.mx6_penalty, normal_mode ? "3.0" : "3.5");
         }
-        assign_if_empty(r.mxfp6.selector_scale_top, balanced ? "32" : "48");
+        assign_if_empty(r.mxfp6.selector_scale_top, normal_mode ? "32" : "48");
         assign_if_empty(r.mxfp6.selector_scale_candidates, "0.771105,0.840896,0.917004,0.957603,1,1.04427,1.09051,1.18921,1.29684");
     } else {
         r.nv4mx6.policy.clear();
@@ -1162,23 +1113,24 @@ void apply_master_autotune(Recipe & r) {
     }
 
     if (uses_nvfp4 && r.rescue.enabled) {
-        assign_if_empty(r.rescue.sample_blocks, balanced ? "4096" : "8192");
-        assign_if_empty(r.rescue.coarse_max_blocks, balanced ? "32768" : "65536");
-        assign_if_empty(r.rescue.refine_max_blocks, balanced ? "65536" : "131072");
-        assign_if_empty(r.rescue.guard_max_blocks, balanced ? "65536" : "131072");
+        assign_if_empty(r.rescue.sample_blocks, normal_mode ? "4096" : "8192");
+        assign_if_empty(r.rescue.nvfp4_top, normal_mode ? "0" : "16");
+        assign_if_empty(r.rescue.coarse_max_blocks, normal_mode ? "16384" : "32768");
+        assign_if_empty(r.rescue.refine_max_blocks, "32768");
+        assign_if_empty(r.rescue.guard_max_blocks, normal_mode ? "32768" : "65536");
     }
 }
 
-static void apply_real_best_defaults(Recipe & r) {
-    r.autotune.enabled = true;
-    r.autotune.mode = "quality";
-    r.autotune.objective = "kld-first";
-    r.autotune.evidence = "real-ppl-kld";
-    r.autotune.require_kld = true;
-    r.autotune.require_corpus = true;
-    r.autotune.require_imatrix = true;
-    r.autotune.allow_diagnostic = false;
-    apply_master_autotune(r);
+static void apply_deep_quality_defaults(Recipe & r) {
+    r.quantizer.enabled = true;
+    r.quantizer.mode = "deep";
+    r.quantizer.objective = "kld-first";
+    r.quantizer.evidence = "real-ppl-kld";
+    r.quantizer.require_kld = true;
+    r.quantizer.require_corpus = true;
+    r.quantizer.require_imatrix = true;
+    r.quantizer.allow_diagnostic = false;
+    apply_quantizer_mode(r);
 }
 
 Recipe default_recipe(const std::string & profile) {
@@ -1193,13 +1145,13 @@ Recipe default_recipe(const std::string & profile) {
         r.nvfp4.scale_tie.clear();
         r.base.output_tensor_type = "MXFP6_E2M3";
         r.base.token_embedding_type = "MXFP6_E2M3";
-        apply_real_best_defaults(r);
+        apply_deep_quality_defaults(r);
         r.mxfp6.tensor_scale = "on";
         r.stock_ftype.mostly_type = "MOSTLY_MXFP6_E2M3";
         r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
         r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
         r.stock_ftype.rationale = "Explicit local MXFP6_E2M3 recipe; embeddings/output use MXFP6_E2M3.";
-    } else if (profile == "nvfp4-mxfp6-balanced" || profile == "nvfp4_mxfp6" || profile == "nvfp4-mxfp6") {
+    } else if (profile == "nvfp4_mxfp6") {
         r.target.precision_mode = "NVFP4_MXFP6";
         r.base.ftype = "NVFP4_MXFP6";
         r.base.output_tensor_type = "MXFP6_E2M3";
@@ -1207,7 +1159,7 @@ Recipe default_recipe(const std::string & profile) {
         r.nvfp4.preset = "baseline";
         r.nvfp4.correction_denom = "2688";
         r.nvfp4.input_scale_policy = "imatrix-rms";
-        apply_real_best_defaults(r);
+        apply_deep_quality_defaults(r);
         r.nv4mx6.policy = "nv4_promote_mx6";
         r.nv4mx6.mx6_penalty = "3.5";
         r.selector.ranking.kld_penalty = "12.0";
@@ -1219,13 +1171,13 @@ Recipe default_recipe(const std::string & profile) {
         r.rescue.top = "-1";
         r.rescue.budget_mb = "3000";
         r.rescue.class_limit = "0";
-        r.rescue.nvfp4_top = "256";
-        apply_master_autotune(r);
+        r.rescue.nvfp4_top = "16";
+        apply_quantizer_mode(r);
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
         r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
         r.stock_ftype.rationale = "Local mixed NVFP4/MXFP6 recipe starts compact and promotes measured high-risk tensors to MXFP6_E2M3.";
-    } else if (profile == "mxfp6-nvfp4-quality" || profile == "mxfp6_nvfp4" || profile == "mxfp6-primary") {
+    } else if (profile == "mxfp6-primary") {
         r.target.precision_mode = "NVFP4_MXFP6";
         r.base.ftype = "MXFP6";
         r.base.output_tensor_type = "MXFP6_E2M3";
@@ -1233,7 +1185,7 @@ Recipe default_recipe(const std::string & profile) {
         r.nvfp4.preset = "baseline";
         r.nvfp4.correction_denom = "2688";
         r.nvfp4.input_scale_policy = "imatrix-rms";
-        apply_real_best_defaults(r);
+        apply_deep_quality_defaults(r);
         r.nv4mx6.policy = "mx6_demote_nv4";
         r.nv4mx6.mx6_penalty = "1.75";
         r.rescue.enabled = true;
@@ -1242,7 +1194,7 @@ Recipe default_recipe(const std::string & profile) {
         r.rescue.report_top = "12";
         r.rescue.budget_mb = "0";
         r.rescue.class_limit = "0";
-        apply_master_autotune(r);
+        apply_quantizer_mode(r);
         r.stock_ftype.mostly_type = "MOSTLY_MXFP6_E2M3";
         r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
         r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
@@ -1252,15 +1204,15 @@ Recipe default_recipe(const std::string & profile) {
         r.base.ftype = "NVFP4";
         r.base.output_tensor_type = "Q6_K";
         r.base.token_embedding_type = "NVFP4";
-        r.autotune.enabled = true;
-        r.autotune.mode = "quality";
-        r.autotune.objective = "kld-first";
-        r.autotune.evidence = "real-ppl-kld";
-        r.autotune.require_kld = true;
-        r.autotune.require_corpus = true;
-        r.autotune.require_imatrix = true;
-        r.autotune.allow_diagnostic = false;
-        apply_master_autotune(r);
+        r.quantizer.enabled = true;
+        r.quantizer.mode = "normal";
+        r.quantizer.objective = "kld-first";
+        r.quantizer.evidence = "real-ppl-kld";
+        r.quantizer.require_kld = true;
+        r.quantizer.require_corpus = true;
+        r.quantizer.require_imatrix = true;
+        r.quantizer.allow_diagnostic = false;
+        apply_quantizer_mode(r);
         r.rescue.type.clear();
         r.nv4mx6.policy.clear();
         r.mxfp6 = {};
@@ -1268,28 +1220,14 @@ Recipe default_recipe(const std::string & profile) {
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "NVFP4" };
         r.stock_ftype.output_tensor_candidates = { "Q6_K" };
-        r.stock_ftype.rationale = "Default NVFP4 RSF search: full-KLD exhaustive real-artifact selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
-    } else if (profile == "nvfp4-fast" || profile == "nvfp4-minimal" || profile == "fast") {
-        r.target.precision_mode = "NVFP4";
-        r.base.ftype = "NVFP4";
-        r.base.output_tensor_type = "Q6_K";
-        r.base.token_embedding_type = "NVFP4";
-        r.autotune.mode = "fast";
-        apply_master_autotune(r);
-        r.nv4mx6.policy.clear();
-        r.mxfp6 = {};
-        r.mxfp6.tensor_scale.clear();
-        r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
-        r.stock_ftype.token_embedding_candidates = { "NVFP4" };
-        r.stock_ftype.output_tensor_candidates = { "Q6_K" };
-        r.stock_ftype.rationale = "Fast-compatible NVFP4 default: deep RSF selector budget with token embeddings NVFP4 and separate output.weight as Q6_K.";
+        r.stock_ftype.rationale = "Default NVFP4 RSF search: compact KLD-guided real-artifact selector budget.";
     } else if (profile == "q8_0") {
         r.target.precision_mode = "Q8_0";
         r.base.ftype = "Q8_0";
-        r.autotune.enabled = false;
-        r.autotune.require_kld = false;
-        r.autotune.require_corpus = false;
-        r.autotune.require_imatrix = false;
+        r.quantizer.enabled = false;
+        r.quantizer.require_kld = false;
+        r.quantizer.require_corpus = false;
+        r.quantizer.require_imatrix = false;
         r.base.output_tensor_type = "Q8_0";
         r.base.token_embedding_type = "Q8_0";
         r.nvfp4.preset.clear();
@@ -1325,6 +1263,20 @@ Recipe default_recipe() {
     return default_recipe_for_quant_type(Recipe().target.precision_mode);
 }
 
+static std::string quantizer_work_mode_arg(const std::string & mode) {
+    const std::string normalized = lower_copy(trim(mode));
+    if (normalized == "fast") {
+        return "fast";
+    }
+    if (normalized == "normal") {
+        return "normal";
+    }
+    if (normalized == "deep") {
+        return "deep";
+    }
+    return std::string();
+}
+
 std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_run) {
     (void) force_dry_run;
     std::vector<std::string> args;
@@ -1338,6 +1290,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
             (quant_type == "NVFP4" || quant_type == "MXFP6" ? quant_type : r.base.ftype));
     const bool uses_nvfp4 = quant_type == "NVFP4" || quant_type == "NVFP4_MXFP6" || ftype == "NVFP4";
     const bool uses_mxfp6 = quant_type == "MXFP6" || quant_type == "NVFP4_MXFP6" || ftype == "MXFP6";
+    const bool use_mode_defaults = r.quantizer.enabled && !r.quantizer.allow_diagnostic;
     auto push_pair = [&args](const char * flag, const std::string & value) {
         if (!value.empty()) {
             args.push_back(flag);
@@ -1375,12 +1328,11 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--tensor-type", item);
     }
 
+    if ((uses_nvfp4 || uses_mxfp6) && r.quantizer.enabled) {
+        push_pair("--mode", quantizer_work_mode_arg(r.quantizer.mode));
+    }
+
     if (uses_nvfp4) {
-        const std::string autotune_mode = lower_copy(trim(r.autotune.mode));
-        push_bool("--nvfp4-fast-quantize",
-            r.autotune.enabled &&
-            (autotune_mode == "fast" || autotune_mode == "minimal" ||
-             autotune_mode == "fast-minimal" || autotune_mode == "minimal-autotune"));
         const std::string four_six_cfg = nvfp4_four_six_cfg(r.nvfp4.four_six);
         if (four_six_cfg.empty()) {
             push_pair("--nvfp4-preset", r.nvfp4.preset);
@@ -1390,10 +1342,12 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         }
         push_pair("--nvfp4-correction-denom", r.nvfp4.correction_denom);
         push_pair("--nvfp4-input-scale-policy", r.nvfp4.input_scale_policy);
-        push_pair("--nvfp4-autotune-max-blocks", r.nvfp4.autotune.max_blocks);
-        push_pair("--nvfp4-autotune-threads", r.nvfp4.autotune.threads);
-        push_pair("--nvfp4-selector-rsf-mode", r.nvfp4.rsf.mode);
-        push_pair("--nvfp4-selector-rsf-depth", r.nvfp4.rsf.depth);
+        if (!use_mode_defaults) {
+            push_pair("--nvfp4-encoder-max-blocks", r.nvfp4.encoder.max_blocks);
+            push_pair("--nvfp4-encoder-threads", r.nvfp4.encoder.threads);
+            push_pair("--nvfp4-selector-rsf-mode", r.nvfp4.rsf.mode);
+            push_pair("--nvfp4-selector-rsf-depth", r.nvfp4.rsf.depth);
+        }
     }
 
     const bool uses_mxfp6_controls =
@@ -1428,41 +1382,28 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_pair("--nvfp4-selector-cache-dir", r.selector.cache_dir);
     push_pair("--nvfp4-selector-skip-file", r.selector.skip_file);
     push_pair("--nvfp4-selector-ledger", r.selector.ledger);
-    const std::string selector_search_lower = lower_copy(r.selector.search);
-    const bool selector_planner_requested =
-        !r.selector.search.empty() &&
-        selector_search_lower != "legacy" &&
-        selector_search_lower != "off" &&
-        selector_search_lower != "none";
-    if (selector_planner_requested) {
-        push_pair("--nvfp4-selector-search", r.selector.search);
-        push_pair("--nvfp4-selector-local-top-k", r.selector.local_top_k);
-        push_pair("--nvfp4-selector-group-units", r.selector.group_units);
-        push_pair("--nvfp4-selector-beam-width", r.selector.beam_width);
-        push_pair("--nvfp4-selector-exact-budget", r.selector.exact_budget);
-        push_pair("--nvfp4-selector-delta-mode", r.selector.delta_mode);
-    }
     push_bool("--nvfp4-selector-keep-checkpoint", r.selector.keep_checkpoint);
     push_bool("--nvfp4-selector-require-runtime-cache", r.selector.require_runtime_cache);
-    push_pair("--nvfp4-selector-chunks", r.selector.chunks);
-    push_pair("--nvfp4-selector-chunk-start", r.selector.chunk_start);
-    push_pair("--nvfp4-selector-holdout-chunks", r.selector.holdout_chunks);
-    push_pair("--nvfp4-selector-holdout-start", r.selector.holdout_start);
-    push_pair("--nvfp4-selector-stagea-sample-blocks", r.selector.stagea_sample_blocks);
-    push_pair("--nvfp4-selector-stagea-max-policies", r.selector.stagea_max_policies);
-    push_pair("--nvfp4-selector-refine-top", r.selector.refine_top);
-    push_pair("--nvfp4-selector-refine-budget", r.selector.refine_budget);
-    push_pair("--nvfp4-selector-survey-top", r.selector.survey_top);
-    push_pair("--nvfp4-selector-survey-sample-blocks", r.selector.survey_sample_blocks);
-    push_pair("--nvfp4-selector-max-tensors", r.selector.max_tensors);
+    if (!use_mode_defaults) {
+        push_pair("--nvfp4-selector-stagea-sample-blocks", r.selector.stagea_sample_blocks);
+        push_pair("--nvfp4-selector-stagea-max-policies", r.selector.stagea_max_policies);
+        push_pair("--nvfp4-selector-refine-top", r.selector.refine_top);
+        push_pair("--nvfp4-selector-refine-budget", r.selector.refine_budget);
+        push_pair("--nvfp4-selector-survey-top", r.selector.survey_top);
+        push_pair("--nvfp4-selector-survey-sample-blocks", r.selector.survey_sample_blocks);
+        push_pair("--nvfp4-selector-max-tensors", r.selector.max_tensors);
+    }
     push_bool("--nvfp4-selector-trace", r.selector.trace);
-    push_pair("--nvfp4-selector-policy-threads", r.selector.policy_threads);
-    push_pair("--nvfp4-selector-threads", r.selector.threads);
-    push_pair("--nvfp4-selector-kld-threads", r.selector.kld_threads);
+    if (!use_mode_defaults) {
+        push_pair("--nvfp4-selector-policy-threads", r.selector.policy_threads);
+        push_pair("--nvfp4-selector-threads", r.selector.threads);
+        push_pair("--nvfp4-selector-kld-threads", r.selector.kld_threads);
+    }
     push_bool("--nvfp4-selector-only", r.selector.only);
-    push_pair("--nvfp4-selector-eval-top", r.selector.eval_top);
-    push_pair("--nvfp4-selector-eval-chunks", r.selector.eval_chunks);
-    push_pair("--nvfp4-selector-n-seq", r.selector.n_seq);
+    if (!use_mode_defaults) {
+        push_pair("--nvfp4-selector-eval-top", r.selector.eval_top);
+        push_pair("--nvfp4-selector-n-seq", r.selector.n_seq);
+    }
     push_pair("--nvfp4-selector-sensitivity-report", r.selector.sensitivity_report);
     push_pair("--nvfp4-selector-sensitivity-top", r.selector.sensitivity_top);
     push_pair("--nvfp4-selector-sensitivity-layer", r.selector.sensitivity_layer);
@@ -1470,22 +1411,24 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     push_pair("--nvfp4-selector-sensitivity-sample-blocks", r.selector.sensitivity_sample_blocks);
     push_pair("--nvfp4-selector-rsf-report", r.selector.rsf_report);
 
-    push_pair("--nvfp4-selector-kld-penalty", r.selector.ranking.kld_penalty);
-    push_pair("--nvfp4-selector-p99-penalty", r.selector.ranking.p99_penalty);
-    push_pair("--nvfp4-selector-p999-penalty", r.selector.ranking.p999_penalty);
-    push_pair("--nvfp4-selector-max-kld-penalty", r.selector.ranking.max_kld_penalty);
-    push_pair("--nvfp4-selector-rank-kld-threshold", r.selector.ranking.kld_threshold);
-    push_pair("--nvfp4-selector-rank-p99-threshold", r.selector.ranking.p99_threshold);
-    push_pair("--nvfp4-selector-rank-p999-threshold", r.selector.ranking.p999_threshold);
-    push_pair("--nvfp4-selector-rank-max-kld-threshold", r.selector.ranking.max_kld_threshold);
-    push_bool("--nvfp4-selector-rank-kld-hard-gate", r.selector.ranking.kld_hard_gate);
-    push_bool("--nvfp4-selector-rank-p99-hard-gate", r.selector.ranking.p99_hard_gate);
-    push_bool("--nvfp4-selector-rank-p999-hard-gate", r.selector.ranking.p999_hard_gate);
-    push_bool("--nvfp4-selector-rank-max-kld-hard-gate", r.selector.ranking.max_kld_hard_gate);
+    if (!use_mode_defaults) {
+        push_pair("--nvfp4-selector-kld-penalty", r.selector.ranking.kld_penalty);
+        push_pair("--nvfp4-selector-p99-penalty", r.selector.ranking.p99_penalty);
+        push_pair("--nvfp4-selector-p999-penalty", r.selector.ranking.p999_penalty);
+        push_pair("--nvfp4-selector-max-kld-penalty", r.selector.ranking.max_kld_penalty);
+        push_pair("--nvfp4-selector-rank-kld-threshold", r.selector.ranking.kld_threshold);
+        push_pair("--nvfp4-selector-rank-p99-threshold", r.selector.ranking.p99_threshold);
+        push_pair("--nvfp4-selector-rank-p999-threshold", r.selector.ranking.p999_threshold);
+        push_pair("--nvfp4-selector-rank-max-kld-threshold", r.selector.ranking.max_kld_threshold);
+        push_bool("--nvfp4-selector-rank-kld-hard-gate", r.selector.ranking.kld_hard_gate);
+        push_bool("--nvfp4-selector-rank-p99-hard-gate", r.selector.ranking.p99_hard_gate);
+        push_bool("--nvfp4-selector-rank-p999-hard-gate", r.selector.ranking.p999_hard_gate);
+        push_bool("--nvfp4-selector-rank-max-kld-hard-gate", r.selector.ranking.max_kld_hard_gate);
+    }
 
     if (uses_nvfp4 && r.rescue.enabled) {
         args.push_back("--nvfp4-selector-auto-rescue");
-        push_pair("--nvfp4-selector-rescue-type", r.rescue.type);
+        push_pair("--nvfp4-selector-candidate-types", r.rescue.type);
         push_pair("--nvfp4-selector-rescue-top", r.rescue.top);
         push_pair("--nvfp4-selector-rescue-report-top", r.rescue.report_top);
         push_pair("--nvfp4-selector-rescue-budget-mb", r.rescue.budget_mb);

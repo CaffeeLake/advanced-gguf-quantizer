@@ -11,7 +11,7 @@ bool striequals(const char * a, const char * b);
 std::string trim_copy(std::string value);
 
 bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, std::string & ftype_str_out);
-bool ftype_is_nvfp4_mxfp6_alias(const std::string & ftype_str);
+bool ftype_is_mixed_nvfp4_mxfp6(const std::string & ftype_str);
 [[noreturn]] void usage(const char * executable);
 
 ggml_type parse_ggml_type(const char * arg);

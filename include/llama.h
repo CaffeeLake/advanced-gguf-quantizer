@@ -450,7 +450,7 @@ extern "C" {
         float nvfp4_correction_denom;                               // NVFP4 tensor correction denominator
         int32_t nvfp4_input_scale_policy;                           // NVFP4 input scale policy
         const char * assignment_jsonl;                               // optional tensor assignment report path
-        int64_t nvfp4_autotune_max_blocks;                          // NVFP4 autotune sample block cap, 0 = automatic
+        int64_t nvfp4_encoder_max_blocks;                           // NVFP4 encoder sample block cap, 0 = automatic
         float mxfp6_input_scale_denom;                               // MXFP6 input-scale denominator, <= 0 = default
         float mxfp6_input_scale_quantile;                            // MXFP6 imatrix input-scale quantile, <= 0 or >= 1 = default
         int64_t mxfp6_tensor_scale_sample_blocks;                    // MXFP6 tensor-scale sample blocks, 0 = default

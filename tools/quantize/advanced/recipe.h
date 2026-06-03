@@ -21,9 +21,9 @@ struct Recipe {
         std::string sizing_note;
     } target;
 
-    struct Autotune {
+    struct Quantizer {
         bool enabled = true;
-        std::string mode = "quality";
+        std::string mode = "normal";
         std::string objective = "kld-first";
         std::string evidence = "real-ppl-kld";
         std::string policy_set = "native-full";
@@ -31,7 +31,7 @@ struct Recipe {
         bool require_corpus = true;
         bool require_imatrix = true;
         bool allow_diagnostic = false;
-    } autotune;
+    } quantizer;
 
     struct StockFtype {
         std::string source = "llama.cpp";
@@ -85,7 +85,6 @@ struct Recipe {
         std::string n_gpu_layers;
         std::string threads;
         std::string threads_batch;
-        std::string chunks;
         std::string extra_args;
         std::vector<std::string> include_weights;
         std::vector<std::string> exclude_weights;
@@ -118,10 +117,10 @@ struct Recipe {
             std::string depth;
         } rsf;
 
-        struct Autotune {
+        struct Encoder {
             std::string max_blocks;
             std::string threads;
-        } autotune;
+        } encoder;
 
         struct FourSix {
             std::string choose46;
@@ -156,7 +155,7 @@ struct Recipe {
     } nv4mx6;
 
     struct Selector {
-        std::string effort = "full-best";
+        std::string effort = "deep";
         std::string kld;
         std::string checkpoint_model;
         std::string cache_dir;
@@ -170,10 +169,6 @@ struct Recipe {
         std::string delta_mode;
         bool keep_checkpoint = false;
         bool require_runtime_cache = false;
-        std::string chunks;
-        std::string chunk_start;
-        std::string holdout_chunks;
-        std::string holdout_start;
         std::string stagea_sample_blocks;
         std::string stagea_max_policies;
         std::string refine_top;
@@ -187,7 +182,6 @@ struct Recipe {
         std::string kld_threads;
         bool only = false;
         std::string eval_top;
-        std::string eval_chunks;
         std::string n_seq;
         std::string sensitivity_report;
         std::string sensitivity_top;
@@ -252,7 +246,7 @@ Recipe default_recipe();
 Recipe default_recipe(const std::string & profile);
 Recipe default_recipe_for_quant_type(const std::string & precision_mode);
 std::string default_recipe_toml(const std::string & profile);
-void apply_master_autotune(Recipe & recipe);
+void apply_quantizer_mode(Recipe & recipe);
 std::vector<std::string> build_quantize_args(const Recipe & recipe, bool force_dry_run);
 
 } // namespace bq
