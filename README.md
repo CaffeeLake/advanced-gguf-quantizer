@@ -1,36 +1,41 @@
 # advanced-gguf-quantizer
 
-`advanced-gguf-quantizer` is a llama.cpp-derived GGUF quantization toolkit for
-creating, inspecting, evaluating, repairing, and testing GGUF
-models. The first focus is Blackwell NVFP4 and the local MXFP6_E2M3 GGUF
-format, including mixed NVFP4/MXFP6 models.  It implements several experimental improvements
-to NVFP4 scaling and quantization techniques, such as "RSF" from me (michaelw9999) and from others.
+`advanced-gguf-quantizer` is a llama.cpp-derived, CUDA accelerated GGUF quantization toolkit for
+creating, inspecting, evaluating, improving, and testing GGUF models. The first
+focus initially was Blackwell NVFP4 and MXFP6, but now this quantizer has expanded
+psat that.  A BF16.gguf, imatrix and dataset, and kld file are all used together
+to search and tune for the best possible combination of scales and mixed tensor types.
+
+This tool is still in the absolute earliest stages of development and is still a rapidly changing work in progress.  More features and improvements are still on the way.
+
+A new strategy called Refined Scale Fit (RSF) is  used on Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and NVFP4 for changing the scales and re-fitting using imatrix supported data.
+
+Logit KLD files are used during the process to tune and adjust through a series of candidate policies and different types of quantizations to determine which has the lowest error for that particular tensor and how the imatrix affects the ppl/kld data.  
+The tool will also self determine using a weighted score how to promote more error prone or sensitive tensors to higher bit GGUF types such as Q4_K, Q5_K, Q6_K, MXFP6 (not by default) or Q8_0 when the measured error profile justifies both bpw/size and speed tradeoff.
 
 Models created with this tool are posted at:
 https://huggingface.co/michaelw9999
 
-This repository keeps a limited set of tools:
+This repository keeps a limited set of the original llama.cpp tools:
 
 - `llama-quantize`: the primary command and preferred entry
-  point for recipes, plans, runs, inspection, repair, candidate reports, and the
-  interactive wizard.
-- `advanced-gguf-quantizer`:  binary that backs those subcommands.
-- `llama-imatrix`: calibration matrix generation.
-- `llama-perplexity`: PPL and saved-logit KLD evidence.
-- `llama-completion`: quick generation smoke tests for produced GGUFs.
-- Optional: `llama-bench` and `llama-fit-params` for runtime and sizing
-  evidence.
+  point
+- `advanced-gguf-quantizer`:  binary for new subcommands.
+- `llama-imatrix`: calibration imatrix generation.
+- `llama-perplexity`: PPL and saved-logit KLD reporter
+- `llama-completion`: quickly tests produced GGUFs.
 
-This tool requires input GGUF files to be present locally.
+
+This tool requires the input GGUF files to be present locally.
 It does not download models, import Hugging Face checkpoints, or convert checkpoints.
-Use llama.cpp to create a source GGUF if necessary, then use this tool to create
-and evaluate NVFP4/MXFP6 GGUF models.
 
-## Alpha  Notice
+## Alpha Notice
 
-MXFP6_E2M3 is experimental and is not supported by NVIDIA or llama.cpp. If
+This tool and MXFP6/E2M3 is experimental and is not supported by NVIDIA or llama.cpp. If
 official MXFP6 support appears later, the official format may change and GGUF
 models created here may not work with future runtimes.
+
+MXFP6 is not enabled by default, but the tool can make MXFP6 quantizations and also use MXFP6 mixed with other tensor types in the model evaluation strategy.
 
 Feedback is requested. The latest full CUDA MXFP6 branch can be installed from
 <https://github.com/michaelw9999/llama.cpp/tree/mxfp6-cuda>.
@@ -39,23 +44,28 @@ The initial llama.cpp MXFP6 CPU only PR is located at
 
 ## What This Does
 
-- Creates NVFP4 GGUFs with proper tensor and input scales.
-- Creates experimental MXFP6_E2M3 and mixed NVFP4/MXFP6 models.
-- CUDA-accelerated quantization paths for NVFP4/MXFP6 tensor encoding.
-- CUDA-backed evaluation workflows via `llama-perplexity`,
-  `llama-imatrix`, and runtime patch evaluation.
-- Activation-aware quantization using imatrix input scales.
-- Recipe and project files for reproducible runs.
-- Real run artifacts: locked recipe, run log, tensor assignment log, manifest,
+- Designed to creates NVFP4, MXFP6, and mixed NVFP4/MXFP6 GGUFs with proper tensor and input scales.
+- Uses RSF (Refined Scale Fit) for supported K-quants and NVFP4 scale fitting.
+- Selects quantization types tensor-by-tensor based on set parameters/recipe or mode.
+- Offers `fast`, `normal`, and `deep` work modes for quantizer search depth.
+- Allows existing GGUFs to easily be patched to further improve them or swap tensor types.
+- Uses CUDA accelerated improvements for tensor encoding, `llama-perplexity`,
+  `llama-imatrix`, and in-memory runtime patch edits.
+- Allows start and stop and resume on quantizing, creating imatrix, or saving logits.
+- Creates activation-aware quantization for NVFP4 using imatrix input scales.
+- Offers recipe and project files for reproducible runs.
+- Creates run artifacts: locked recipe, run log, tensor assignment log, manifest,
   `checkpoint-key.json`, quantization report, and validation scripts.
 - Checkpointed candidate search so interrupted long runs can resume safely.
 - In-place repair and edit feature for existing GGUFs.
 - p99 and p999 KLD gates in quality mode, visible in reports.
-- Fused decision units.
-- Best-candidate reporting for quality and budget choices.
+- Fused decision units for grouped tensor choices.
+- Best-candidate reporting determined by defined quality and budget choices.
 - A text UI and wizard for guided recipe creation, monitoring, recovery, repair,
-  and inspection.
+  and inspection. [Still needs improvement]
 - Agent-guided quantization in [SKILLS.md](SKILLS.md) for automated runs.
+
+- This README is still a work in progress.  The tool has more features and improvements than are listed here.
 
 ## Build
 
@@ -101,6 +111,9 @@ kld_base = "runs/model/bf16.kld"
 [target]
 precision_mode = "nvfp4"
 target_bpw = 4.8
+
+[quantizer]
+mode = "normal" # fast | normal | deep
 ```
 
 Generate an imatrix:
@@ -166,23 +179,31 @@ real artifacts and does not waste time on fake quantization passes.
 
 ## Choosing NVFP4, MXFP6, Or Mixed
 
-`NVFP4` when smaller size size and Blackwell speed matter most. It is the smallest
-advanced mode but has more quantization error, so quality mode should rely on
-imatrix, KLD evidence, p99/p999 gates, and tensor exceptions.
+`NVFP4` when smaller size and Blackwell speed matter most. It is the smallest
+advanced mode but has more quantization error, so quality runs should rely on
+imatrix, saved-logit KLD evidence, p99/p999 tails, and tensor-by-tensor
+promotions for more error prone or sensitive layers.
 
 `MXFP6_E2M3` when quality matters more than file size. It is larger than
 NVFP4 but useful for sensitive tensors, MoE experts, output/head tensors,
-or models where NVFP4-only error is high.  MXFP6 is still experimental.
+or models where NVFP4-only error is high. MXFP6 is still experimental and should
+be selected deliberately.
 
-`NVFP4_MXFP6` for a balanced model. The allocator can either:
+`NVFP4_MXFP6` will make the fastest, best balanced model. The allocator can either:
 
 - use MXFP6 to improve an NVFP4-first model while keeping the model compact;
 - use MXFP6 as the primary target and demote selected tensors to NVFP4 to increase speed
 and reduce model size, when measured quality loss is acceptable.
 
 Fallback types such as `MXFP6_E2M3`, `Q4_K`, `Q6_K`, `Q8_0`, `BF16`, and
-`F16` remain available for tensor policy, speed-aware candidate assignment,
-output/head handling, exclusions, and repair.
+`F16` remain available for tensor policy, size and speed-aware candidate assignment,
+output/head handling, exclusions, or repair.
+
+For KLD selector runs, choose a quantizer mode:
+
+- `fast`: smallest search for relatively quick iteration.
+- `normal`: default time/search balance for typical use
+- `deep`: longest, deepest search for finding incremental last remaining quality
 
 ## Documentation
 
