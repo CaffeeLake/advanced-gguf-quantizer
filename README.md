@@ -5,6 +5,9 @@ creating, inspecting, evaluating, repairing, and testing GGUF
 models. The first focus is Blackwell NVFP4 and the local MXFP6_E2M3 GGUF
 format, including mixed NVFP4/MXFP6 models.
 
+Models created with this tool are posted at:
+https://huggingface.co/michaelw9999
+
 This repository keeps a limited set of tools:
 
 - `llama-quantize`: the primary command and preferred entry
