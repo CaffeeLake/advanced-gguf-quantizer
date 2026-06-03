@@ -3,7 +3,8 @@
 `advanced-gguf-quantizer` is a llama.cpp-derived GGUF quantization toolkit for
 creating, inspecting, evaluating, repairing, and testing GGUF
 models. The first focus is Blackwell NVFP4 and the local MXFP6_E2M3 GGUF
-format, including mixed NVFP4/MXFP6 models.
+format, including mixed NVFP4/MXFP6 models.  It implements several experimental improvements
+to NVFP4 scaling and quantization techniques, such as "RSF" from me (michaelw9999) and from others.
 
 Models created with this tool are posted at:
 https://huggingface.co/michaelw9999
