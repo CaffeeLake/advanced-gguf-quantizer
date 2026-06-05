@@ -241,6 +241,8 @@ static void append_json_file_key(std::ostream & out, const std::string & key, co
 
 struct RunKey {
     FileKey source;
+    FileKey calibration_corpus;
+    FileKey evaluation_corpus;
     FileKey imatrix;
     FileKey kld_base;
     FileKey recipe_lock;
@@ -258,6 +260,8 @@ static RunKey build_run_key(
     RunKey fp;
     const std::string recipe_lock_text = bq::dump_recipe_toml(recipe);
     fp.source = file_key(plan.input);
+    fp.calibration_corpus = file_key(recipe.calibration.corpus);
+    fp.evaluation_corpus = file_key(recipe.evaluation.corpus);
     fp.imatrix = file_key(recipe.calibration.imatrix);
     fp.kld_base = file_key(!recipe.selector.kld.empty() ? recipe.selector.kld : recipe.evaluation.kld_base);
     fp.recipe_lock = file_key((run_dir / "recipe.lock.toml").string());
@@ -275,6 +279,8 @@ static RunKey build_run_key(
     out << "  \"command_hash64\": \"" << fp.command_hash64 << "\",\n";
     out << "  \"files\": {\n";
     append_json_file_key(out, "source_model", fp.source, ",");
+    append_json_file_key(out, "calibration_corpus", fp.calibration_corpus, ",");
+    append_json_file_key(out, "evaluation_corpus", fp.evaluation_corpus, ",");
     append_json_file_key(out, "imatrix", fp.imatrix, ",");
     append_json_file_key(out, "kld_base", fp.kld_base, ",");
     append_json_file_key(out, "recipe_lock", fp.recipe_lock, "");
@@ -307,6 +313,8 @@ static void write_or_check_run_key(const std::filesystem::path & run_dir, const 
             const bool same_material =
                 has_line("\"recipe_hash64\": \"" + fp.recipe_hash64 + "\"") &&
                 has_file("source_model", fp.source) &&
+                has_file("calibration_corpus", fp.calibration_corpus) &&
+                has_file("evaluation_corpus", fp.evaluation_corpus) &&
                 has_file("imatrix", fp.imatrix) &&
                 has_file("kld_base", fp.kld_base);
             if (!same_material) {
@@ -317,7 +325,7 @@ static void write_or_check_run_key(const std::filesystem::path & run_dir, const 
             }
             write_text_file(run_dir / "checkpoint-key.previous.json", old_json);
             fprintf(stderr,
-                "%s: run checkpoint key changed in code/selector command only; reusing checkpoint because source, imatrix, KLD base, and recipe hash match\n",
+                "%s: run checkpoint key changed in code/selector command only; reusing checkpoint because source, corpora, imatrix, KLD base, and recipe hash match\n",
                 __func__);
         }
     }
@@ -746,6 +754,8 @@ static void write_run_manifest_and_report(
     report << "- Exact PPL/KLD gates and final artifact evaluation are release evidence.\n\n";
     report << "## Keys\n\n";
     report << "- Source: `" << key.source.hash64 << "` (" << key.source.mode << ", " << key.source.bytes << " bytes)\n";
+    report << "- Calibration corpus: `" << key.calibration_corpus.hash64 << "` (" << key.calibration_corpus.mode << ", " << key.calibration_corpus.bytes << " bytes)\n";
+    report << "- Evaluation corpus: `" << key.evaluation_corpus.hash64 << "` (" << key.evaluation_corpus.mode << ", " << key.evaluation_corpus.bytes << " bytes)\n";
     report << "- Imatrix: `" << key.imatrix.hash64 << "` (" << key.imatrix.mode << ", " << key.imatrix.bytes << " bytes)\n";
     report << "- KLD base: `" << key.kld_base.hash64 << "` (" << key.kld_base.mode << ", " << key.kld_base.bytes << " bytes)\n";
     report << "- Recipe: `" << key.recipe_hash64 << "`\n";
