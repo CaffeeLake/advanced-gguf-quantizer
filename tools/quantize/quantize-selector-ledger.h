@@ -7,13 +7,13 @@
 #include <string>
 #include <unordered_map>
 
-class nvfp4_selector_ledger {
+class selector_ledger {
 public:
     static constexpr const char * schema = "advanced-gguf-selector-ledger-v1";
     static constexpr int schema_version = 1;
 
-    nvfp4_selector_ledger() = default;
-    explicit nvfp4_selector_ledger(std::string path);
+    selector_ledger() = default;
+    explicit selector_ledger(std::string path);
 
     struct local_metric {
         double sum_sq = 0.0;

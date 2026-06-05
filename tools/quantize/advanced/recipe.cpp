@@ -317,7 +317,7 @@ static void set_value(LoadedRecipe & loaded, const std::string & path, const std
     if (path == "rescue.budget_mb") { r.rescue.budget_mb = value; return; }
     if (path == "rescue.bf16_budget_mb") { r.rescue.bf16_budget_mb = value; return; }
     if (path == "rescue.class_limit") { r.rescue.class_limit = value; return; }
-    if (path == "rescue.nvfp4_top") { r.rescue.nvfp4_top = value; return; }
+    if (path == "rescue.encoder_top") { r.rescue.encoder_top = value; return; }
     if (path == "rescue.sample_blocks") { r.rescue.sample_blocks = value; return; }
     if (path == "rescue.coarse_max_blocks") { r.rescue.coarse_max_blocks = value; return; }
     if (path == "rescue.refine_max_blocks") { r.rescue.refine_max_blocks = value; return; }
@@ -410,6 +410,47 @@ static void append_unique(std::vector<std::string> & values, const std::string &
     if (!value.empty() && std::find(values.begin(), values.end(), value) == values.end()) {
         values.push_back(value);
     }
+}
+
+static void clear_nvfp4_controls(Recipe & r) {
+    r.nvfp4.preset.clear();
+    r.nvfp4.cfg.clear();
+    r.nvfp4.correction_denom.clear();
+    r.nvfp4.input_scale_policy.clear();
+    r.nvfp4.calibration_families.clear();
+    r.nvfp4.scale_tie.clear();
+    r.nvfp4.rsf.mode.clear();
+    r.nvfp4.rsf.depth.clear();
+    r.nvfp4.encoder.max_blocks.clear();
+    r.nvfp4.encoder.threads.clear();
+    r.nvfp4.four_six.choose46.clear();
+    r.nvfp4.four_six.refit_iters.clear();
+    r.nvfp4.four_six.compand.clear();
+    r.nvfp4.four_six.cap6.clear();
+    r.nvfp4.four_six.cap4.clear();
+}
+
+static void clear_mxfp6_controls(Recipe & r) {
+    r.mxfp6.tensor_scale.clear();
+    r.mxfp6.min_savings_bytes.clear();
+    r.mxfp6.input_scale_denom.clear();
+    r.mxfp6.input_scale_quantile.clear();
+    r.mxfp6.tensor_scale_sample_blocks.clear();
+    r.mxfp6.tensor_scale_steps.clear();
+    r.mxfp6.selector_scale_top.clear();
+    r.mxfp6.selector_scale_candidates.clear();
+}
+
+static void clear_mixed_controls(Recipe & r) {
+    r.nv4mx6.policy.clear();
+    r.nv4mx6.mx6_penalty.clear();
+    r.nv4mx6.bf16_mx6_threshold.clear();
+    r.nv4mx6.sample_blocks.clear();
+    r.nv4mx6.sample_cap.clear();
+    r.nv4mx6.imatrix_weight_blend.clear();
+    r.nv4mx6.imatrix_weight_power.clear();
+    r.nv4mx6.imatrix_weight_min.clear();
+    r.nv4mx6.imatrix_weight_max.clear();
 }
 
 static void apply_native_policy_set(Recipe & r) {
@@ -837,20 +878,65 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string_list(out, "files", r.tensor_overrides.files);
     dump_string_list(out, "entries", r.tensor_overrides.entries);
 
-    out << "\n[nvfp4]\n";
-    dump_string(out, "preset", r.nvfp4.preset);
-    dump_string(out, "cfg", r.nvfp4.cfg);
-    dump_string(out, "correction_denom", r.nvfp4.correction_denom);
-    dump_string(out, "input_scale_policy", r.nvfp4.input_scale_policy);
-    dump_string_list(out, "calibration_families", r.nvfp4.calibration_families);
-    dump_string(out, "scale_tie", r.nvfp4.scale_tie);
-
-    out << "\n[nvfp4.rsf]\n";
-    dump_string(out, "mode", r.nvfp4.rsf.mode);
-    dump_string(out, "depth", r.nvfp4.rsf.depth);
-
     const bool show_low_level = !r.quantizer.enabled || r.quantizer.allow_diagnostic;
-    if (show_low_level) {
+    const bool uses_nvfp4 =
+        quant_type_uses_nvfp4(r.base.ftype) ||
+        quant_type_uses_nvfp4(r.target.precision_mode);
+    const bool uses_mxfp6 =
+        quant_type_uses_mxfp6(r.base.ftype) ||
+        quant_type_uses_mxfp6(r.target.precision_mode);
+    const bool has_nvfp4_base =
+        !r.nvfp4.preset.empty() ||
+        !r.nvfp4.cfg.empty() ||
+        !r.nvfp4.correction_denom.empty() ||
+        !r.nvfp4.input_scale_policy.empty() ||
+        !r.nvfp4.calibration_families.empty() ||
+        !r.nvfp4.scale_tie.empty();
+    const bool has_nvfp4_rsf = !r.nvfp4.rsf.mode.empty() || !r.nvfp4.rsf.depth.empty();
+    const bool has_nvfp4_encoder = !r.nvfp4.encoder.max_blocks.empty() || !r.nvfp4.encoder.threads.empty();
+    const bool has_nvfp4_four_six =
+        !r.nvfp4.four_six.choose46.empty() ||
+        !r.nvfp4.four_six.refit_iters.empty() ||
+        !r.nvfp4.four_six.compand.empty() ||
+        !r.nvfp4.four_six.cap6.empty() ||
+        !r.nvfp4.four_six.cap4.empty();
+    const bool has_mxfp6_controls =
+        !r.mxfp6.tensor_scale.empty() ||
+        !r.mxfp6.min_savings_bytes.empty() ||
+        !r.mxfp6.input_scale_denom.empty() ||
+        !r.mxfp6.input_scale_quantile.empty() ||
+        !r.mxfp6.tensor_scale_sample_blocks.empty() ||
+        !r.mxfp6.tensor_scale_steps.empty() ||
+        !r.mxfp6.selector_scale_top.empty() ||
+        !r.mxfp6.selector_scale_candidates.empty();
+    const bool has_mixed_controls =
+        !r.nv4mx6.policy.empty() ||
+        !r.nv4mx6.mx6_penalty.empty() ||
+        !r.nv4mx6.bf16_mx6_threshold.empty() ||
+        !r.nv4mx6.sample_blocks.empty() ||
+        !r.nv4mx6.sample_cap.empty() ||
+        !r.nv4mx6.imatrix_weight_blend.empty() ||
+        !r.nv4mx6.imatrix_weight_power.empty() ||
+        !r.nv4mx6.imatrix_weight_min.empty() ||
+        !r.nv4mx6.imatrix_weight_max.empty();
+
+    if (uses_nvfp4 || has_nvfp4_base || has_nvfp4_rsf || has_nvfp4_encoder || has_nvfp4_four_six) {
+        out << "\n[nvfp4]\n";
+        dump_string(out, "preset", r.nvfp4.preset);
+        dump_string(out, "cfg", r.nvfp4.cfg);
+        dump_string(out, "correction_denom", r.nvfp4.correction_denom);
+        dump_string(out, "input_scale_policy", r.nvfp4.input_scale_policy);
+        dump_string_list(out, "calibration_families", r.nvfp4.calibration_families);
+        dump_string(out, "scale_tie", r.nvfp4.scale_tie);
+    }
+
+    if (uses_nvfp4 || has_nvfp4_rsf) {
+        out << "\n[nvfp4.rsf]\n";
+        dump_string(out, "mode", r.nvfp4.rsf.mode);
+        dump_string(out, "depth", r.nvfp4.rsf.depth);
+    }
+
+    if ((uses_nvfp4 || has_nvfp4_encoder || has_nvfp4_four_six) && show_low_level) {
         out << "\n[nvfp4.encoder]\n";
         dump_string(out, "max_blocks", r.nvfp4.encoder.max_blocks);
         dump_string(out, "threads", r.nvfp4.encoder.threads);
@@ -863,13 +949,7 @@ std::string dump_recipe_toml(const Recipe & r) {
         dump_string(out, "cap4", r.nvfp4.four_six.cap4);
     }
 
-    const bool uses_nvfp4 =
-        quant_type_uses_nvfp4(r.base.ftype) ||
-        quant_type_uses_nvfp4(r.target.precision_mode);
-    const bool uses_mxfp6 =
-        quant_type_uses_mxfp6(r.base.ftype) ||
-        quant_type_uses_mxfp6(r.target.precision_mode);
-    if (uses_mxfp6 || show_low_level) {
+    if (uses_mxfp6 || has_mxfp6_controls) {
         out << "\n[mxfp6]\n";
         dump_string(out, "tensor_scale", r.mxfp6.tensor_scale);
         dump_string(out, "min_savings_bytes", r.mxfp6.min_savings_bytes);
@@ -881,7 +961,7 @@ std::string dump_recipe_toml(const Recipe & r) {
         dump_string(out, "selector_scale_candidates", r.mxfp6.selector_scale_candidates);
     }
 
-    if ((uses_nvfp4 && uses_mxfp6) || show_low_level) {
+    if ((uses_nvfp4 && uses_mxfp6) || has_mixed_controls) {
         out << "\n[mixed]\n";
         dump_string(out, "policy", r.nv4mx6.policy);
         dump_string(out, "mx6_penalty", r.nv4mx6.mx6_penalty);
@@ -954,7 +1034,7 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "budget_mb", r.rescue.budget_mb);
     dump_string(out, "bf16_budget_mb", r.rescue.bf16_budget_mb);
     dump_string(out, "class_limit", r.rescue.class_limit);
-    dump_string(out, "nvfp4_top", r.rescue.nvfp4_top);
+    dump_string(out, "encoder_top", r.rescue.encoder_top);
     dump_string(out, "sample_blocks", r.rescue.sample_blocks);
     dump_string(out, "coarse_max_blocks", r.rescue.coarse_max_blocks);
     dump_string(out, "refine_max_blocks", r.rescue.refine_max_blocks);
@@ -1112,9 +1192,9 @@ void apply_quantizer_mode(Recipe & r) {
         r.mxfp6.selector_scale_candidates.clear();
     }
 
-    if (uses_nvfp4 && r.rescue.enabled) {
+    if (r.rescue.enabled) {
         assign_if_empty(r.rescue.sample_blocks, normal_mode ? "4096" : "8192");
-        assign_if_empty(r.rescue.nvfp4_top, normal_mode ? "0" : "16");
+        assign_if_empty(r.rescue.encoder_top, uses_nvfp4 && !normal_mode ? "16" : "0");
         assign_if_empty(r.rescue.coarse_max_blocks, normal_mode ? "16384" : "32768");
         assign_if_empty(r.rescue.refine_max_blocks, "32768");
         assign_if_empty(r.rescue.guard_max_blocks, normal_mode ? "32768" : "65536");
@@ -1138,11 +1218,7 @@ Recipe default_recipe(const std::string & profile) {
     if (profile == "mxfp6") {
         r.target.precision_mode = "MXFP6";
         r.base.ftype = "MXFP6";
-        r.nvfp4.preset.clear();
-        r.nvfp4.correction_denom.clear();
-        r.nvfp4.input_scale_policy.clear();
-        r.nvfp4.calibration_families.clear();
-        r.nvfp4.scale_tie.clear();
+        clear_nvfp4_controls(r);
         r.base.output_tensor_type = "MXFP6_E2M3";
         r.base.token_embedding_type = "MXFP6_E2M3";
         apply_deep_quality_defaults(r);
@@ -1171,7 +1247,7 @@ Recipe default_recipe(const std::string & profile) {
         r.rescue.top = "-1";
         r.rescue.budget_mb = "3000";
         r.rescue.class_limit = "0";
-        r.rescue.nvfp4_top = "16";
+        r.rescue.encoder_top = "16";
         apply_quantizer_mode(r);
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
@@ -1214,13 +1290,12 @@ Recipe default_recipe(const std::string & profile) {
         r.quantizer.allow_diagnostic = false;
         apply_quantizer_mode(r);
         r.rescue.type.clear();
-        r.nv4mx6.policy.clear();
-        r.mxfp6 = {};
-        r.mxfp6.tensor_scale.clear();
+        clear_mixed_controls(r);
+        clear_mxfp6_controls(r);
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "NVFP4" };
         r.stock_ftype.output_tensor_candidates = { "Q6_K" };
-        r.stock_ftype.rationale = "Default NVFP4 RSF search: compact KLD-guided real-artifact selector budget.";
+        r.stock_ftype.rationale = "Default RSF selector search: compact KLD-guided real-artifact budget.";
     } else if (profile == "q8_0") {
         r.target.precision_mode = "Q8_0";
         r.base.ftype = "Q8_0";
@@ -1230,18 +1305,18 @@ Recipe default_recipe(const std::string & profile) {
         r.quantizer.require_imatrix = false;
         r.base.output_tensor_type = "Q8_0";
         r.base.token_embedding_type = "Q8_0";
-        r.nvfp4.preset.clear();
-        r.nvfp4.correction_denom.clear();
-        r.nvfp4.input_scale_policy.clear();
-        r.nvfp4.calibration_families.clear();
-        r.nvfp4.scale_tie.clear();
-        r.nv4mx6.policy.clear();
+        clear_nvfp4_controls(r);
+        clear_mixed_controls(r);
         r.selector = {};
         r.selector.effort.clear();
         r.rescue.enabled = false;
         r.rescue.type.clear();
-        r.mxfp6.tensor_scale.clear();
+        clear_mxfp6_controls(r);
         r.stock_ftype.mostly_type = "MOSTLY_Q8_0";
+        r.stock_ftype.token_embedding_candidates = { "Q8_0" };
+        r.stock_ftype.output_tensor_candidates = { "Q8_0" };
+        r.stock_ftype.sweep_tensor_policy = false;
+        r.stock_ftype.sweep_sensitive_tensors = false;
         r.stock_ftype.rationale = "Plain GGUF Q8_0 recipe for users who want a high-compatibility baseline.";
     } else {
         throw std::runtime_error("unknown profile: " + profile);
@@ -1328,7 +1403,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--tensor-type", item);
     }
 
-    if ((uses_nvfp4 || uses_mxfp6) && r.quantizer.enabled) {
+    if (r.quantizer.enabled) {
         push_pair("--mode", quantizer_work_mode_arg(r.quantizer.mode));
     }
 
@@ -1345,8 +1420,8 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         if (!use_mode_defaults) {
             push_pair("--nvfp4-encoder-max-blocks", r.nvfp4.encoder.max_blocks);
             push_pair("--nvfp4-encoder-threads", r.nvfp4.encoder.threads);
-            push_pair("--nvfp4-selector-rsf-mode", r.nvfp4.rsf.mode);
-            push_pair("--nvfp4-selector-rsf-depth", r.nvfp4.rsf.depth);
+            push_pair("--selector-rsf-mode", r.nvfp4.rsf.mode);
+            push_pair("--selector-rsf-depth", r.nvfp4.rsf.depth);
         }
     }
 
@@ -1377,70 +1452,70 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--mixed-imatrix-weight-max", r.nv4mx6.imatrix_weight_max);
     }
 
-    push_pair("--nvfp4-selector-kld", r.selector.kld);
-    push_pair("--nvfp4-selector-checkpoint-model", r.selector.checkpoint_model);
-    push_pair("--nvfp4-selector-cache-dir", r.selector.cache_dir);
-    push_pair("--nvfp4-selector-skip-file", r.selector.skip_file);
-    push_pair("--nvfp4-selector-ledger", r.selector.ledger);
-    push_bool("--nvfp4-selector-keep-checkpoint", r.selector.keep_checkpoint);
-    push_bool("--nvfp4-selector-require-runtime-cache", r.selector.require_runtime_cache);
+    push_pair("--selector-kld", r.selector.kld);
+    push_pair("--selector-checkpoint-model", r.selector.checkpoint_model);
+    push_pair("--selector-cache-dir", r.selector.cache_dir);
+    push_pair("--selector-skip-file", r.selector.skip_file);
+    push_pair("--selector-ledger", r.selector.ledger);
+    push_bool("--selector-keep-checkpoint", r.selector.keep_checkpoint);
+    push_bool("--selector-require-runtime-cache", r.selector.require_runtime_cache);
     if (!use_mode_defaults) {
-        push_pair("--nvfp4-selector-stagea-sample-blocks", r.selector.stagea_sample_blocks);
-        push_pair("--nvfp4-selector-stagea-max-policies", r.selector.stagea_max_policies);
-        push_pair("--nvfp4-selector-refine-top", r.selector.refine_top);
-        push_pair("--nvfp4-selector-refine-budget", r.selector.refine_budget);
-        push_pair("--nvfp4-selector-survey-top", r.selector.survey_top);
-        push_pair("--nvfp4-selector-survey-sample-blocks", r.selector.survey_sample_blocks);
-        push_pair("--nvfp4-selector-max-tensors", r.selector.max_tensors);
+        push_pair("--selector-stagea-sample-blocks", r.selector.stagea_sample_blocks);
+        push_pair("--selector-stagea-max-policies", r.selector.stagea_max_policies);
+        push_pair("--selector-refine-top", r.selector.refine_top);
+        push_pair("--selector-refine-budget", r.selector.refine_budget);
+        push_pair("--selector-survey-top", r.selector.survey_top);
+        push_pair("--selector-survey-sample-blocks", r.selector.survey_sample_blocks);
+        push_pair("--selector-max-tensors", r.selector.max_tensors);
     }
-    push_bool("--nvfp4-selector-trace", r.selector.trace);
+    push_bool("--selector-trace", r.selector.trace);
     if (!use_mode_defaults) {
-        push_pair("--nvfp4-selector-policy-threads", r.selector.policy_threads);
-        push_pair("--nvfp4-selector-threads", r.selector.threads);
-        push_pair("--nvfp4-selector-kld-threads", r.selector.kld_threads);
+        push_pair("--selector-policy-threads", r.selector.policy_threads);
+        push_pair("--selector-threads", r.selector.threads);
+        push_pair("--selector-kld-threads", r.selector.kld_threads);
     }
-    push_bool("--nvfp4-selector-only", r.selector.only);
+    push_bool("--selector-only", r.selector.only);
     if (!use_mode_defaults) {
-        push_pair("--nvfp4-selector-eval-top", r.selector.eval_top);
-        push_pair("--nvfp4-selector-n-seq", r.selector.n_seq);
+        push_pair("--selector-eval-top", r.selector.eval_top);
+        push_pair("--selector-n-seq", r.selector.n_seq);
     }
-    push_pair("--nvfp4-selector-sensitivity-report", r.selector.sensitivity_report);
-    push_pair("--nvfp4-selector-sensitivity-top", r.selector.sensitivity_top);
-    push_pair("--nvfp4-selector-sensitivity-layer", r.selector.sensitivity_layer);
-    push_pair("--nvfp4-selector-sensitivity-tensor", r.selector.sensitivity_tensor);
-    push_pair("--nvfp4-selector-sensitivity-sample-blocks", r.selector.sensitivity_sample_blocks);
-    push_pair("--nvfp4-selector-rsf-report", r.selector.rsf_report);
+    push_pair("--selector-sensitivity-report", r.selector.sensitivity_report);
+    push_pair("--selector-sensitivity-top", r.selector.sensitivity_top);
+    push_pair("--selector-sensitivity-layer", r.selector.sensitivity_layer);
+    push_pair("--selector-sensitivity-tensor", r.selector.sensitivity_tensor);
+    push_pair("--selector-sensitivity-sample-blocks", r.selector.sensitivity_sample_blocks);
+    push_pair("--selector-rsf-report", r.selector.rsf_report);
 
     if (!use_mode_defaults) {
-        push_pair("--nvfp4-selector-kld-penalty", r.selector.ranking.kld_penalty);
-        push_pair("--nvfp4-selector-p99-penalty", r.selector.ranking.p99_penalty);
-        push_pair("--nvfp4-selector-p999-penalty", r.selector.ranking.p999_penalty);
-        push_pair("--nvfp4-selector-max-kld-penalty", r.selector.ranking.max_kld_penalty);
-        push_pair("--nvfp4-selector-rank-kld-threshold", r.selector.ranking.kld_threshold);
-        push_pair("--nvfp4-selector-rank-p99-threshold", r.selector.ranking.p99_threshold);
-        push_pair("--nvfp4-selector-rank-p999-threshold", r.selector.ranking.p999_threshold);
-        push_pair("--nvfp4-selector-rank-max-kld-threshold", r.selector.ranking.max_kld_threshold);
-        push_bool("--nvfp4-selector-rank-kld-hard-gate", r.selector.ranking.kld_hard_gate);
-        push_bool("--nvfp4-selector-rank-p99-hard-gate", r.selector.ranking.p99_hard_gate);
-        push_bool("--nvfp4-selector-rank-p999-hard-gate", r.selector.ranking.p999_hard_gate);
-        push_bool("--nvfp4-selector-rank-max-kld-hard-gate", r.selector.ranking.max_kld_hard_gate);
+        push_pair("--selector-kld-penalty", r.selector.ranking.kld_penalty);
+        push_pair("--selector-p99-penalty", r.selector.ranking.p99_penalty);
+        push_pair("--selector-p999-penalty", r.selector.ranking.p999_penalty);
+        push_pair("--selector-max-kld-penalty", r.selector.ranking.max_kld_penalty);
+        push_pair("--selector-rank-kld-threshold", r.selector.ranking.kld_threshold);
+        push_pair("--selector-rank-p99-threshold", r.selector.ranking.p99_threshold);
+        push_pair("--selector-rank-p999-threshold", r.selector.ranking.p999_threshold);
+        push_pair("--selector-rank-max-kld-threshold", r.selector.ranking.max_kld_threshold);
+        push_bool("--selector-rank-kld-hard-gate", r.selector.ranking.kld_hard_gate);
+        push_bool("--selector-rank-p99-hard-gate", r.selector.ranking.p99_hard_gate);
+        push_bool("--selector-rank-p999-hard-gate", r.selector.ranking.p999_hard_gate);
+        push_bool("--selector-rank-max-kld-hard-gate", r.selector.ranking.max_kld_hard_gate);
     }
 
-    if (uses_nvfp4 && r.rescue.enabled) {
-        args.push_back("--nvfp4-selector-auto-rescue");
-        push_pair("--nvfp4-selector-candidate-types", r.rescue.type);
-        push_pair("--nvfp4-selector-rescue-top", r.rescue.top);
-        push_pair("--nvfp4-selector-rescue-report-top", r.rescue.report_top);
-        push_pair("--nvfp4-selector-rescue-budget-mb", r.rescue.budget_mb);
-        push_pair("--nvfp4-selector-rescue-bf16-budget-mb", r.rescue.bf16_budget_mb);
-        push_pair("--nvfp4-selector-rescue-class-limit", r.rescue.class_limit);
-        push_pair("--nvfp4-selector-rescue-nvfp4-top", r.rescue.nvfp4_top);
-        push_pair("--nvfp4-selector-rescue-sample-blocks", r.rescue.sample_blocks);
-        push_pair("--nvfp4-selector-rescue-coarse-max-blocks", r.rescue.coarse_max_blocks);
-        push_pair("--nvfp4-selector-rescue-refine-max-blocks", r.rescue.refine_max_blocks);
-        push_pair("--nvfp4-selector-rescue-guard-max-blocks", r.rescue.guard_max_blocks);
-        push_pair("--nvfp4-selector-rescue-report", r.rescue.report);
-        push_pair("--nvfp4-selector-rescue-tensor-types", r.rescue.tensor_types);
+    if (r.rescue.enabled) {
+        args.push_back("--selector-auto-rescue");
+        push_pair("--selector-candidate-types", r.rescue.type);
+        push_pair("--selector-rescue-top", r.rescue.top);
+        push_pair("--selector-rescue-report-top", r.rescue.report_top);
+        push_pair("--selector-rescue-budget-mb", r.rescue.budget_mb);
+        push_pair("--selector-rescue-bf16-budget-mb", r.rescue.bf16_budget_mb);
+        push_pair("--selector-rescue-class-limit", r.rescue.class_limit);
+        push_pair("--selector-rescue-encoder-top", r.rescue.encoder_top);
+        push_pair("--selector-rescue-sample-blocks", r.rescue.sample_blocks);
+        push_pair("--selector-rescue-coarse-max-blocks", r.rescue.coarse_max_blocks);
+        push_pair("--selector-rescue-refine-max-blocks", r.rescue.refine_max_blocks);
+        push_pair("--selector-rescue-guard-max-blocks", r.rescue.guard_max_blocks);
+        push_pair("--selector-rescue-report", r.rescue.report);
+        push_pair("--selector-rescue-tensor-types", r.rescue.tensor_types);
     }
 
     args.push_back(r.io.input);

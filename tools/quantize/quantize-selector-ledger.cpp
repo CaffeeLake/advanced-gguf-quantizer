@@ -7,27 +7,27 @@
 #include <system_error>
 #include <utility>
 
-nvfp4_selector_ledger::nvfp4_selector_ledger(std::string path) {
+selector_ledger::selector_ledger(std::string path) {
     configure(std::move(path));
 }
 
-void nvfp4_selector_ledger::configure(std::string path) {
+void selector_ledger::configure(std::string path) {
     std::lock_guard<std::mutex> lock(mutex_);
     path_ = std::move(path);
     local_metrics_loaded_ = false;
     local_metrics_.clear();
 }
 
-bool nvfp4_selector_ledger::enabled() const {
+bool selector_ledger::enabled() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return !path_.empty();
 }
 
-const std::string & nvfp4_selector_ledger::path() const {
+const std::string & selector_ledger::path() const {
     return path_;
 }
 
-bool nvfp4_selector_ledger::metric_from_json(const nlohmann::ordered_json & row, local_metric & out) {
+bool selector_ledger::metric_from_json(const nlohmann::ordered_json & row, local_metric & out) {
     if (!row.is_object()) {
         return false;
     }
@@ -46,11 +46,11 @@ bool nvfp4_selector_ledger::metric_from_json(const nlohmann::ordered_json & row,
     return out.count > 0;
 }
 
-std::string nvfp4_selector_ledger::key_string(const nlohmann::ordered_json & key) {
+std::string selector_ledger::key_string(const nlohmann::ordered_json & key) {
     return key.dump();
 }
 
-bool nvfp4_selector_ledger::load_local_metrics() {
+bool selector_ledger::load_local_metrics() {
     std::lock_guard<std::mutex> lock(mutex_);
     local_metrics_.clear();
     local_metrics_loaded_ = true;
@@ -100,7 +100,7 @@ bool nvfp4_selector_ledger::load_local_metrics() {
     return true;
 }
 
-bool nvfp4_selector_ledger::find_local_metric(const nlohmann::ordered_json & key, local_metric & out) const {
+bool selector_ledger::find_local_metric(const nlohmann::ordered_json & key, local_metric & out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!local_metrics_loaded_) {
         return false;
@@ -113,7 +113,7 @@ bool nvfp4_selector_ledger::find_local_metric(const nlohmann::ordered_json & key
     return true;
 }
 
-bool nvfp4_selector_ledger::append_context(const char * event, nlohmann::ordered_json payload) const {
+bool selector_ledger::append_context(const char * event, nlohmann::ordered_json payload) const {
     if (!payload.is_object()) {
         nlohmann::ordered_json wrapped = nlohmann::ordered_json::object();
         wrapped["value"] = std::move(payload);
@@ -125,15 +125,15 @@ bool nvfp4_selector_ledger::append_context(const char * event, nlohmann::ordered
     return append_row("context", std::move(payload));
 }
 
-bool nvfp4_selector_ledger::append_tensor_local_metric(nlohmann::ordered_json payload) const {
+bool selector_ledger::append_tensor_local_metric(nlohmann::ordered_json payload) const {
     return append_row("tensor.local_metric", std::move(payload));
 }
 
-bool nvfp4_selector_ledger::append_exact_eval(nlohmann::ordered_json payload) const {
+bool selector_ledger::append_exact_eval(nlohmann::ordered_json payload) const {
     return append_row("exact_eval", std::move(payload));
 }
 
-bool nvfp4_selector_ledger::append_row(const char * row_type, nlohmann::ordered_json payload) const {
+bool selector_ledger::append_row(const char * row_type, nlohmann::ordered_json payload) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (path_.empty()) {
         return true;

@@ -100,7 +100,7 @@ static __global__ void quantize_mmq_nvfp4(const float * __restrict__ x,
     if constexpr (has_scale) {
         const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : (has_ids && ids_expert ? ids_expert[i1] : i01);
         float input_scale = scale_activation[scale_idx];
-        if (!(input_scale != 0.0f) || !isfinite(input_scale)) {
+        if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
             input_scale = 1.0f;
         }
         inv_input_scale = 1.0f / input_scale;
@@ -265,7 +265,7 @@ static __global__ void quantize_mmq_mxfp6_e2m3(const float * __restrict__ x,
         if (lane == 0) {
             const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : (has_ids && ids_expert ? ids_expert[i1] : i01);
             const float input_scale = scale_activation[scale_idx];
-            if (input_scale != 1.0f && input_scale != 0.0f && isfinite(input_scale)) {
+            if (input_scale != 1.0f && input_scale > 0.0f && isfinite(input_scale)) {
                 inv_input_scale = 1.0f / input_scale;
             }
         }
@@ -386,7 +386,7 @@ static __global__ void quantize_mmq_fp8_e4m3(const float * __restrict__ x,
     if constexpr (has_scale) {
         const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : (has_ids && ids_expert ? ids_expert[i1] : i01);
         float input_scale = scale_activation[scale_idx];
-        if (!(input_scale != 0.0f) || !isfinite(input_scale)) {
+        if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
             input_scale = 1.0f;
         }
         inv_input_scale = 1.0f / input_scale;
@@ -464,7 +464,7 @@ static __global__ void quantize_row_fp8_e4m3(const float * __restrict__ x,
     if constexpr (has_scale) {
         const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : i01;
         float input_scale = scale_activation[scale_idx];
-        if (!(input_scale != 0.0f) || !isfinite(input_scale)) {
+        if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
             input_scale = 1.0f;
         }
         inv_input_scale = 1.0f / input_scale;

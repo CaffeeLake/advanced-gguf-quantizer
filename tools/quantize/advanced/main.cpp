@@ -2138,7 +2138,7 @@ static int evidence_main(int argc, char ** argv) {
     double best_exact_score = std::numeric_limits<double>::infinity();
     std::string best_exact_policy;
     for (const bq::CandidateRecord & record : table.records) {
-        if (record_string_field(record, "schema") != nvfp4_selector_ledger::schema) {
+        if (record_string_field(record, "schema") != selector_ledger::schema) {
             ++ignored;
             continue;
         }
@@ -2678,7 +2678,7 @@ static void apply_vram_target(
         recipe.rescue.budget_mb.clear();
         recipe.rescue.bf16_budget_mb.clear();
         recipe.rescue.class_limit.clear();
-        recipe.rescue.nvfp4_top.clear();
+        recipe.rescue.encoder_top.clear();
     }
 
     std::ostringstream alloc;
@@ -4888,7 +4888,7 @@ static void shell_configure_target_budget(ShellState & state) {
             state.recipe.rescue.budget_mb.clear();
             state.recipe.rescue.bf16_budget_mb.clear();
             state.recipe.rescue.class_limit.clear();
-            state.recipe.rescue.nvfp4_top.clear();
+            state.recipe.rescue.encoder_top.clear();
         }
         std::ostringstream note;
         note.setf(std::ios::fixed);
@@ -4968,7 +4968,7 @@ static void shell_configure_native_techniques(ShellState & state) {
             label("AWQ candidates", awq),
             label("SmoothQuant input-scale candidates", smoothquant),
             label("Scale/cap sweep candidates", mse),
-            label("NVFP4 RSF variants", rsf),
+            label("RSF variants", rsf),
             label("KL-divergence sensitivity scorer", kl),
             label("Gradient/Hessian sidecar scorer", gradient),
             label("Tie Q/K/V, gate/up, and experts as groups", grouped),
@@ -5192,7 +5192,7 @@ static void shell_configure_edit_existing_gguf(ShellState & state) {
     state.recipe.rescue.budget_mb = shell_prompt_on_page(state, title, "edit budget MiB", state.recipe.rescue.budget_mb);
     state.recipe.rescue.bf16_budget_mb = shell_prompt_on_page(state, title, "BF16 edit budget MiB", state.recipe.rescue.bf16_budget_mb);
     state.recipe.rescue.class_limit = shell_prompt_on_page(state, title, "per-class edit limit", state.recipe.rescue.class_limit);
-    state.recipe.rescue.nvfp4_top = shell_prompt_on_page(state, title, "NVFP4 retest top", state.recipe.rescue.nvfp4_top);
+    state.recipe.rescue.encoder_top = shell_prompt_on_page(state, title, "encoder retest top", state.recipe.rescue.encoder_top);
     state.recipe.rescue.sample_blocks = shell_prompt_on_page(state, title, "edit sample blocks", state.recipe.rescue.sample_blocks);
     state.recipe.rescue.coarse_max_blocks = shell_prompt_on_page(state, title, "edit coarse max blocks", state.recipe.rescue.coarse_max_blocks);
     state.recipe.rescue.refine_max_blocks = shell_prompt_on_page(state, title, "edit refine max blocks", state.recipe.rescue.refine_max_blocks);

@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-struct nvfp4_selector_kld_subset {
+struct selector_kld_subset {
     struct mmap_file {
         int fd = -1;
         size_t size = 0;
@@ -35,7 +35,7 @@ struct nvfp4_selector_kld_subset {
     const uint16_t * log_probs_u16_mapped = nullptr;
 };
 
-struct nvfp4_selector_kld_metrics {
+struct selector_kld_metrics {
     double sum_nll = 0.0;
     double sum_nll2 = 0.0;
     double sum_nll_base = 0.0;
@@ -55,7 +55,7 @@ struct nvfp4_selector_kld_metrics {
     std::vector<double> kld_values;
 };
 
-struct nvfp4_selector_derived_metrics {
+struct selector_derived_metrics {
     bool ok = false;
     double ppl_q = 0.0;
     double ppl_base = 0.0;
@@ -77,21 +77,21 @@ struct nvfp4_selector_derived_metrics {
     double top_flip_weight = 0.0;
 };
 
-const uint16_t * nvfp4_selector_kld_log_probs_data(const nvfp4_selector_kld_subset & kld);
-bool nvfp4_selector_load_kld_subset(const std::string & path, nvfp4_selector_kld_subset & out);
+const uint16_t * selector_kld_log_probs_data(const selector_kld_subset & kld);
+bool selector_load_kld_subset(const std::string & path, selector_kld_subset & out);
 
-void nvfp4_selector_eval_one_token(
+void selector_eval_one_token(
     int n_vocab,
     const float * logits,
     const uint16_t * base_logp_u16,
     llama_token tok,
-    nvfp4_selector_kld_metrics & m);
+    selector_kld_metrics & m);
 
-void nvfp4_selector_merge_kld_metrics(nvfp4_selector_kld_metrics & dst, nvfp4_selector_kld_metrics && src);
-void nvfp4_selector_merge_cuda_kld_metrics(
-    nvfp4_selector_kld_metrics & dst,
+void selector_merge_kld_metrics(selector_kld_metrics & dst, selector_kld_metrics && src);
+void selector_merge_cuda_kld_metrics(
+    selector_kld_metrics & dst,
     const nvfp4_cuda_kld_result & src,
     std::vector<double> && kld_values);
 
-std::pair<double, double> nvfp4_selector_mean_and_uncertainty(double sum, double sum2, int64_t count);
-nvfp4_selector_derived_metrics nvfp4_selector_derive_metrics(const nvfp4_selector_kld_metrics & km);
+std::pair<double, double> selector_mean_and_uncertainty(double sum, double sum2, int64_t count);
+selector_derived_metrics selector_derive_metrics(const selector_kld_metrics & km);

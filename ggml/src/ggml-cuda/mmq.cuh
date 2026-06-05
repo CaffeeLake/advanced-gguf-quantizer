@@ -4337,12 +4337,11 @@ static __device__ __forceinline__ void process_nvfp4_tiles(const char * __restri
 
     const block_nvfp4_mmq * __restrict__ y_nv = reinterpret_cast<const block_nvfp4_mmq *>(y);
     const block_nvfp4_blackwell_tensor * __restrict__ x_tensor = (const block_nvfp4_blackwell_tensor *) x;
-    const float weight_scale = x_tensor->weight_scales ? x_tensor->weight_scales[scale_channel] : x_tensor->weight_scale;
-    const float input_scale  = x_tensor->input_scales  ? x_tensor->input_scales[scale_channel]  : x_tensor->input_scale;
-    float tensor_scale = weight_scale;
-    if (input_scale != 1.0f) {
-        tensor_scale *= input_scale;
-    }
+    float weight_scale = x_tensor->weight_scales ? x_tensor->weight_scales[scale_channel] : x_tensor->weight_scale;
+    float input_scale  = x_tensor->input_scales  ? x_tensor->input_scales[scale_channel]  : x_tensor->input_scale;
+    weight_scale = weight_scale > 0.0f && isfinite(weight_scale) ? weight_scale : 1.0f;
+    input_scale  = input_scale  > 0.0f && isfinite(input_scale)  ? input_scale  : 1.0f;
+    const float tensor_scale = weight_scale * input_scale;
 
     const int k_block_start = kb0_start / 4;
     const int k_block_stop  = (kb0_stop + blocks_per_tile - 1) / blocks_per_tile;

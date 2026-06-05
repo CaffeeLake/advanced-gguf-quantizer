@@ -65,7 +65,7 @@ static const char * const LLM_KV_QUANTIZE_IMATRIX_N_CHUNKS   = "quantize.imatrix
 // satisfies -Wmissing-declarations
 int llama_quantize(int argc, char ** argv);
 
-static constexpr int64_t NVFP4_SELECTOR_BLOCK_SIZE = 64;
+static constexpr int64_t SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE = 64;
 static constexpr int     SELECTOR_ENCODER_EVIDENCE_VERSION = 4;
 static constexpr int     SELECTOR_CLASS_BUCKET_LIMIT = 2;
 static constexpr int     SELECTOR_SPECIAL_LIMIT = 4;
@@ -118,6 +118,17 @@ static constexpr double  SELECTOR_RESCUE_NVFP4_PHASE_TAIL_WEIGHT = 0.35;
 static constexpr int     SELECTOR_RESCUE_NVFP4_REFINE_TOP = 2;
 static constexpr int     SELECTOR_RESCUE_NVFP4_GUARD_TOP = 1;
 static constexpr double  SELECTOR_RESCUE_NVFP4_MIN_GAIN = 5e-4;
+
+static bool agq_file_has_gguf_magic(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    char magic[4] = {};
+    in.read(magic, sizeof(magic));
+    return in.gcount() == (std::streamsize) sizeof(magic) &&
+        magic[0] == 'G' && magic[1] == 'G' && magic[2] == 'U' && magic[3] == 'F';
+}
 static constexpr double  SELECTOR_RESCUE_NVFP4_MIN_REL_GAIN = 0.0025;
 static constexpr double  SELECTOR_RESCUE_NVFP4_PREFER_GAIN = 9e-4;
 static constexpr double  SELECTOR_RESCUE_NVFP4_PREFER_REL_GAIN = 0.005;
@@ -268,7 +279,49 @@ static bool parse_quantize_work_mode(const char * value, quantize_work_mode & ou
     return false;
 }
 
-static bool nvfp4_selector_reset_cuda_device(int device) {
+static std::string selector_generic_control_key(const char * suffix) {
+    return std::string("LLAMA_SELECTOR_") + (suffix != nullptr ? suffix : "");
+}
+
+static std::string selector_legacy_control_key(const char * suffix) {
+    return std::string("LLAMA_NVFP4_SELECTOR_") + (suffix != nullptr ? suffix : "");
+}
+
+static bool selector_control_has(const char * suffix) {
+    const std::string generic_key = selector_generic_control_key(suffix);
+    const std::string legacy_key = selector_legacy_control_key(suffix);
+    return quantize_control_has(generic_key.c_str()) || quantize_control_has(legacy_key.c_str());
+}
+
+static std::string selector_control_string(const char * suffix, std::string fallback = {}) {
+    const std::string generic_key = selector_generic_control_key(suffix);
+    const std::string legacy_key = selector_legacy_control_key(suffix);
+    const std::string legacy_value = quantize_control_string(legacy_key.c_str(), fallback);
+    return quantize_control_string(generic_key.c_str(), legacy_value);
+}
+
+static int64_t selector_control_i64(const char * suffix, int64_t fallback) {
+    const std::string generic_key = selector_generic_control_key(suffix);
+    const std::string legacy_key = selector_legacy_control_key(suffix);
+    const int64_t legacy_value = quantize_control_i64(legacy_key.c_str(), fallback);
+    return quantize_control_i64(generic_key.c_str(), legacy_value);
+}
+
+static double selector_control_f64(const char * suffix, double fallback) {
+    const std::string generic_key = selector_generic_control_key(suffix);
+    const std::string legacy_key = selector_legacy_control_key(suffix);
+    const double legacy_value = quantize_control_f64(legacy_key.c_str(), fallback);
+    return quantize_control_f64(generic_key.c_str(), legacy_value);
+}
+
+static bool selector_control_bool(const char * suffix, bool fallback) {
+    const std::string generic_key = selector_generic_control_key(suffix);
+    const std::string legacy_key = selector_legacy_control_key(suffix);
+    const bool legacy_value = quantize_control_bool(legacy_key.c_str(), fallback);
+    return quantize_control_bool(generic_key.c_str(), legacy_value);
+}
+
+static bool selector_reset_cuda_device(int device) {
 #if defined(GGML_USE_CUDA) && (defined(__unix__) || defined(__APPLE__))
     nvfp4_clear_cuda_stream_cache();
     void * handle = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
@@ -362,12 +415,12 @@ struct selector_rank_config {
     mxfp6_config mxfp6;
 };
 
-enum class nvfp4_selector_tensor_class : uint8_t;
+enum class selector_tensor_class : uint8_t;
 
-struct nvfp4_selector_rsf_tensor_record {
+struct selector_rsf_tensor_record {
     std::string tensor;
     std::string policy;
-    nvfp4_selector_tensor_class cls = (nvfp4_selector_tensor_class) 0;
+    selector_tensor_class cls = (selector_tensor_class) 0;
     int bucket = -1;
     int32_t layer = -1;
     int64_t slices = 0;
@@ -377,7 +430,7 @@ struct nvfp4_selector_rsf_tensor_record {
     std::vector<float> scale_muls;
 };
 
-struct nvfp4_selector_policy {
+struct selector_policy {
     std::string name;
     nvfp4_cuda_runtime_cfg cfg = {
         NVFP4_CUDA_CHOOSE46_ADAPTIVE,
@@ -400,15 +453,15 @@ struct nvfp4_selector_policy {
     double first_tensor_max_abs = std::numeric_limits<double>::infinity();
     bool proxy_rejected = false;
     bool has_survey = false;
-    nvfp4_selector_derived_metrics measured;
-    nvfp4_selector_derived_metrics measured_holdout;
+    selector_derived_metrics measured;
+    selector_derived_metrics measured_holdout;
     bool has_holdout = false;
     bool measured_pass = false;
     double measured_score = std::numeric_limits<double>::infinity();
-    std::vector<nvfp4_selector_rsf_tensor_record> tensor_records;
+    std::vector<selector_rsf_tensor_record> tensor_records;
 };
 
-enum class nvfp4_selector_tensor_class : uint8_t {
+enum class selector_tensor_class : uint8_t {
     EMBEDDING_OUTPUT = 0,
     ATTN_QKV,
     ATTN_OUT,
@@ -420,22 +473,22 @@ enum class nvfp4_selector_tensor_class : uint8_t {
     OTHER,
 };
 
-struct nvfp4_selector_device_snapshot {
+struct selector_device_snapshot {
     void * data = nullptr;
     size_t nbytes = 0;
 
-    nvfp4_selector_device_snapshot() = default;
-    nvfp4_selector_device_snapshot(const nvfp4_selector_device_snapshot &) = delete;
-    nvfp4_selector_device_snapshot & operator=(const nvfp4_selector_device_snapshot &) = delete;
+    selector_device_snapshot() = default;
+    selector_device_snapshot(const selector_device_snapshot &) = delete;
+    selector_device_snapshot & operator=(const selector_device_snapshot &) = delete;
 
-    nvfp4_selector_device_snapshot(nvfp4_selector_device_snapshot && other) noexcept {
+    selector_device_snapshot(selector_device_snapshot && other) noexcept {
         data = other.data;
         nbytes = other.nbytes;
         other.data = nullptr;
         other.nbytes = 0;
     }
 
-    nvfp4_selector_device_snapshot & operator=(nvfp4_selector_device_snapshot && other) noexcept {
+    selector_device_snapshot & operator=(selector_device_snapshot && other) noexcept {
         if (this != &other) {
             reset();
             data = other.data;
@@ -446,7 +499,7 @@ struct nvfp4_selector_device_snapshot {
         return *this;
     }
 
-    ~nvfp4_selector_device_snapshot() {
+    ~selector_device_snapshot() {
         reset();
     }
 
@@ -530,9 +583,9 @@ struct nvfp4_selector_device_sample_view {
     float x_scale = 1.0f;
 };
 
-struct nvfp4_selector_binding {
+struct selector_binding {
     std::string name;
-    nvfp4_selector_tensor_class cls = nvfp4_selector_tensor_class::OTHER;
+    selector_tensor_class cls = selector_tensor_class::OTHER;
     int bucket = -1;
     int32_t layer = -1;
     ggml_tensor * target = nullptr;
@@ -553,13 +606,13 @@ struct nvfp4_selector_binding {
     std::vector<uint8_t> working_scale_bytes;
     std::vector<uint8_t> original_input_scale_bytes;
     std::vector<uint8_t> working_input_scale_bytes;
-    nvfp4_selector_device_snapshot original_target_device;
-    nvfp4_selector_device_snapshot original_scale_device;
-    nvfp4_selector_device_snapshot original_input_scale_device;
+    selector_device_snapshot original_target_device;
+    selector_device_snapshot original_scale_device;
+    selector_device_snapshot original_input_scale_device;
     std::shared_ptr<nvfp4_selector_device_sample_bank> device_samples;
 };
 
-struct nvfp4_selector_type_candidate {
+struct selector_type_candidate {
     ggml_type type = GGML_TYPE_COUNT;
     size_t nbytes = 0;
     size_t delta_bytes = 0;
@@ -568,30 +621,30 @@ struct nvfp4_selector_type_candidate {
     double type_gain = 1.0;
 };
 
-struct nvfp4_selector_tensor_sensitivity {
+struct selector_tensor_sensitivity {
     std::string name;
     std::string role;
-    nvfp4_selector_tensor_class cls = nvfp4_selector_tensor_class::OTHER;
+    selector_tensor_class cls = selector_tensor_class::OTHER;
     int bucket = -1;
     int32_t layer = -1;
     size_t binding_index = 0;
     size_t target_nbytes = 0;
-    size_t q8_nbytes = 0;
+    size_t best_candidate_nbytes = 0;
     size_t bf16_nbytes = 0;
-    std::vector<nvfp4_selector_type_candidate> type_candidates;
+    std::vector<selector_type_candidate> type_candidates;
     double proxy_score = 0.0;
     double proxy_rmse = 0.0;
     double proxy_abs_mean = 0.0;
     double proxy_max_abs = 0.0;
-    double q8_roi = 0.0;
+    double best_candidate_roi = 0.0;
     double bf16_roi = 0.0;
-    size_t q8_delta_bytes = 0;
+    size_t best_candidate_delta_bytes = 0;
     size_t bf16_delta_bytes = 0;
-    double q8_speed_penalty = 0.0;
+    double best_candidate_speed_penalty = 0.0;
     double bf16_speed_penalty = 0.0;
-    ggml_type q8_type = GGML_TYPE_Q8_0;
-    bool has_alt_nvfp4_cfg = false;
-    nvfp4_cuda_runtime_cfg alt_nvfp4_cfg = {
+    ggml_type best_candidate_type = GGML_TYPE_Q8_0;
+    bool has_alt_nvfp4_encoder_cfg = false;
+    nvfp4_cuda_runtime_cfg alt_nvfp4_encoder_cfg = {
         NVFP4_CUDA_CHOOSE46_ADAPTIVE,
         8,
         1,
@@ -599,11 +652,11 @@ struct nvfp4_selector_tensor_sensitivity {
         448.0f,
         256.0f,
     };
-    int64_t alt_nvfp4_sample_blocks = 0;
-    std::string alt_nvfp4_policy_name;
-    double alt_nvfp4_proxy_score = std::numeric_limits<double>::infinity();
-    double alt_nvfp4_gain = 0.0;
-    double alt_nvfp4_gain_rel = 0.0;
+    int64_t alt_nvfp4_encoder_sample_blocks = 0;
+    std::string alt_nvfp4_encoder_policy_name;
+    double alt_nvfp4_encoder_proxy_score = std::numeric_limits<double>::infinity();
+    double alt_nvfp4_encoder_gain = 0.0;
+    double alt_nvfp4_encoder_gain_rel = 0.0;
     double suggested_priority = 0.0;
     ggml_type suggested_type = GGML_TYPE_COUNT;
     size_t suggested_nbytes = 0;
@@ -616,14 +669,14 @@ struct nvfp4_selector_tensor_sensitivity {
     int32_t suggested_k_rsf_mode = 0;
 };
 
-static std::string format_selector_suggested_type(const nvfp4_selector_tensor_sensitivity & s) {
+static std::string format_selector_suggested_type(const selector_tensor_sensitivity & s) {
     tensor_type_option opt;
     opt.type = s.suggested_type;
-    if (s.suggested_type == GGML_TYPE_NVFP4 && s.has_alt_nvfp4_cfg) {
+    if (s.suggested_type == GGML_TYPE_NVFP4 && s.has_alt_nvfp4_encoder_cfg) {
         opt.has_nvfp4_cfg = true;
-        opt.nvfp4_cfg = s.alt_nvfp4_cfg;
-        opt.nvfp4_sample_blocks = s.alt_nvfp4_sample_blocks;
-        opt.nvfp4_policy_name = s.alt_nvfp4_policy_name;
+        opt.nvfp4_cfg = s.alt_nvfp4_encoder_cfg;
+        opt.nvfp4_sample_blocks = s.alt_nvfp4_encoder_sample_blocks;
+        opt.nvfp4_policy_name = s.alt_nvfp4_encoder_policy_name;
     } else if (s.has_suggested_k_rsf_mode && s.suggested_k_rsf_mode > 0) {
         opt.has_k_rsf_mode = true;
         opt.k_rsf_mode = s.suggested_k_rsf_mode;
@@ -631,7 +684,7 @@ static std::string format_selector_suggested_type(const nvfp4_selector_tensor_se
     return format_tensor_type_value(opt);
 }
 
-static int64_t nvfp4_selector_autotune_sample_blocks(int64_t nb_total, int64_t override_cap);
+static int64_t selector_sample_blocks(int64_t nb_total, int64_t override_cap);
 
 enum class quantize_stream_key_mode {
     HASHED_SLOT,
@@ -663,10 +716,10 @@ struct ggml_quantize_type_traits;
 template <>
 struct ggml_quantize_type_traits<GGML_TYPE_NVFP4> {
     static constexpr ggml_type quant_type = GGML_TYPE_NVFP4;
-    static constexpr int64_t block_size = NVFP4_SELECTOR_BLOCK_SIZE;
+    static constexpr int64_t block_size = SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
     static constexpr bool require_scale_bytes = false;
     static constexpr bool supports_sample_only = true;
-    static constexpr const char * thread_control_key = "LLAMA_NVFP4_SELECTOR_THREADS";
+    static constexpr const char * thread_control_key = nullptr;
     static constexpr quantize_stream_key_mode stream_key_mode = quantize_stream_key_mode::HASHED_SLOT;
     static constexpr uintptr_t single_stream_slot = 2;
     static constexpr uintptr_t worker_stream_slot = 16;
@@ -734,7 +787,7 @@ struct quantize_binding_shape_t {
 
 template <ggml_type type>
 static bool quantize_binding_prepare_shape(
-    const nvfp4_selector_binding & binding,
+    const selector_binding & binding,
     int64_t sample_blocks_override,
     int64_t sample_phase,
     const char * caller,
@@ -771,7 +824,7 @@ static bool quantize_binding_prepare_shape(
     shape.nb_total = (shape.nrows * shape.n_per_row) / traits::block_size;
     if constexpr (traits::supports_sample_only) {
         shape.sample_nb_for_bytes = shape.sample_only
-            ? nvfp4_selector_autotune_sample_blocks(shape.nb_total, sample_blocks_override)
+            ? selector_sample_blocks(shape.nb_total, sample_blocks_override)
             : 0;
     } else {
         shape.sample_nb_for_bytes = 0;
@@ -800,7 +853,9 @@ template <ggml_type type>
 static int quantize_binding_thread_count(int64_t n_slices, int nthread) {
     using traits = ggml_quantize_type_traits<type>;
     int64_t requested = std::max(1, nthread);
-    if constexpr (traits::thread_control_key != nullptr) {
+    if constexpr (traits::quant_type == GGML_TYPE_NVFP4) {
+        requested = selector_control_i64("THREADS", requested);
+    } else if constexpr (traits::thread_control_key != nullptr) {
         requested = quantize_control_i64(traits::thread_control_key, requested);
     }
     return (int) std::max<int64_t>(1, std::min<int64_t>(std::max<int64_t>(1, n_slices), requested));
@@ -934,7 +989,7 @@ static bool quantize_run_binding_slices(
 
 template <ggml_type type>
 static bool quantize_binding_has_target(
-    const nvfp4_selector_binding & binding,
+    const selector_binding & binding,
     const char * caller) {
     using traits = ggml_quantize_type_traits<type>;
 
@@ -1018,18 +1073,18 @@ static bool quantize_binding_quantize(
         count);
 }
 
-static int64_t nvfp4_selector_sample_phase_stride(
+static int64_t selector_sample_phase_stride(
     int64_t nb_total,
-    nvfp4_selector_tensor_class cls) {
+    selector_tensor_class cls) {
     int64_t stride = std::max<int64_t>(1, nb_total / 11);
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:
-        case nvfp4_selector_tensor_class::ATTN_OUT:
-        case nvfp4_selector_tensor_class::SSM:
+        case selector_tensor_class::ATTN_QKV:
+        case selector_tensor_class::ATTN_OUT:
+        case selector_tensor_class::SSM:
             stride = std::max<int64_t>(stride, std::max<int64_t>(1, nb_total / 7));
             break;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:
+        case selector_tensor_class::EXPERT_UP_GATE:
+        case selector_tensor_class::EXPERT_DOWN:
             stride = std::max<int64_t>(stride, std::max<int64_t>(1, nb_total / 5));
             break;
         default:
@@ -1062,9 +1117,9 @@ static float gguf_get_nvfp4_tensor_scale(const gguf_context * ctx_gguf, const ch
     return (std::isfinite(out) && out > 0.0f) ? out : 1.0f;
 }
 
-static bool nvfp4_selector_gpu_kld_parity_ok(
-        const nvfp4_selector_kld_metrics & cpu,
-        const nvfp4_selector_kld_metrics & gpu,
+static bool selector_gpu_kld_parity_ok(
+        const selector_kld_metrics & cpu,
+        const selector_kld_metrics & gpu,
         std::string * reason) {
     auto fail = [&](const std::string & why) {
         if (reason != nullptr) {
@@ -1107,9 +1162,9 @@ static bool nvfp4_selector_gpu_kld_parity_ok(
     return true;
 }
 
-class nvfp4_selector_kld_worker_pool {
+class selector_kld_worker_pool {
 public:
-    explicit nvfp4_selector_kld_worker_pool(int n_threads) {
+    explicit selector_kld_worker_pool(int n_threads) {
         const int capped = std::max(0, n_threads);
         workers.reserve((size_t) capped);
         for (int i = 0; i < capped; ++i) {
@@ -1117,7 +1172,7 @@ public:
         }
     }
 
-    ~nvfp4_selector_kld_worker_pool() {
+    ~selector_kld_worker_pool() {
         {
             std::lock_guard<std::mutex> lock(mu);
             stopping = true;
@@ -1193,11 +1248,11 @@ private:
     bool stopping = false;
 };
 
-static bool nvfp4_selector_eval_kld_subset(
+static bool selector_eval_kld_subset(
     llama_context * ctx,
-    const nvfp4_selector_kld_subset & kld,
+    const selector_kld_subset & kld,
     int32_t n_batch,
-    nvfp4_selector_kld_metrics & out,
+    selector_kld_metrics & out,
     bool collect_kld_distribution,
     const std::string & progress_label = "selector kld eval") {
     const llama_model * model = llama_get_model(ctx);
@@ -1230,7 +1285,7 @@ static bool nvfp4_selector_eval_kld_subset(
         out.kld_values.clear();
     }
     const int64_t metric_thread_cap = std::max<int64_t>(1, kld.n_chunk * kld.n_score);
-    int64_t metric_thread_request = nvfp4_selector_kld_threads_override();
+    int64_t metric_thread_request = selector_kld_threads_override();
     if (metric_thread_request <= 0) {
         metric_thread_request = std::max<unsigned int>(1, std::thread::hardware_concurrency());
     }
@@ -1263,12 +1318,12 @@ static bool nvfp4_selector_eval_kld_subset(
         }
     };
 
-    std::unique_ptr<nvfp4_selector_kld_worker_pool> cpu_kld_pool;
+    std::unique_ptr<selector_kld_worker_pool> cpu_kld_pool;
     llama_batch batch = llama_batch_init(std::min(n_batch, kld.n_ctx * n_seq), 0, 1);
     const int64_t progress_total =
         (int64_t) ((kld.n_chunk + n_seq - 1) / n_seq) * (int64_t) std::max(1, num_batches);
     int64_t progress_done = 0;
-    nvfp4_selector_progress_heartbeat heartbeat(progress_label, progress_total);
+    selector_progress_heartbeat heartbeat(progress_label, progress_total);
     {
         char detail[192];
         snprintf(detail, sizeof(detail),
@@ -1293,7 +1348,7 @@ static bool nvfp4_selector_eval_kld_subset(
         bool chunk_gpu_complete = gpu_kld_enabled && gpu_kld_state.load(std::memory_order_relaxed) >= 0;
         bool chunk_gpu_failed = false;
         int chunk_gpu_rows = 0;
-        nvfp4_selector_kld_metrics chunk_gpu_metrics;
+        selector_kld_metrics chunk_gpu_metrics;
         chunk_gpu_metrics.collect_kld_values = collect_kld_distribution;
         for (int jb = 0; jb < num_batches; ++jb) {
             const int batch_start = jb * n_batch;
@@ -1378,7 +1433,7 @@ static bool nvfp4_selector_eval_kld_subset(
                             token_ids[(size_t) s] = (int32_t) chunk_tokens[t + 1];
                         }
                         const uint16_t * base_seq =
-                            nvfp4_selector_kld_log_probs_data(kld) +
+                            selector_kld_log_probs_data(kld) +
                             ((size_t) (ci + seq) * (size_t) kld.n_score + (size_t) s_begin) * (size_t) kld.nv;
                         nvfp4_cuda_kld_result cuda_km{};
                         std::vector<double> cuda_kld_values;
@@ -1406,7 +1461,7 @@ static bool nvfp4_selector_eval_kld_subset(
                             gpu_kld_state.store(-1, std::memory_order_relaxed);
                             break;
                         }
-                        nvfp4_selector_merge_cuda_kld_metrics(chunk_gpu_metrics, cuda_km, std::move(cuda_kld_values));
+                        selector_merge_cuda_kld_metrics(chunk_gpu_metrics, cuda_km, std::move(cuda_kld_values));
                         chunk_gpu_rows += score_count;
                     }
                 }
@@ -1422,7 +1477,7 @@ static bool nvfp4_selector_eval_kld_subset(
                 heartbeat.detail(detail);
             }
             gpu_kld_state.store(1, std::memory_order_relaxed);
-            nvfp4_selector_merge_kld_metrics(out, std::move(chunk_gpu_metrics));
+            selector_merge_kld_metrics(out, std::move(chunk_gpu_metrics));
             continue;
         }
         if (chunk_skipped_host_logits) {
@@ -1449,7 +1504,7 @@ static bool nvfp4_selector_eval_kld_subset(
             snprintf(detail, sizeof(detail), "chunk [%d/%d] reducing CPU KLD", ci + 1, kld.n_chunk);
             heartbeat.detail(detail);
         }
-        auto eval_range = [&](int begin, int end, nvfp4_selector_kld_metrics & local) -> bool {
+        auto eval_range = [&](int begin, int end, selector_kld_metrics & local) -> bool {
             local.collect_kld_values = collect_kld_distribution;
             if (collect_kld_distribution) {
                 local.kld_values.reserve((size_t) std::max(0, end - begin));
@@ -1459,32 +1514,32 @@ static bool nvfp4_selector_eval_kld_subset(
                 const int s = item - seq * kld.n_score;
                 const int t = kld.first + s;
                 const llama_token * chunk_tokens = kld.tokens.data() + (size_t) (ci + seq) * (size_t) kld.n_ctx;
-                const uint16_t * base_chunk = nvfp4_selector_kld_log_probs_data(kld) + (size_t) (ci + seq) * (size_t) kld.n_score * (size_t) kld.nv;
+                const uint16_t * base_chunk = selector_kld_log_probs_data(kld) + (size_t) (ci + seq) * (size_t) kld.n_score * (size_t) kld.nv;
                 const float * logits_t = num_batches > 1
                     ? logits_all.data() + ((size_t) seq * (size_t) kld.n_score + (size_t) s) * (size_t) kld.n_vocab
                     : logits_contiguous + ((size_t) seq * (size_t) kld.n_score + (size_t) s) * (size_t) kld.n_vocab;
                 const uint16_t * base_t = base_chunk + (size_t) s * (size_t) kld.nv;
                 const llama_token tok = chunk_tokens[t + 1];
-                nvfp4_selector_eval_one_token(kld.n_vocab, logits_t, base_t, tok, local);
+                selector_eval_one_token(kld.n_vocab, logits_t, base_t, tok, local);
             }
             return true;
         };
 
-        nvfp4_selector_kld_metrics chunk_cpu_metrics;
+        selector_kld_metrics chunk_cpu_metrics;
         chunk_cpu_metrics.collect_kld_values = collect_kld_distribution;
         const int threads_for_chunk = std::min(metric_threads, std::max(1, n_eval));
         if (threads_for_chunk <= 1 || n_eval < 2) {
-            nvfp4_selector_kld_metrics local;
+            selector_kld_metrics local;
             if (!eval_range(0, n_eval, local)) {
                 fprintf(stderr, "%s: selector missing logits chunk=%d token=%d\n", __func__, ci, kld.first);
                 llama_batch_free(batch);
                 return false;
             }
-            nvfp4_selector_merge_kld_metrics(chunk_cpu_metrics, std::move(local));
+            selector_merge_kld_metrics(chunk_cpu_metrics, std::move(local));
         } else {
-            std::vector<nvfp4_selector_kld_metrics> locals((size_t) threads_for_chunk);
+            std::vector<selector_kld_metrics> locals((size_t) threads_for_chunk);
             if (!cpu_kld_pool || cpu_kld_pool->capacity() < threads_for_chunk) {
-                cpu_kld_pool = std::make_unique<nvfp4_selector_kld_worker_pool>(threads_for_chunk);
+                cpu_kld_pool = std::make_unique<selector_kld_worker_pool>(threads_for_chunk);
             }
             std::atomic_bool ok{true};
             cpu_kld_pool->run(threads_for_chunk, [&](int ti) {
@@ -1500,26 +1555,26 @@ static bool nvfp4_selector_eval_kld_subset(
                 return false;
             }
             for (auto & local : locals) {
-                nvfp4_selector_merge_kld_metrics(chunk_cpu_metrics, std::move(local));
+                selector_merge_kld_metrics(chunk_cpu_metrics, std::move(local));
             }
         }
         if (validate_gpu_chunk) {
             std::string parity_reason;
-            if (nvfp4_selector_gpu_kld_parity_ok(chunk_cpu_metrics, chunk_gpu_metrics, &parity_reason)) {
+            if (selector_gpu_kld_parity_ok(chunk_cpu_metrics, chunk_gpu_metrics, &parity_reason)) {
                 fprintf(stderr,
                     "%s: selector GPU KLD parity passed; enabling host-logits skip for later chunks\n",
                     __func__);
                 gpu_kld_state.store(1, std::memory_order_relaxed);
-                nvfp4_selector_merge_kld_metrics(out, std::move(chunk_gpu_metrics));
+                selector_merge_kld_metrics(out, std::move(chunk_gpu_metrics));
             } else {
                 fprintf(stderr,
                     "%s: selector GPU KLD parity failed (%s); disabling CUDA reducer for this process\n",
                     __func__, parity_reason.c_str());
                 gpu_kld_state.store(-1, std::memory_order_relaxed);
-                nvfp4_selector_merge_kld_metrics(out, std::move(chunk_cpu_metrics));
+                selector_merge_kld_metrics(out, std::move(chunk_cpu_metrics));
             }
         } else {
-            nvfp4_selector_merge_kld_metrics(out, std::move(chunk_cpu_metrics));
+            selector_merge_kld_metrics(out, std::move(chunk_cpu_metrics));
         }
         {
             char detail[160];
@@ -1533,9 +1588,9 @@ static bool nvfp4_selector_eval_kld_subset(
     return true;
 }
 
-static std::string nvfp4_selector_format_metrics(
+static std::string selector_format_metrics(
         const char * label,
-        const nvfp4_selector_derived_metrics & dm) {
+        const selector_derived_metrics & dm) {
     char buf[1024];
     snprintf(buf, sizeof(buf),
         "%s{ln=%.6f+-%.6f kld=%.6f+-%.6f p95=%.6f p99=%.6f p999=%.6f tail99=%.6f rms=%.6f+-%.6f max=%.6f top=%.4f+-%.4f top_flip_w=%.6f top_p_rmse=%.6f entropy_rmse=%.6f}",
@@ -1559,7 +1614,7 @@ static std::string nvfp4_selector_format_metrics(
     return buf;
 }
 
-static std::string nvfp4_selector_json_escape(const std::string & value) {
+static std::string selector_json_escape(const std::string & value) {
     std::string out;
     out.reserve(value.size() + 8);
     for (const char c : value) {
@@ -1575,7 +1630,7 @@ static std::string nvfp4_selector_json_escape(const std::string & value) {
     return out;
 }
 
-static void nvfp4_selector_write_json_number(std::ostream & out, double value) {
+static void selector_write_json_number(std::ostream & out, double value) {
     if (std::isfinite(value)) {
         out << value;
     } else {
@@ -1583,41 +1638,41 @@ static void nvfp4_selector_write_json_number(std::ostream & out, double value) {
     }
 }
 
-static void nvfp4_selector_write_json_number_field(std::ostream & out, const char * name, double value) {
+static void selector_write_json_number_field(std::ostream & out, const char * name, double value) {
     out << ", \"" << name << "\": ";
-    nvfp4_selector_write_json_number(out, value);
+    selector_write_json_number(out, value);
 }
 
-static void nvfp4_selector_write_metric_json_fields(
+static void selector_write_metric_json_fields(
         std::ostream & out,
-        const nvfp4_selector_derived_metrics & dm,
+        const selector_derived_metrics & dm,
         const char * prefix) {
     out
         << ", \"" << prefix << "valid\": " << (dm.ok ? "true" : "false");
-    out << ", \"" << prefix << "ppl\": "; nvfp4_selector_write_json_number(out, dm.ppl_q);
-    out << ", \"" << prefix << "ppl_base\": "; nvfp4_selector_write_json_number(out, dm.ppl_base);
-    out << ", \"" << prefix << "ln_ratio\": "; nvfp4_selector_write_json_number(out, dm.ln_ratio);
-    out << ", \"" << prefix << "mean_kld\": "; nvfp4_selector_write_json_number(out, dm.mean_kld);
-    out << ", \"" << prefix << "kld_p95\": "; nvfp4_selector_write_json_number(out, dm.kld_p95);
-    out << ", \"" << prefix << "kld_p99\": "; nvfp4_selector_write_json_number(out, dm.kld_p99);
-    out << ", \"" << prefix << "kld_p999\": "; nvfp4_selector_write_json_number(out, dm.kld_p999);
-    out << ", \"" << prefix << "kld_tail_mean\": "; nvfp4_selector_write_json_number(out, dm.kld_tail_mean);
-    out << ", \"" << prefix << "max_kld\": "; nvfp4_selector_write_json_number(out, dm.max_kld);
-    out << ", \"" << prefix << "rms_dp\": "; nvfp4_selector_write_json_number(out, dm.rms_dp);
-    out << ", \"" << prefix << "same_top\": "; nvfp4_selector_write_json_number(out, dm.same_top);
-    out << ", \"" << prefix << "entropy_rmse\": "; nvfp4_selector_write_json_number(out, dm.entropy_rmse);
-    out << ", \"" << prefix << "top_prob_rmse\": "; nvfp4_selector_write_json_number(out, dm.top_prob_rmse);
-    out << ", \"" << prefix << "top_flip_weight\": "; nvfp4_selector_write_json_number(out, dm.top_flip_weight);
+    out << ", \"" << prefix << "ppl\": "; selector_write_json_number(out, dm.ppl_q);
+    out << ", \"" << prefix << "ppl_base\": "; selector_write_json_number(out, dm.ppl_base);
+    out << ", \"" << prefix << "ln_ratio\": "; selector_write_json_number(out, dm.ln_ratio);
+    out << ", \"" << prefix << "mean_kld\": "; selector_write_json_number(out, dm.mean_kld);
+    out << ", \"" << prefix << "kld_p95\": "; selector_write_json_number(out, dm.kld_p95);
+    out << ", \"" << prefix << "kld_p99\": "; selector_write_json_number(out, dm.kld_p99);
+    out << ", \"" << prefix << "kld_p999\": "; selector_write_json_number(out, dm.kld_p999);
+    out << ", \"" << prefix << "kld_tail_mean\": "; selector_write_json_number(out, dm.kld_tail_mean);
+    out << ", \"" << prefix << "max_kld\": "; selector_write_json_number(out, dm.max_kld);
+    out << ", \"" << prefix << "rms_dp\": "; selector_write_json_number(out, dm.rms_dp);
+    out << ", \"" << prefix << "same_top\": "; selector_write_json_number(out, dm.same_top);
+    out << ", \"" << prefix << "entropy_rmse\": "; selector_write_json_number(out, dm.entropy_rmse);
+    out << ", \"" << prefix << "top_prob_rmse\": "; selector_write_json_number(out, dm.top_prob_rmse);
+    out << ", \"" << prefix << "top_flip_weight\": "; selector_write_json_number(out, dm.top_flip_weight);
 }
 
-static void nvfp4_selector_write_delta_metric_json_fields(
+static void selector_write_delta_metric_json_fields(
         std::ostream & out,
-        const nvfp4_selector_derived_metrics & after,
-        const nvfp4_selector_derived_metrics & before) {
+        const selector_derived_metrics & after,
+        const selector_derived_metrics & before) {
     auto write_delta = [&](const char * name, double value) {
         out << ", \"" << name << "\": ";
         if (after.ok && before.ok && std::isfinite(value)) {
-            nvfp4_selector_write_json_number(out, value);
+            selector_write_json_number(out, value);
         } else {
             out << "null";
         }
@@ -1637,7 +1692,7 @@ static void nvfp4_selector_write_delta_metric_json_fields(
     write_delta("delta_top_flip_weight", after.top_flip_weight - before.top_flip_weight);
 }
 
-struct nvfp4_selector_stageb_digest {
+struct selector_stageb_digest {
     uint64_t value = 1469598103934665603ull;
 
     void add_bytes(const void * data, size_t size) {
@@ -1661,7 +1716,7 @@ struct nvfp4_selector_stageb_digest {
     }
 };
 
-static nlohmann::ordered_json nvfp4_selector_stageb_metric_json(const nvfp4_selector_derived_metrics & dm) {
+static nlohmann::ordered_json selector_stageb_metric_json(const selector_derived_metrics & dm) {
     nlohmann::ordered_json out = nlohmann::ordered_json::object();
     out["ok"] = dm.ok;
     out["ppl_q"] = dm.ppl_q;
@@ -1685,9 +1740,9 @@ static nlohmann::ordered_json nvfp4_selector_stageb_metric_json(const nvfp4_sele
     return out;
 }
 
-static bool nvfp4_selector_stageb_metric_from_json(
+static bool selector_stageb_metric_from_json(
         const nlohmann::ordered_json & in,
-        nvfp4_selector_derived_metrics & dm) {
+        selector_derived_metrics & dm) {
     if (!in.is_object()) {
         return false;
     }
@@ -1713,7 +1768,7 @@ static bool nvfp4_selector_stageb_metric_from_json(
     return dm.ok;
 }
 
-static nlohmann::ordered_json nvfp4_selector_stageb_cfg_json(const nvfp4_cuda_runtime_cfg & cfg) {
+static nlohmann::ordered_json selector_stageb_cfg_json(const nvfp4_cuda_runtime_cfg & cfg) {
     nlohmann::ordered_json out = nlohmann::ordered_json::object();
     out["choose46"] = cfg.choose46_mode;
     out["refit"] = cfg.refit_iters;
@@ -1724,7 +1779,23 @@ static nlohmann::ordered_json nvfp4_selector_stageb_cfg_json(const nvfp4_cuda_ru
     return out;
 }
 
-static nlohmann::ordered_json nvfp4_selector_stageb_rank_json(const selector_rank_config & cfg) {
+static bool selector_stageb_cfg_from_json(
+        const nlohmann::ordered_json & in,
+        nvfp4_cuda_runtime_cfg & cfg) {
+    if (!in.is_object()) {
+        return false;
+    }
+    cfg.choose46_mode = in.value("choose46", NVFP4_CUDA_CHOOSE46_ADAPTIVE);
+    cfg.refit_iters = in.value("refit", 8);
+    cfg.use_compand_sat = in.value("compand", 1);
+    cfg.reserved_i32 = in.value("reserved", 0);
+    cfg.cap_m6 = in.value("cap6", 448.0f);
+    cfg.cap_m4 = in.value("cap4", 256.0f);
+    return std::isfinite(cfg.cap_m6) && std::isfinite(cfg.cap_m4) &&
+           cfg.refit_iters > 0 && cfg.cap_m6 > 0.0f && cfg.cap_m4 > 0.0f;
+}
+
+static nlohmann::ordered_json selector_stageb_rank_json(const selector_rank_config & cfg) {
     nlohmann::ordered_json out = nlohmann::ordered_json::object();
     out["kld_threshold"] = cfg.kld_threshold;
     out["p99_threshold"] = cfg.p99_threshold;
@@ -1763,7 +1834,7 @@ static nlohmann::ordered_json nvfp4_selector_stageb_rank_json(const selector_ran
     return out;
 }
 
-static nlohmann::ordered_json nvfp4_selector_stageb_file_json(const std::string & path) {
+static nlohmann::ordered_json selector_stageb_file_json(const std::string & path) {
     nlohmann::ordered_json out = nlohmann::ordered_json::object();
     std::error_code ec;
     const auto canonical = std::filesystem::weakly_canonical(path, ec);
@@ -1775,7 +1846,7 @@ static nlohmann::ordered_json nvfp4_selector_stageb_file_json(const std::string 
     return out;
 }
 
-static nlohmann::ordered_json nvfp4_selector_stageb_kld_json(const nvfp4_selector_kld_subset & kld) {
+static nlohmann::ordered_json selector_stageb_kld_json(const selector_kld_subset & kld) {
     nlohmann::ordered_json out = nlohmann::ordered_json::object();
     out["path"] = kld.source_path;
     out["size"] = kld.source_size;
@@ -1790,21 +1861,21 @@ static nlohmann::ordered_json nvfp4_selector_stageb_kld_json(const nvfp4_selecto
     return out;
 }
 
-struct nvfp4_selector_stageb_cache_entry {
+struct selector_stageb_cache_entry {
     std::string event;
     std::string policy;
-    nvfp4_selector_derived_metrics search;
-    nvfp4_selector_derived_metrics validation;
+    selector_derived_metrics search;
+    selector_derived_metrics validation;
     bool has_validation = false;
     bool pass = false;
     double score = std::numeric_limits<double>::infinity();
 };
 
-struct nvfp4_selector_stageb_cache {
+struct selector_stageb_cache {
     static constexpr const char * schema = "advanced-gguf-selector-stageb-result-v1";
     std::string path;
-    const nvfp4_selector_ledger * ledger = nullptr;
-    std::unordered_map<std::string, nvfp4_selector_stageb_cache_entry> entries;
+    const selector_ledger * ledger = nullptr;
+    std::unordered_map<std::string, selector_stageb_cache_entry> entries;
     std::unordered_set<std::string> sidecar_keys;
     std::unordered_set<std::string> policies;
     std::unordered_set<std::string> mismatch_logged;
@@ -1833,7 +1904,7 @@ struct nvfp4_selector_stageb_cache {
                     continue;
                 }
                 if (from_ledger) {
-                    if (record_schema != nvfp4_selector_ledger::schema ||
+                    if (record_schema != selector_ledger::schema ||
                             record.value("row_type", std::string()) != "exact_eval") {
                         ++ignored;
                         continue;
@@ -1849,21 +1920,21 @@ struct nvfp4_selector_stageb_cache {
                     continue;
                 }
 
-                nvfp4_selector_stageb_cache_entry entry;
+                selector_stageb_cache_entry entry;
                 entry.event = record.value("event", std::string());
                 entry.policy = record.value("policy", std::string());
                 entry.pass = record.value("pass", false);
                 entry.score = record.value("score", std::numeric_limits<double>::infinity());
                 entry.has_validation = record.value("has_validation", false);
                 if (entry.policy.empty() ||
-                        !nvfp4_selector_stageb_metric_from_json(*search_it, entry.search)) {
+                        !selector_stageb_metric_from_json(*search_it, entry.search)) {
                     ++ignored;
                     continue;
                 }
                 if (entry.has_validation) {
                     const auto validation_it = record.find("validation");
                     if (validation_it == record.end() ||
-                            !nvfp4_selector_stageb_metric_from_json(*validation_it, entry.validation)) {
+                            !selector_stageb_metric_from_json(*validation_it, entry.validation)) {
                         ++ignored;
                         continue;
                     }
@@ -1900,7 +1971,7 @@ struct nvfp4_selector_stageb_cache {
     bool find(
             const nlohmann::ordered_json & key,
             const std::string & policy,
-            nvfp4_selector_stageb_cache_entry & out) {
+            selector_stageb_cache_entry & out) {
         const auto it = entries.find(key.dump());
         if (it != entries.end()) {
             out = it->second;
@@ -1939,8 +2010,8 @@ struct nvfp4_selector_stageb_cache {
             const char * event,
             const nlohmann::ordered_json & key,
             const std::string & policy,
-            const nvfp4_selector_derived_metrics & search,
-            const nvfp4_selector_derived_metrics * validation,
+            const selector_derived_metrics & search,
+            const selector_derived_metrics * validation,
             bool pass,
             double score) {
         if (path.empty() || !search.ok) {
@@ -1963,10 +2034,10 @@ struct nvfp4_selector_stageb_cache {
         record["event"] = event;
         record["policy"] = policy;
         record["key"] = key;
-        record["search"] = nvfp4_selector_stageb_metric_json(search);
+        record["search"] = selector_stageb_metric_json(search);
         record["has_validation"] = validation != nullptr && validation->ok;
         if (validation != nullptr && validation->ok) {
-            record["validation"] = nvfp4_selector_stageb_metric_json(*validation);
+            record["validation"] = selector_stageb_metric_json(*validation);
         }
         record["pass"] = pass;
         record["score"] = score;
@@ -1984,17 +2055,17 @@ struct nvfp4_selector_stageb_cache {
             ledger_record["policy"] = policy;
             ledger_record["cache_path"] = path;
             ledger_record["key"] = key;
-            ledger_record["search"] = nvfp4_selector_stageb_metric_json(search);
+            ledger_record["search"] = selector_stageb_metric_json(search);
             ledger_record["has_validation"] = validation != nullptr && validation->ok;
             if (validation != nullptr && validation->ok) {
-                ledger_record["validation"] = nvfp4_selector_stageb_metric_json(*validation);
+                ledger_record["validation"] = selector_stageb_metric_json(*validation);
             }
             ledger_record["pass"] = pass;
             ledger_record["score"] = score;
             ledger->append_exact_eval(std::move(ledger_record));
         }
 
-        nvfp4_selector_stageb_cache_entry entry;
+        selector_stageb_cache_entry entry;
         entry.event = event;
         entry.policy = policy;
         entry.search = search;
@@ -2009,12 +2080,148 @@ struct nvfp4_selector_stageb_cache {
     }
 };
 
-static double nvfp4_selector_combined_unc(double ua, double ub) {
+struct selector_tensor_rescue_cache_entry {
+    std::string policy;
+    nvfp4_cuda_runtime_cfg cfg = {
+        NVFP4_CUDA_CHOOSE46_ADAPTIVE,
+        8,
+        1,
+        0,
+        448.0f,
+        256.0f,
+    };
+    int64_t sample_blocks = 0;
+    double base_score = std::numeric_limits<double>::infinity();
+    double best_score = std::numeric_limits<double>::infinity();
+};
+
+struct selector_tensor_rescue_cache {
+    static constexpr const char * schema = "advanced-gguf-selector-tensor-rescue-result-v1";
+    std::string path;
+    std::unordered_map<std::string, selector_tensor_rescue_cache_entry> entries;
+
+    void load(const std::string & cache_path) {
+        path = cache_path;
+        entries.clear();
+        if (path.empty()) {
+            return;
+        }
+        std::ifstream in(path);
+        if (!in) {
+            return;
+        }
+
+        std::string line;
+        size_t loaded = 0;
+        size_t ignored = 0;
+        while (std::getline(in, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            try {
+                const auto record = nlohmann::ordered_json::parse(line);
+                if (!record.is_object() ||
+                        record.value("schema", std::string()) != schema) {
+                    ++ignored;
+                    continue;
+                }
+                const auto key_it = record.find("key");
+                const auto cfg_it = record.find("cfg");
+                if (key_it == record.end() || cfg_it == record.end()) {
+                    ++ignored;
+                    continue;
+                }
+
+                selector_tensor_rescue_cache_entry entry;
+                entry.policy = record.value("policy", std::string());
+                entry.sample_blocks = record.value("sample_blocks", (int64_t) 0);
+                entry.base_score = record.value("base_score", std::numeric_limits<double>::infinity());
+                entry.best_score = record.value("best_score", std::numeric_limits<double>::infinity());
+                if (entry.policy.empty() ||
+                        entry.sample_blocks <= 0 ||
+                        !std::isfinite(entry.base_score) ||
+                        !std::isfinite(entry.best_score) ||
+                        !selector_stageb_cfg_from_json(*cfg_it, entry.cfg)) {
+                    ++ignored;
+                    continue;
+                }
+                entries[key_it->dump()] = entry;
+                ++loaded;
+            } catch (const std::exception &) {
+                ++ignored;
+            }
+        }
+
+        fprintf(stderr,
+            "%s: selector tensor rescue cache loaded entries=%zu ignored=%zu path=%s\n",
+            __func__, loaded, ignored, path.c_str());
+    }
+
+    bool find(
+            const nlohmann::ordered_json & key,
+            const std::string & tensor,
+            selector_tensor_rescue_cache_entry & out) const {
+        const auto it = entries.find(key.dump());
+        if (it == entries.end()) {
+            return false;
+        }
+        out = it->second;
+        fprintf(stderr,
+            "%s: selector tensor rescue cache accepted tensor=%s policy=%s\n",
+            __func__, tensor.c_str(), out.policy.c_str());
+        return true;
+    }
+
+    void append(
+            const nlohmann::ordered_json & key,
+            const std::string & tensor,
+            const selector_tensor_rescue_cache_entry & entry) {
+        if (path.empty() || tensor.empty() || entry.policy.empty() ||
+                entry.sample_blocks <= 0 ||
+                !std::isfinite(entry.base_score) ||
+                !std::isfinite(entry.best_score)) {
+            return;
+        }
+
+        std::filesystem::path cache_path(path);
+        std::error_code ec;
+        if (cache_path.has_parent_path()) {
+            std::filesystem::create_directories(cache_path.parent_path(), ec);
+            if (ec) {
+                fprintf(stderr, "%s: selector tensor rescue cache directory unavailable %s: %s\n",
+                    __func__, cache_path.parent_path().string().c_str(), ec.message().c_str());
+                return;
+            }
+        }
+
+        nlohmann::ordered_json record = nlohmann::ordered_json::object();
+        record["schema"] = schema;
+        record["event"] = "tensor_rescue";
+        record["tensor"] = tensor;
+        record["key"] = key;
+        record["policy"] = entry.policy;
+        record["cfg"] = selector_stageb_cfg_json(entry.cfg);
+        record["sample_blocks"] = entry.sample_blocks;
+        record["base_score"] = entry.base_score;
+        record["best_score"] = entry.best_score;
+
+        std::ofstream out(path, std::ios::app);
+        if (!out) {
+            fprintf(stderr, "%s: selector tensor rescue cache append failed path=%s\n",
+                __func__, path.c_str());
+            return;
+        }
+        out << record.dump() << '\n';
+        entries[key.dump()] = entry;
+    }
+};
+
+static double selector_combined_unc(double ua, double ub) {
     return std::sqrt(std::max(0.0, ua * ua + ub * ub));
 }
 
-static int nvfp4_selector_compare_lower_noise(double a, double a_unc, double b, double b_unc, double sigma, double abs_floor) {
-    const double margin = std::max(abs_floor, std::max(0.0, sigma) * nvfp4_selector_combined_unc(a_unc, b_unc));
+static int selector_compare_lower_noise(double a, double a_unc, double b, double b_unc, double sigma, double abs_floor) {
+    const double margin = std::max(abs_floor, std::max(0.0, sigma) * selector_combined_unc(a_unc, b_unc));
     if (a + margin < b) {
         return -1;
     }
@@ -2024,8 +2231,8 @@ static int nvfp4_selector_compare_lower_noise(double a, double a_unc, double b, 
     return 0;
 }
 
-static int nvfp4_selector_compare_higher_noise(double a, double a_unc, double b, double b_unc, double sigma, double abs_floor) {
-    const double margin = std::max(abs_floor, std::max(0.0, sigma) * nvfp4_selector_combined_unc(a_unc, b_unc));
+static int selector_compare_higher_noise(double a, double a_unc, double b, double b_unc, double sigma, double abs_floor) {
+    const double margin = std::max(abs_floor, std::max(0.0, sigma) * selector_combined_unc(a_unc, b_unc));
     if (a > b + margin) {
         return -1;
     }
@@ -2035,7 +2242,7 @@ static int nvfp4_selector_compare_higher_noise(double a, double a_unc, double b,
     return 0;
 }
 
-static int nvfp4_selector_compare_lower_margin(double a, double b, double abs_margin, double rel_margin) {
+static int selector_compare_lower_margin(double a, double b, double abs_margin, double rel_margin) {
     const double margin = std::max(std::max(0.0, abs_margin), std::max(0.0, rel_margin) * std::max(std::fabs(a), std::fabs(b)));
     if (a + margin < b) {
         return -1;
@@ -2046,7 +2253,7 @@ static int nvfp4_selector_compare_lower_margin(double a, double b, double abs_ma
     return 0;
 }
 
-static double nvfp4_selector_threshold_penalty(double value, double threshold, double penalty) {
+static double selector_threshold_penalty(double value, double threshold, double penalty) {
     if (!(penalty > 0.0) || !std::isfinite(penalty) ||
             !(threshold > 0.0) || !std::isfinite(threshold)) {
         return 0.0;
@@ -2067,22 +2274,22 @@ static double mxfp6_selector_rel_excess(double value, double base, double abs_fl
     return excess / std::max(std::fabs(base), 1e-12);
 }
 
-enum class nvfp4_selector_metric_mode {
+enum class selector_metric_mode {
     POLICY,
     MXFP6_SCALE,
 };
 
-struct nvfp4_selector_metric_score {
+struct selector_metric_score {
     bool pass = false;
     double score = std::numeric_limits<double>::infinity();
 };
 
-static nvfp4_selector_metric_score nvfp4_selector_score_metrics(
-    const nvfp4_selector_derived_metrics & dm,
-    const nvfp4_selector_derived_metrics * base,
+static selector_metric_score selector_score_metrics(
+    const selector_derived_metrics & dm,
+    const selector_derived_metrics * base,
     const selector_rank_config & rank_cfg,
-    nvfp4_selector_metric_mode mode) {
-    nvfp4_selector_metric_score out;
+    selector_metric_mode mode) {
+    selector_metric_score out;
     if (!dm.ok) {
         return out;
     }
@@ -2102,7 +2309,7 @@ static nvfp4_selector_metric_score nvfp4_selector_score_metrics(
             (!rank_cfg.max_kld_hard_gate || dm.max_kld <= max_kld_thr);
     }
 
-    const bool scale_mode = mode == nvfp4_selector_metric_mode::MXFP6_SCALE;
+    const bool scale_mode = mode == selector_metric_mode::MXFP6_SCALE;
     if (scale_mode && !have_base) {
         return out;
     }
@@ -2124,10 +2331,10 @@ static nvfp4_selector_metric_score nvfp4_selector_score_metrics(
 
     if (!scale_mode) {
         out.score +=
-            nvfp4_selector_threshold_penalty(dm.mean_kld, rank_cfg.kld_threshold, rank_cfg.kld_penalty) +
-            nvfp4_selector_threshold_penalty(dm.kld_p99, rank_cfg.p99_threshold, rank_cfg.p99_penalty) +
-            nvfp4_selector_threshold_penalty(dm.kld_p999, rank_cfg.p999_threshold, rank_cfg.p999_penalty) +
-            nvfp4_selector_threshold_penalty(dm.max_kld, rank_cfg.max_kld_threshold, rank_cfg.max_kld_penalty);
+            selector_threshold_penalty(dm.mean_kld, rank_cfg.kld_threshold, rank_cfg.kld_penalty) +
+            selector_threshold_penalty(dm.kld_p99, rank_cfg.p99_threshold, rank_cfg.p99_penalty) +
+            selector_threshold_penalty(dm.kld_p999, rank_cfg.p999_threshold, rank_cfg.p999_penalty) +
+            selector_threshold_penalty(dm.max_kld, rank_cfg.max_kld_threshold, rank_cfg.max_kld_penalty);
         out.pass = pass;
         return out;
     }
@@ -2160,32 +2367,32 @@ static nvfp4_selector_metric_score nvfp4_selector_score_metrics(
     return out;
 }
 
-struct nvfp4_selector_metric_rank {
+struct selector_metric_rank {
     bool pass = false;
     double score = std::numeric_limits<double>::infinity();
 };
 
-static nvfp4_selector_metric_rank nvfp4_selector_rank_policy_metrics(
-        const nvfp4_selector_derived_metrics & main_dm,
-        const nvfp4_selector_derived_metrics * holdout_dm,
-        const nvfp4_selector_derived_metrics & baseline_main,
-        const nvfp4_selector_derived_metrics * baseline_holdout,
+static selector_metric_rank selector_rank_policy_metrics(
+        const selector_derived_metrics & main_dm,
+        const selector_derived_metrics * holdout_dm,
+        const selector_derived_metrics & baseline_main,
+        const selector_derived_metrics * baseline_holdout,
         const selector_rank_config & rank_cfg) {
-    const nvfp4_selector_metric_score main_score =
-        nvfp4_selector_score_metrics(main_dm, &baseline_main, rank_cfg, nvfp4_selector_metric_mode::POLICY);
+    const selector_metric_score main_score =
+        selector_score_metrics(main_dm, &baseline_main, rank_cfg, selector_metric_mode::POLICY);
 
-    nvfp4_selector_metric_rank out;
+    selector_metric_rank out;
     out.pass = main_score.pass;
     out.score = main_score.score;
 
     if (holdout_dm != nullptr && holdout_dm->ok) {
         const bool have_holdout_base = baseline_holdout != nullptr && baseline_holdout->ok;
-        const nvfp4_selector_metric_score holdout_score =
-            nvfp4_selector_score_metrics(
+        const selector_metric_score holdout_score =
+            selector_score_metrics(
                 *holdout_dm,
                 have_holdout_base ? baseline_holdout : nullptr,
                 rank_cfg,
-                nvfp4_selector_metric_mode::POLICY);
+                selector_metric_mode::POLICY);
         if (have_holdout_base) {
             out.pass = out.pass && holdout_score.pass;
         }
@@ -2196,9 +2403,9 @@ static nvfp4_selector_metric_rank nvfp4_selector_rank_policy_metrics(
     return out;
 }
 
-static int nvfp4_selector_compare_one(
-    const nvfp4_selector_derived_metrics & a,
-    const nvfp4_selector_derived_metrics & b,
+static int selector_compare_one(
+    const selector_derived_metrics & a,
+    const selector_derived_metrics & b,
     const selector_rank_config & rank_cfg) {
     if (!a.ok || !b.ok) {
         if (a.ok != b.ok) {
@@ -2207,13 +2414,13 @@ static int nvfp4_selector_compare_one(
         return 0;
     }
 
-    const int same_top_cmp = nvfp4_selector_compare_higher_noise(
+    const int same_top_cmp = selector_compare_higher_noise(
         a.same_top, a.same_top_unc,
         b.same_top, b.same_top_unc,
         rank_cfg.same_top_sigma,
         rank_cfg.same_top_abs_floor);
 
-    int cmp = nvfp4_selector_compare_lower_noise(
+    int cmp = selector_compare_lower_noise(
         a.mean_kld, a.mean_kld_unc,
         b.mean_kld, b.mean_kld_unc,
         rank_cfg.kld_sigma,
@@ -2226,27 +2433,27 @@ static int nvfp4_selector_compare_one(
         return same_top_cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.kld_p95, b.kld_p95, rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
+    cmp = selector_compare_lower_margin(a.kld_p95, b.kld_p95, rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
     if (cmp != 0) {
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.kld_p99, b.kld_p99, rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
+    cmp = selector_compare_lower_margin(a.kld_p99, b.kld_p99, rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
     if (cmp != 0) {
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.kld_p999, b.kld_p999, rank_cfg.p999_abs_margin, rank_cfg.p999_rel_margin);
+    cmp = selector_compare_lower_margin(a.kld_p999, b.kld_p999, rank_cfg.p999_abs_margin, rank_cfg.p999_rel_margin);
     if (cmp != 0) {
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.kld_tail_mean, b.kld_tail_mean, rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
+    cmp = selector_compare_lower_margin(a.kld_tail_mean, b.kld_tail_mean, rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
     if (cmp != 0) {
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_noise(
+    cmp = selector_compare_lower_noise(
         a.rms_dp, a.rms_dp_unc,
         b.rms_dp, b.rms_dp_unc,
         rank_cfg.rms_dp_sigma,
@@ -2255,54 +2462,54 @@ static int nvfp4_selector_compare_one(
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.top_flip_weight, b.top_flip_weight, rank_cfg.top_flip_weight_abs_floor, 0.0);
+    cmp = selector_compare_lower_margin(a.top_flip_weight, b.top_flip_weight, rank_cfg.top_flip_weight_abs_floor, 0.0);
     if (cmp != 0) {
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.top_prob_rmse, b.top_prob_rmse, rank_cfg.top_prob_rmse_abs_floor, 0.0);
+    cmp = selector_compare_lower_margin(a.top_prob_rmse, b.top_prob_rmse, rank_cfg.top_prob_rmse_abs_floor, 0.0);
     if (cmp != 0) {
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.entropy_rmse, b.entropy_rmse, rank_cfg.entropy_rmse_abs_floor, 0.0);
+    cmp = selector_compare_lower_margin(a.entropy_rmse, b.entropy_rmse, rank_cfg.entropy_rmse_abs_floor, 0.0);
     if (cmp != 0) {
         return cmp;
     }
 
-    cmp = nvfp4_selector_compare_lower_margin(a.max_kld, b.max_kld, rank_cfg.max_kld_abs_margin, rank_cfg.max_kld_rel_margin);
+    cmp = selector_compare_lower_margin(a.max_kld, b.max_kld, rank_cfg.max_kld_abs_margin, rank_cfg.max_kld_rel_margin);
     if (cmp != 0) {
         return cmp;
     }
 
-    return nvfp4_selector_compare_lower_noise(
+    return selector_compare_lower_noise(
         a.ln_ratio, a.ln_ratio_unc,
         b.ln_ratio, b.ln_ratio_unc,
         rank_cfg.ppl_sigma,
         rank_cfg.ln_ratio_abs_floor);
 }
 
-static double nvfp4_selector_measured_score_one(
-        const nvfp4_selector_derived_metrics & dm,
+static double selector_measured_score_one(
+        const selector_derived_metrics & dm,
         const selector_rank_config & rank_cfg) {
-    return nvfp4_selector_score_metrics(
-        dm, nullptr, rank_cfg, nvfp4_selector_metric_mode::POLICY).score;
+    return selector_score_metrics(
+        dm, nullptr, rank_cfg, selector_metric_mode::POLICY).score;
 }
 
-static double nvfp4_selector_measured_score(
-    const nvfp4_selector_derived_metrics & main_dm,
-    const nvfp4_selector_derived_metrics * holdout_dm,
+static double selector_measured_score(
+    const selector_derived_metrics & main_dm,
+    const selector_derived_metrics * holdout_dm,
     const selector_rank_config & rank_cfg) {
-    const double main_score = nvfp4_selector_measured_score_one(main_dm, rank_cfg);
+    const double main_score = selector_measured_score_one(main_dm, rank_cfg);
     if (holdout_dm == nullptr || !holdout_dm->ok) {
         return main_score;
     }
-    const double holdout_score = nvfp4_selector_measured_score_one(*holdout_dm, rank_cfg);
+    const double holdout_score = selector_measured_score_one(*holdout_dm, rank_cfg);
     const double w = std::clamp(rank_cfg.holdout_weight, 0.0, 0.95);
     return (1.0 - w) * main_score + w * holdout_score;
 }
 
-static int nvfp4_selector_compare_measured_score(double a, double b) {
+static int selector_compare_measured_score(double a, double b) {
     if (!std::isfinite(a) || !std::isfinite(b)) {
         if (std::isfinite(a) != std::isfinite(b)) {
             return std::isfinite(a) ? -1 : 1;
@@ -2320,7 +2527,7 @@ static int nvfp4_selector_compare_measured_score(double a, double b) {
     return 0;
 }
 
-struct nvfp4_selector_best_objectives {
+struct selector_best_objectives {
     bool ok = false;
     double ln_ratio = 0.0;
     double mean_kld = 0.0;
@@ -2336,10 +2543,10 @@ struct nvfp4_selector_best_objectives {
     double top_flip_weight = 0.0;
 };
 
-static nvfp4_selector_best_objectives nvfp4_selector_best_objectives_for(
-        const nvfp4_selector_policy & policy,
+static selector_best_objectives selector_best_objectives_for(
+        const selector_policy & policy,
         double holdout_weight) {
-    nvfp4_selector_best_objectives obj;
+    selector_best_objectives obj;
     if (!policy.measured.ok) {
         return obj;
     }
@@ -2380,29 +2587,29 @@ static nvfp4_selector_best_objectives nvfp4_selector_best_objectives_for(
     return obj;
 }
 
-static bool nvfp4_selector_best_lower_no_worse(double a, double b, double abs_margin, double rel_margin) {
+static bool selector_best_lower_no_worse(double a, double b, double abs_margin, double rel_margin) {
     const double margin = std::max(std::max(0.0, abs_margin), std::max(0.0, rel_margin) * std::max(std::fabs(a), std::fabs(b)));
     return a <= b + margin;
 }
 
-static bool nvfp4_selector_best_lower_better(double a, double b, double abs_margin, double rel_margin) {
+static bool selector_best_lower_better(double a, double b, double abs_margin, double rel_margin) {
     const double margin = std::max(std::max(0.0, abs_margin), std::max(0.0, rel_margin) * std::max(std::fabs(a), std::fabs(b)));
     return a + margin < b;
 }
 
-static bool nvfp4_selector_best_higher_no_worse(double a, double b, double abs_margin, double rel_margin) {
+static bool selector_best_higher_no_worse(double a, double b, double abs_margin, double rel_margin) {
     const double margin = std::max(std::max(0.0, abs_margin), std::max(0.0, rel_margin) * std::max(std::fabs(a), std::fabs(b)));
     return a + margin >= b;
 }
 
-static bool nvfp4_selector_best_higher_better(double a, double b, double abs_margin, double rel_margin) {
+static bool selector_best_higher_better(double a, double b, double abs_margin, double rel_margin) {
     const double margin = std::max(std::max(0.0, abs_margin), std::max(0.0, rel_margin) * std::max(std::fabs(a), std::fabs(b)));
     return a > b + margin;
 }
 
-static bool nvfp4_selector_rsf_holdout_guard(
-        const nvfp4_selector_policy & policy,
-        const nvfp4_selector_policy & base,
+static bool selector_rsf_holdout_guard(
+        const selector_policy & policy,
+        const selector_policy & base,
         const selector_rank_config & rank_cfg,
         std::string & reason) {
     const bool is_rsf =
@@ -2412,9 +2619,9 @@ static bool nvfp4_selector_rsf_holdout_guard(
         return true;
     }
 
-    auto score_metrics = [&](const nvfp4_selector_derived_metrics & dm) {
-        return nvfp4_selector_score_metrics(
-            dm, nullptr, rank_cfg, nvfp4_selector_metric_mode::POLICY).score;
+    auto score_metrics = [&](const selector_derived_metrics & dm) {
+        return selector_score_metrics(
+            dm, nullptr, rank_cfg, selector_metric_mode::POLICY).score;
     };
     auto score_margin = [](double a, double b, double abs_margin, double rel_margin) {
         return std::max(std::max(0.0, abs_margin),
@@ -2460,7 +2667,7 @@ static bool nvfp4_selector_rsf_holdout_guard(
         }
         return excess / std::max(std::fabs(base_v), 1e-12);
     };
-    auto utility_gain = [&](const nvfp4_selector_derived_metrics & dm, const nvfp4_selector_derived_metrics & bm) {
+    auto utility_gain = [&](const selector_derived_metrics & dm, const selector_derived_metrics & bm) {
         return
             3.25 * lower_gain(dm.mean_kld, bm.mean_kld, rank_cfg.mean_kld_abs_floor, 0.0) +
             0.85 * lower_gain(dm.kld_p95, bm.kld_p95, rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin) +
@@ -2475,7 +2682,7 @@ static bool nvfp4_selector_rsf_holdout_guard(
             0.30 * lower_gain(dm.max_kld, bm.max_kld, rank_cfg.max_kld_abs_margin, rank_cfg.max_kld_rel_margin) +
             0.06 * lower_gain(dm.ln_ratio, bm.ln_ratio, rank_cfg.ln_ratio_abs_floor, 0.0);
     };
-    auto broad_regression = [&](const nvfp4_selector_derived_metrics & dm, const nvfp4_selector_derived_metrics & bm, bool validation) {
+    auto broad_regression = [&](const selector_derived_metrics & dm, const selector_derived_metrics & bm, bool validation) {
         const double mean_abs = validation ? 0.0030 : 0.0040;
         const double mean_rel = validation ? 0.0500 : 0.0700;
         const double p99_abs = validation ? 0.0800 : 0.1000;
@@ -2534,12 +2741,12 @@ static bool nvfp4_selector_rsf_holdout_guard(
         policy.has_holdout && policy.measured_holdout.ok &&
         base.has_holdout && base.measured_holdout.ok;
     const double combined_score =
-        nvfp4_selector_measured_score(
+        selector_measured_score(
             policy.measured,
             have_holdout ? &policy.measured_holdout : nullptr,
             rank_cfg);
     const double base_combined_score =
-        nvfp4_selector_measured_score(
+        selector_measured_score(
             base.measured,
             have_holdout ? &base.measured_holdout : nullptr,
             rank_cfg);
@@ -2549,7 +2756,7 @@ static bool nvfp4_selector_rsf_holdout_guard(
     const double combined_delta = combined_score - base_combined_score;
     const bool search_improved =
         score_better(search_score, base_search_score, 1e-6, 1e-6) ||
-        nvfp4_selector_compare_one(policy.measured, base.measured, rank_cfg) < 0;
+        selector_compare_one(policy.measured, base.measured, rank_cfg) < 0;
     const bool search_utility_improved = search_gain > search_regression * 0.65 + 0.25;
     const bool combined_improved =
         score_better(
@@ -2582,7 +2789,7 @@ static bool nvfp4_selector_rsf_holdout_guard(
         holdout_regression = broad_regression(policy.measured_holdout, base.measured_holdout, true);
         holdout_improved =
             score_better(holdout_score, base_holdout_score, 0.08, 0.01) ||
-            nvfp4_selector_compare_one(policy.measured_holdout, base.measured_holdout, rank_cfg) < 0;
+            selector_compare_one(policy.measured_holdout, base.measured_holdout, rank_cfg) < 0;
         holdout_utility_improved = holdout_gain > holdout_regression * 0.60 + 0.20;
         holdout_not_catastrophic =
             score_no_worse(holdout_score, base_holdout_score, 0.60, 0.08) ||
@@ -2629,29 +2836,29 @@ static bool nvfp4_selector_rsf_holdout_guard(
     return true;
 }
 
-static bool nvfp4_selector_best_dominates(
-        const nvfp4_selector_policy & a,
-        const nvfp4_selector_policy & b,
+static bool selector_best_dominates(
+        const selector_policy & a,
+        const selector_policy & b,
         const selector_rank_config & rank_cfg) {
-    const auto ao = nvfp4_selector_best_objectives_for(a, rank_cfg.holdout_weight);
-    const auto bo = nvfp4_selector_best_objectives_for(b, rank_cfg.holdout_weight);
+    const auto ao = selector_best_objectives_for(a, rank_cfg.holdout_weight);
+    const auto bo = selector_best_objectives_for(b, rank_cfg.holdout_weight);
     if (!ao.ok || !bo.ok) {
         return false;
     }
 
     bool strictly_better = false;
     auto lower = [&](double av, double bv, double abs_margin, double rel_margin) {
-        if (!nvfp4_selector_best_lower_no_worse(av, bv, abs_margin, rel_margin)) {
+        if (!selector_best_lower_no_worse(av, bv, abs_margin, rel_margin)) {
             return false;
         }
-        strictly_better = strictly_better || nvfp4_selector_best_lower_better(av, bv, abs_margin, rel_margin);
+        strictly_better = strictly_better || selector_best_lower_better(av, bv, abs_margin, rel_margin);
         return true;
     };
     auto higher = [&](double av, double bv, double abs_margin, double rel_margin) {
-        if (!nvfp4_selector_best_higher_no_worse(av, bv, abs_margin, rel_margin)) {
+        if (!selector_best_higher_no_worse(av, bv, abs_margin, rel_margin)) {
             return false;
         }
-        strictly_better = strictly_better || nvfp4_selector_best_higher_better(av, bv, abs_margin, rel_margin);
+        strictly_better = strictly_better || selector_best_higher_better(av, bv, abs_margin, rel_margin);
         return true;
     };
 
@@ -2671,8 +2878,8 @@ static bool nvfp4_selector_best_dominates(
         strictly_better;
 }
 
-static std::vector<size_t> nvfp4_selector_best_set(
-        const std::vector<nvfp4_selector_policy> & policies,
+static std::vector<size_t> selector_best_set(
+        const std::vector<selector_policy> & policies,
         const std::vector<size_t> & candidates,
         const selector_rank_config & rank_cfg) {
     std::vector<size_t> best_set;
@@ -2687,7 +2894,7 @@ static std::vector<size_t> nvfp4_selector_best_set(
             if (other == idx || other >= policies.size()) {
                 continue;
             }
-            if (nvfp4_selector_best_dominates(policies[other], policies[idx], rank_cfg)) {
+            if (selector_best_dominates(policies[other], policies[idx], rank_cfg)) {
                 dominated = true;
                 break;
             }
@@ -2700,7 +2907,7 @@ static std::vector<size_t> nvfp4_selector_best_set(
     return best_set;
 }
 
-struct nvfp4_selector_best_set_stats {
+struct selector_best_set_stats {
     bool ok = false;
     double min_ln_ratio = std::numeric_limits<double>::infinity();
     double max_ln_ratio = -std::numeric_limits<double>::infinity();
@@ -2728,9 +2935,9 @@ struct nvfp4_selector_best_set_stats {
     double max_top_flip_weight = -std::numeric_limits<double>::infinity();
 };
 
-static void nvfp4_selector_best_set_stats_add(
-        nvfp4_selector_best_set_stats & stats,
-        const nvfp4_selector_best_objectives & obj) {
+static void selector_best_set_stats_add(
+        selector_best_set_stats & stats,
+        const selector_best_objectives & obj) {
     if (!obj.ok ||
             !std::isfinite(obj.ln_ratio) ||
             !std::isfinite(obj.mean_kld) ||
@@ -2773,23 +2980,23 @@ static void nvfp4_selector_best_set_stats_add(
     stats.max_top_flip_weight = std::max(stats.max_top_flip_weight, obj.top_flip_weight);
 }
 
-static nvfp4_selector_best_set_stats nvfp4_selector_best_set_stats_for(
-        const std::vector<nvfp4_selector_policy> & policies,
+static selector_best_set_stats selector_best_set_stats_for(
+        const std::vector<selector_policy> & policies,
         const std::vector<size_t> & candidates,
         const selector_rank_config & rank_cfg) {
-    nvfp4_selector_best_set_stats stats;
+    selector_best_set_stats stats;
     for (size_t idx : candidates) {
         if (idx >= policies.size()) {
             continue;
         }
-        nvfp4_selector_best_set_stats_add(
+        selector_best_set_stats_add(
             stats,
-            nvfp4_selector_best_objectives_for(policies[idx], rank_cfg.holdout_weight));
+            selector_best_objectives_for(policies[idx], rank_cfg.holdout_weight));
     }
     return stats;
 }
 
-static double nvfp4_selector_range_floor(double best, double worst, double abs_floor, double rel_floor) {
+static double selector_range_floor(double best, double worst, double abs_floor, double rel_floor) {
     return std::max({
         std::fabs(worst - best),
         std::max(0.0, abs_floor),
@@ -2798,66 +3005,66 @@ static double nvfp4_selector_range_floor(double best, double worst, double abs_f
     });
 }
 
-static double nvfp4_selector_norm_lower(double value, double best, double worst, double abs_floor, double rel_floor) {
+static double selector_norm_lower(double value, double best, double worst, double abs_floor, double rel_floor) {
     if (!std::isfinite(value) || !std::isfinite(best) || !std::isfinite(worst)) {
         return std::numeric_limits<double>::infinity();
     }
-    return std::max(0.0, value - best) / nvfp4_selector_range_floor(best, worst, abs_floor, rel_floor);
+    return std::max(0.0, value - best) / selector_range_floor(best, worst, abs_floor, rel_floor);
 }
 
-static double nvfp4_selector_norm_higher(double value, double best, double worst, double abs_floor, double rel_floor) {
+static double selector_norm_higher(double value, double best, double worst, double abs_floor, double rel_floor) {
     if (!std::isfinite(value) || !std::isfinite(best) || !std::isfinite(worst)) {
         return std::numeric_limits<double>::infinity();
     }
-    return std::max(0.0, best - value) / nvfp4_selector_range_floor(best, worst, abs_floor, rel_floor);
+    return std::max(0.0, best - value) / selector_range_floor(best, worst, abs_floor, rel_floor);
 }
 
-static double nvfp4_selector_best_set_utility(
-        const nvfp4_selector_policy & policy,
-        const nvfp4_selector_best_set_stats & stats,
+static double selector_best_set_utility(
+        const selector_policy & policy,
+        const selector_best_set_stats & stats,
         const selector_rank_config & rank_cfg) {
     if (!stats.ok || !policy.measured.ok) {
         return std::numeric_limits<double>::infinity();
     }
-    const auto obj = nvfp4_selector_best_objectives_for(policy, rank_cfg.holdout_weight);
+    const auto obj = selector_best_objectives_for(policy, rank_cfg.holdout_weight);
     if (!obj.ok) {
         return std::numeric_limits<double>::infinity();
     }
 
-    const double ppl = nvfp4_selector_norm_lower(
+    const double ppl = selector_norm_lower(
         obj.ln_ratio, stats.min_ln_ratio, stats.max_ln_ratio,
         rank_cfg.ln_ratio_abs_floor, 0.0);
-    const double mean = nvfp4_selector_norm_lower(
+    const double mean = selector_norm_lower(
         obj.mean_kld, stats.min_mean_kld, stats.max_mean_kld,
         rank_cfg.mean_kld_abs_floor, 0.0);
-    const double p95 = nvfp4_selector_norm_lower(
+    const double p95 = selector_norm_lower(
         obj.kld_p95, stats.min_kld_p95, stats.max_kld_p95,
         rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
-    const double p99 = nvfp4_selector_norm_lower(
+    const double p99 = selector_norm_lower(
         obj.kld_p99, stats.min_kld_p99, stats.max_kld_p99,
         rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
-    const double p999 = nvfp4_selector_norm_lower(
+    const double p999 = selector_norm_lower(
         obj.kld_p999, stats.min_kld_p999, stats.max_kld_p999,
         rank_cfg.p999_abs_margin, rank_cfg.p999_rel_margin);
-    const double tail_mean = nvfp4_selector_norm_lower(
+    const double tail_mean = selector_norm_lower(
         obj.kld_tail_mean, stats.min_kld_tail_mean, stats.max_kld_tail_mean,
         rank_cfg.p99_abs_margin, rank_cfg.p99_rel_margin);
-    const double max_kld = nvfp4_selector_norm_lower(
+    const double max_kld = selector_norm_lower(
         obj.max_kld, stats.min_max_kld, stats.max_max_kld,
         rank_cfg.max_kld_abs_margin, rank_cfg.max_kld_rel_margin);
-    const double rms = nvfp4_selector_norm_lower(
+    const double rms = selector_norm_lower(
         obj.rms_dp, stats.min_rms_dp, stats.max_rms_dp,
         rank_cfg.rms_dp_abs_floor, 0.0);
-    const double same_top = nvfp4_selector_norm_higher(
+    const double same_top = selector_norm_higher(
         obj.same_top, stats.max_same_top, stats.min_same_top,
         rank_cfg.same_top_abs_floor, 0.0);
-    const double entropy = nvfp4_selector_norm_lower(
+    const double entropy = selector_norm_lower(
         obj.entropy_rmse, stats.min_entropy_rmse, stats.max_entropy_rmse,
         rank_cfg.entropy_rmse_abs_floor, 0.0);
-    const double top_prob = nvfp4_selector_norm_lower(
+    const double top_prob = selector_norm_lower(
         obj.top_prob_rmse, stats.min_top_prob_rmse, stats.max_top_prob_rmse,
         rank_cfg.top_prob_rmse_abs_floor, 0.0);
-    const double top_flip = nvfp4_selector_norm_lower(
+    const double top_flip = selector_norm_lower(
         obj.top_flip_weight, stats.min_top_flip_weight, stats.max_top_flip_weight,
         rank_cfg.top_flip_weight_abs_floor, 0.0);
 
@@ -2902,21 +3109,21 @@ static double nvfp4_selector_best_set_utility(
     return 0.62 * weighted_sum + 0.38 * worst_kld_axis + tail_shape_penalty + behavior_shape_penalty;
 }
 
-static int nvfp4_selector_compare_policy_measured(
-    const nvfp4_selector_policy & a,
-    const nvfp4_selector_policy & b,
-    const nvfp4_selector_derived_metrics & baseline_eval,
-    const nvfp4_selector_derived_metrics * baseline_holdout_eval,
+static int selector_compare_policy_measured(
+    const selector_policy & a,
+    const selector_policy & b,
+    const selector_derived_metrics & baseline_eval,
+    const selector_derived_metrics * baseline_holdout_eval,
     const selector_rank_config & rank_cfg) {
-    const nvfp4_selector_metric_rank a_rank =
-        nvfp4_selector_rank_policy_metrics(
+    const selector_metric_rank a_rank =
+        selector_rank_policy_metrics(
             a.measured,
             a.has_holdout ? &a.measured_holdout : nullptr,
             baseline_eval,
             baseline_holdout_eval,
             rank_cfg);
-    const nvfp4_selector_metric_rank b_rank =
-        nvfp4_selector_rank_policy_metrics(
+    const selector_metric_rank b_rank =
+        selector_rank_policy_metrics(
             b.measured,
             b.has_holdout ? &b.measured_holdout : nullptr,
             baseline_eval,
@@ -2929,10 +3136,10 @@ static int nvfp4_selector_compare_policy_measured(
         return a_pass ? -1 : 1;
     }
 
-    const int cmp_main = nvfp4_selector_compare_one(a.measured, b.measured, rank_cfg);
+    const int cmp_main = selector_compare_one(a.measured, b.measured, rank_cfg);
     if (cmp_main != 0) {
         if (baseline_holdout_eval != nullptr && a.has_holdout && b.has_holdout) {
-            const int cmp_holdout = nvfp4_selector_compare_one(a.measured_holdout, b.measured_holdout, rank_cfg);
+            const int cmp_holdout = selector_compare_one(a.measured_holdout, b.measured_holdout, rank_cfg);
             if (cmp_holdout != 0 && cmp_holdout != cmp_main) {
                 return cmp_holdout;
             }
@@ -2941,13 +3148,13 @@ static int nvfp4_selector_compare_policy_measured(
     }
 
     if (baseline_holdout_eval != nullptr && a.has_holdout && b.has_holdout) {
-        const int cmp_holdout = nvfp4_selector_compare_one(a.measured_holdout, b.measured_holdout, rank_cfg);
+        const int cmp_holdout = selector_compare_one(a.measured_holdout, b.measured_holdout, rank_cfg);
         if (cmp_holdout != 0) {
             return cmp_holdout;
         }
     }
 
-    const int score_cmp = nvfp4_selector_compare_measured_score(a.measured_score, b.measured_score);
+    const int score_cmp = selector_compare_measured_score(a.measured_score, b.measured_score);
     if (score_cmp != 0) {
         return score_cmp;
     }
@@ -2961,7 +3168,7 @@ static int nvfp4_selector_compare_policy_measured(
     return 0;
 }
 
-static int32_t nvfp4_selector_parse_layer(const std::string & name) {
+static int32_t selector_parse_layer(const std::string & name) {
     if (name.rfind("blk.", 0) != 0) {
         return -1;
     }
@@ -2976,35 +3183,35 @@ static int32_t nvfp4_selector_parse_layer(const std::string & name) {
     return have_digit ? layer : -1;
 }
 
-static nvfp4_selector_tensor_class nvfp4_selector_classify_tensor(const std::string & name) {
+static selector_tensor_class selector_classify_tensor(const std::string & name) {
     if (name == "token_embd.weight" || name == "output.weight" || name == "token_embd_norm.weight" || name == "output_norm.weight") {
-        return nvfp4_selector_tensor_class::EMBEDDING_OUTPUT;
+        return selector_tensor_class::EMBEDDING_OUTPUT;
     }
     if (name.find(".ffn_gate_inp") != std::string::npos || name.find(".altup_router") != std::string::npos || name.find(".router") != std::string::npos) {
-        return nvfp4_selector_tensor_class::ROUTER;
+        return selector_tensor_class::ROUTER;
     }
     if (name.find(".attn_gate.weight") != std::string::npos) {
-        return nvfp4_selector_tensor_class::ROUTER;
+        return selector_tensor_class::ROUTER;
     }
     if (name.find(".attn_output.weight") != std::string::npos || name.find(".wo.weight") != std::string::npos) {
-        return nvfp4_selector_tensor_class::ATTN_OUT;
+        return selector_tensor_class::ATTN_OUT;
     }
     if (name.find(".attn_q.weight") != std::string::npos ||
         name.find(".attn_k.weight") != std::string::npos ||
         name.find(".attn_v.weight") != std::string::npos ||
         name.find(".attn_qkv.weight") != std::string::npos) {
-        return nvfp4_selector_tensor_class::ATTN_QKV;
+        return selector_tensor_class::ATTN_QKV;
     }
     if (name.find(".ffn_up_exps.weight") != std::string::npos ||
         name.find(".ffn_gate.weight") != std::string::npos ||
         name.find(".ffn_up.weight") != std::string::npos) {
-        return nvfp4_selector_tensor_class::EXPERT_UP_GATE;
+        return selector_tensor_class::EXPERT_UP_GATE;
     }
     if (name.find(".ffn_down_exps.weight") != std::string::npos) {
-        return nvfp4_selector_tensor_class::EXPERT_DOWN;
+        return selector_tensor_class::EXPERT_DOWN;
     }
     if (name.find(".ffn_down.weight") != std::string::npos) {
-        return nvfp4_selector_tensor_class::DENSE_MLP;
+        return selector_tensor_class::DENSE_MLP;
     }
     if (name.find(".ssm_out.weight") != std::string::npos ||
         name.find(".ssm_in.weight") != std::string::npos ||
@@ -3012,34 +3219,34 @@ static nvfp4_selector_tensor_class nvfp4_selector_classify_tensor(const std::str
         name.find(".ssm_beta.weight") != std::string::npos ||
         name.find(".ssm_conv1d.weight") != std::string::npos ||
         name.find(".ssm_") != std::string::npos) {
-        return nvfp4_selector_tensor_class::SSM;
+        return selector_tensor_class::SSM;
     }
-    return nvfp4_selector_tensor_class::OTHER;
+    return selector_tensor_class::OTHER;
 }
 
-static const char * nvfp4_selector_tensor_class_name(nvfp4_selector_tensor_class cls) {
+static const char * selector_tensor_class_name(selector_tensor_class cls) {
     switch (cls) {
-        case nvfp4_selector_tensor_class::EMBEDDING_OUTPUT: return "embedding_output";
-        case nvfp4_selector_tensor_class::ATTN_QKV:         return "attn_qkv";
-        case nvfp4_selector_tensor_class::ATTN_OUT:         return "attn_out";
-        case nvfp4_selector_tensor_class::ROUTER:           return "router";
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:   return "expert_up_gate";
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:      return "expert_down";
-        case nvfp4_selector_tensor_class::DENSE_MLP:        return "dense_mlp";
-        case nvfp4_selector_tensor_class::SSM:              return "ssm";
-        case nvfp4_selector_tensor_class::OTHER:            return "other";
+        case selector_tensor_class::EMBEDDING_OUTPUT: return "embedding_output";
+        case selector_tensor_class::ATTN_QKV:         return "attn_qkv";
+        case selector_tensor_class::ATTN_OUT:         return "attn_out";
+        case selector_tensor_class::ROUTER:           return "router";
+        case selector_tensor_class::EXPERT_UP_GATE:   return "expert_up_gate";
+        case selector_tensor_class::EXPERT_DOWN:      return "expert_down";
+        case selector_tensor_class::DENSE_MLP:        return "dense_mlp";
+        case selector_tensor_class::SSM:              return "ssm";
+        case selector_tensor_class::OTHER:            return "other";
     }
     return "other";
 }
 
-static std::string nvfp4_selector_tensor_policy_unit_key(const std::string & name, const std::string & mode) {
+static std::string selector_tensor_policy_unit_key(const std::string & name, const std::string & mode) {
     if (striequals(mode.c_str(), "tensor") ||
             striequals(mode.c_str(), "off") ||
             striequals(mode.c_str(), "none")) {
         return name;
     }
 
-    const int32_t layer = nvfp4_selector_parse_layer(name);
+    const int32_t layer = selector_parse_layer(name);
     if (layer >= 0) {
         const std::string prefix = "blk." + std::to_string(layer);
         if (name.find(".attn_q.weight") != std::string::npos ||
@@ -3062,7 +3269,7 @@ static std::string nvfp4_selector_tensor_policy_unit_key(const std::string & nam
     return name;
 }
 
-static std::string nvfp4_selector_rsf_hist_class(const std::string & name, nvfp4_selector_tensor_class cls) {
+static std::string selector_rsf_hist_class(const std::string & name, selector_tensor_class cls) {
     if (name.find("mtp") != std::string::npos || name.find("nextn") != std::string::npos) {
         return "MTP(keep as Q8/BF16/F32)";
     }
@@ -3090,10 +3297,10 @@ static std::string nvfp4_selector_rsf_hist_class(const std::string & name, nvfp4
     if (name.find(".ffn_down.weight") != std::string::npos) {
         return "ffn_down";
     }
-    return nvfp4_selector_tensor_class_name(cls);
+    return selector_tensor_class_name(cls);
 }
 
-static double nvfp4_selector_percentile(std::vector<double> values, double q) {
+static double selector_percentile(std::vector<double> values, double q) {
     if (values.empty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
@@ -3106,7 +3313,7 @@ static double nvfp4_selector_percentile(std::vector<double> values, double q) {
     return values[lo] * (1.0 - frac) + values[hi] * frac;
 }
 
-static double nvfp4_selector_rsf_record_scale_mul(const nvfp4_selector_rsf_tensor_record & r) {
+static double selector_rsf_record_scale_mul(const selector_rsf_tensor_record & r) {
     if (r.scale_muls.empty()) {
         if (r.slices > 0 && std::isfinite(r.scale_mul_sum) && r.scale_mul_sum > 0.0) {
             return r.scale_mul_sum / (double) r.slices;
@@ -3122,9 +3329,9 @@ static double nvfp4_selector_rsf_record_scale_mul(const nvfp4_selector_rsf_tenso
     return sum / (double) std::max<size_t>(1, r.scale_muls.size());
 }
 
-static std::unordered_map<std::string, const nvfp4_selector_rsf_tensor_record *>
-nvfp4_selector_rsf_record_map(const nvfp4_selector_policy & policy) {
-    std::unordered_map<std::string, const nvfp4_selector_rsf_tensor_record *> out;
+static std::unordered_map<std::string, const selector_rsf_tensor_record *>
+selector_rsf_record_map(const selector_policy & policy) {
+    std::unordered_map<std::string, const selector_rsf_tensor_record *> out;
     out.reserve(policy.tensor_records.size());
     for (const auto & r : policy.tensor_records) {
         out.emplace(r.tensor, &r);
@@ -3132,7 +3339,7 @@ nvfp4_selector_rsf_record_map(const nvfp4_selector_policy & policy) {
     return out;
 }
 
-static int nvfp4_selector_layer_bucket(int32_t layer, int32_t n_layer) {
+static int selector_layer_bucket(int32_t layer, int32_t n_layer) {
     if (layer < 0 || n_layer <= 0) {
         return -1;
     }
@@ -3148,15 +3355,15 @@ static int nvfp4_selector_layer_bucket(int32_t layer, int32_t n_layer) {
     return 2;
 }
 
-static int32_t nvfp4_selector_detect_n_layer(const std::vector<std::pair<std::string, ggml_tensor *>> & tmap) {
+static int32_t selector_detect_n_layer(const std::vector<std::pair<std::string, ggml_tensor *>> & tmap) {
     int32_t max_layer = -1;
     for (const auto & kv : tmap) {
-        max_layer = std::max(max_layer, nvfp4_selector_parse_layer(kv.first));
+        max_layer = std::max(max_layer, selector_parse_layer(kv.first));
     }
     return max_layer + 1;
 }
 
-static std::string nvfp4_selector_regex_escape(const std::string & s) {
+static std::string selector_regex_escape(const std::string & s) {
     std::string out;
     out.reserve(s.size() * 2 + 2);
     out.push_back('^');
@@ -3187,9 +3394,9 @@ static std::string nvfp4_selector_regex_escape(const std::string & s) {
     return out;
 }
 
-static void nvfp4_selector_attach_exact_scales(
+static void selector_attach_exact_scales(
         tensor_type_option & opt,
-        const nvfp4_selector_binding & binding) {
+        const selector_binding & binding) {
     const int64_t n_slices = binding.source != nullptr ? std::max<int64_t>(1, binding.source->ne[2]) : 1;
     if (binding.quant_tensor_scales.size() != (size_t) n_slices ||
             binding.working_quant_tensor_scales.size() != (size_t) n_slices) {
@@ -3346,7 +3553,7 @@ static bool quantize_tensor_host_buffer(const ggml_tensor * tensor) {
     return tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_host(tensor->buffer);
 }
 
-static bool quantize_binding_ensure_target_bytes(nvfp4_selector_binding & binding) {
+static bool quantize_binding_ensure_target_bytes(selector_binding & binding) {
     if (binding.target == nullptr || binding.target_nbytes == 0) {
         return false;
     }
@@ -3365,7 +3572,7 @@ static bool quantize_binding_ensure_target_bytes(nvfp4_selector_binding & bindin
     return true;
 }
 
-static bool quantize_binding_ensure_scale_bytes(nvfp4_selector_binding & binding) {
+static bool quantize_binding_ensure_scale_bytes(selector_binding & binding) {
     if (binding.target_scale_nbytes == 0) {
         return false;
     }
@@ -3404,7 +3611,7 @@ static bool quantize_binding_ensure_scale_bytes(nvfp4_selector_binding & binding
     return true;
 }
 
-static bool quantize_binding_ensure_input_scale_bytes(nvfp4_selector_binding & binding) {
+static bool quantize_binding_ensure_input_scale_bytes(selector_binding & binding) {
     if (binding.target_input_scale == nullptr || binding.target_input_scale_nbytes == 0) {
         return false;
     }
@@ -3427,7 +3634,7 @@ static bool quantize_binding_ensure_input_scale_bytes(nvfp4_selector_binding & b
 }
 
 static bool nvfp4_selector_prepare_nvfp4_runtime_scales(
-        nvfp4_selector_binding & binding,
+        selector_binding & binding,
         int32_t input_scale_policy,
         float * header_weight_scale,
         float * header_input_scale) {
@@ -3481,7 +3688,7 @@ static bool nvfp4_selector_prepare_nvfp4_runtime_scales(
     return true;
 }
 
-struct nvfp4_selector_restore_counters {
+struct selector_restore_counters {
     int64_t device = 0;
     int64_t host = 0;
     int64_t failed = 0;
@@ -3489,10 +3696,10 @@ struct nvfp4_selector_restore_counters {
 
 static bool quantize_restore_from_snapshot_or_host(
         ggml_tensor * tensor,
-        const nvfp4_selector_device_snapshot & snapshot,
+        const selector_device_snapshot & snapshot,
         const std::vector<uint8_t> & host_bytes,
         size_t nbytes,
-        nvfp4_selector_restore_counters * counters) {
+        selector_restore_counters * counters) {
     if (tensor == nullptr || nbytes == 0) {
         if (counters != nullptr) {
             ++counters->failed;
@@ -3524,7 +3731,7 @@ static bool quantize_restore_from_host(
         ggml_tensor * tensor,
         const std::vector<uint8_t> & host_bytes,
         size_t nbytes,
-        nvfp4_selector_restore_counters * counters) {
+        selector_restore_counters * counters) {
     if (tensor == nullptr || nbytes == 0 || host_bytes.size() != nbytes ||
             !quantize_tensor_copy_in(tensor, host_bytes.data(), nbytes)) {
         if (counters != nullptr) {
@@ -3538,7 +3745,7 @@ static bool quantize_restore_from_host(
     return true;
 }
 
-static std::vector<std::string> nvfp4_selector_build_stress_tensors(
+static std::vector<std::string> selector_build_stress_tensors(
     const std::vector<std::pair<std::string, ggml_tensor *>> & tmap,
     int32_t n_layer) {
     std::vector<std::string> out;
@@ -3548,7 +3755,7 @@ static std::vector<std::string> nvfp4_selector_build_stress_tensors(
 
     struct tensor_pick {
         std::string name;
-        nvfp4_selector_tensor_class cls = nvfp4_selector_tensor_class::OTHER;
+        selector_tensor_class cls = selector_tensor_class::OTHER;
         int bucket = -1;
         int32_t layer = -1;
         size_t nbytes = 0;
@@ -3562,9 +3769,9 @@ static std::vector<std::string> nvfp4_selector_build_stress_tensors(
         }
         tensor_pick pick;
         pick.name = kv.first;
-        pick.cls = nvfp4_selector_classify_tensor(kv.first);
-        pick.layer = nvfp4_selector_parse_layer(kv.first);
-        pick.bucket = nvfp4_selector_layer_bucket(pick.layer, n_layer);
+        pick.cls = selector_classify_tensor(kv.first);
+        pick.layer = selector_parse_layer(kv.first);
+        pick.bucket = selector_layer_bucket(pick.layer, n_layer);
         pick.nbytes = ggml_nbytes(kv.second);
         picks.push_back(std::move(pick));
     }
@@ -3605,17 +3812,17 @@ static std::vector<std::string> nvfp4_selector_build_stress_tensors(
         return a.name < b.name;
     });
 
-    const std::vector<nvfp4_selector_tensor_class> class_order = {
-        nvfp4_selector_tensor_class::EMBEDDING_OUTPUT,
-        nvfp4_selector_tensor_class::ROUTER,
-        nvfp4_selector_tensor_class::ATTN_QKV,
-        nvfp4_selector_tensor_class::ATTN_OUT,
-        nvfp4_selector_tensor_class::EXPERT_UP_GATE,
-        nvfp4_selector_tensor_class::EXPERT_DOWN,
-        nvfp4_selector_tensor_class::DENSE_MLP,
-        nvfp4_selector_tensor_class::SSM,
+    const std::vector<selector_tensor_class> class_order = {
+        selector_tensor_class::EMBEDDING_OUTPUT,
+        selector_tensor_class::ROUTER,
+        selector_tensor_class::ATTN_QKV,
+        selector_tensor_class::ATTN_OUT,
+        selector_tensor_class::EXPERT_UP_GATE,
+        selector_tensor_class::EXPERT_DOWN,
+        selector_tensor_class::DENSE_MLP,
+        selector_tensor_class::SSM,
     };
-    for (nvfp4_selector_tensor_class cls : class_order) {
+    for (selector_tensor_class cls : class_order) {
         for (int bucket = -1; bucket < 3; ++bucket) {
             int added = 0;
             for (const auto & pick : picks) {
@@ -3638,7 +3845,7 @@ static std::vector<std::string> nvfp4_selector_build_stress_tensors(
         });
         int added = 0;
         for (const auto & pick : by_size) {
-            if (pick.cls == nvfp4_selector_tensor_class::OTHER) {
+            if (pick.cls == selector_tensor_class::OTHER) {
                 continue;
             }
             const size_t before = out.size();
@@ -3652,22 +3859,22 @@ static std::vector<std::string> nvfp4_selector_build_stress_tensors(
     return out;
 }
 
-static double nvfp4_selector_class_hotness(nvfp4_selector_tensor_class cls) {
+static double selector_class_hotness(selector_tensor_class cls) {
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:        return 1.00;
-        case nvfp4_selector_tensor_class::ATTN_OUT:        return 0.95;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:  return 0.90;
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:     return 0.90;
-        case nvfp4_selector_tensor_class::SSM:             return 1.00;
-        case nvfp4_selector_tensor_class::EMBEDDING_OUTPUT:return 0.80;
-        case nvfp4_selector_tensor_class::ROUTER:          return 0.70;
-        case nvfp4_selector_tensor_class::DENSE_MLP:       return 0.75;
-        case nvfp4_selector_tensor_class::OTHER:           return 0.60;
+        case selector_tensor_class::ATTN_QKV:        return 1.00;
+        case selector_tensor_class::ATTN_OUT:        return 0.95;
+        case selector_tensor_class::EXPERT_UP_GATE:  return 0.90;
+        case selector_tensor_class::EXPERT_DOWN:     return 0.90;
+        case selector_tensor_class::SSM:             return 1.00;
+        case selector_tensor_class::EMBEDDING_OUTPUT:return 0.80;
+        case selector_tensor_class::ROUTER:          return 0.70;
+        case selector_tensor_class::DENSE_MLP:       return 0.75;
+        case selector_tensor_class::OTHER:           return 0.60;
     }
     return 0.75;
 }
 
-static bool nvfp4_selector_type_is_k_rsf_capable(ggml_type type) {
+static bool selector_type_is_k_rsf_capable(ggml_type type) {
     return type == GGML_TYPE_Q2_K ||
            type == GGML_TYPE_Q3_K ||
            type == GGML_TYPE_Q4_K ||
@@ -3675,7 +3882,7 @@ static bool nvfp4_selector_type_is_k_rsf_capable(ggml_type type) {
            type == GGML_TYPE_Q6_K;
 }
 
-static const char * nvfp4_selector_tensor_role_name(const std::string & name, nvfp4_selector_tensor_class cls) {
+static const char * selector_tensor_role_name(const std::string & name, selector_tensor_class cls) {
     if (name.find(".attn_gate.weight") != std::string::npos) {
         return "attn_gate";
     }
@@ -3712,11 +3919,11 @@ static const char * nvfp4_selector_tensor_role_name(const std::string & name, nv
     if (name.find(".ssm_") != std::string::npos) {
         return "ssm";
     }
-    return nvfp4_selector_tensor_class_name(cls);
+    return selector_tensor_class_name(cls);
 }
 
-static double nvfp4_selector_tensor_role_importance(const std::string & name, nvfp4_selector_tensor_class cls) {
-    const char * role = nvfp4_selector_tensor_role_name(name, cls);
+static double selector_tensor_role_importance(const std::string & name, selector_tensor_class cls) {
+    const char * role = selector_tensor_role_name(name, cls);
     if (striequals(role, "attn_gate"))    return 1.25;
     if (striequals(role, "ssm_out"))      return 1.24;
     if (striequals(role, "ffn_down"))     return 1.20;
@@ -3730,21 +3937,21 @@ static double nvfp4_selector_tensor_role_importance(const std::string & name, nv
     if (striequals(role, "ffn_up"))       return 1.02;
 
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:         return 1.10;
-        case nvfp4_selector_tensor_class::ATTN_OUT:         return 1.08;
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:      return 1.08;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:   return 0.90;
-        case nvfp4_selector_tensor_class::SSM:              return 1.08;
-        case nvfp4_selector_tensor_class::ROUTER:           return 0.95;
-        case nvfp4_selector_tensor_class::DENSE_MLP:        return 1.05;
-        case nvfp4_selector_tensor_class::EMBEDDING_OUTPUT: return 0.70;
-        case nvfp4_selector_tensor_class::OTHER:            return 0.75;
+        case selector_tensor_class::ATTN_QKV:         return 1.10;
+        case selector_tensor_class::ATTN_OUT:         return 1.08;
+        case selector_tensor_class::EXPERT_DOWN:      return 1.08;
+        case selector_tensor_class::EXPERT_UP_GATE:   return 0.90;
+        case selector_tensor_class::SSM:              return 1.08;
+        case selector_tensor_class::ROUTER:           return 0.95;
+        case selector_tensor_class::DENSE_MLP:        return 1.05;
+        case selector_tensor_class::EMBEDDING_OUTPUT: return 0.70;
+        case selector_tensor_class::OTHER:            return 0.75;
     }
     return 0.85;
 }
 
-static double nvfp4_selector_tensor_role_gate_mul(const std::string & name, nvfp4_selector_tensor_class cls) {
-    const char * role = nvfp4_selector_tensor_role_name(name, cls);
+static double selector_tensor_role_gate_mul(const std::string & name, selector_tensor_class cls) {
+    const char * role = selector_tensor_role_name(name, cls);
     if (striequals(role, "ssm_control"))  return 0.70;
     if (striequals(role, "attn_gate"))    return 0.78;
     if (striequals(role, "ssm_out"))      return 0.80;
@@ -3758,45 +3965,45 @@ static double nvfp4_selector_tensor_role_gate_mul(const std::string & name, nvfp
     if (striequals(role, "ffn_up"))       return 1.06;
 
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:
-        case nvfp4_selector_tensor_class::ATTN_OUT:
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:
-        case nvfp4_selector_tensor_class::SSM:
+        case selector_tensor_class::ATTN_QKV:
+        case selector_tensor_class::ATTN_OUT:
+        case selector_tensor_class::EXPERT_DOWN:
+        case selector_tensor_class::SSM:
             return 0.92;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:
+        case selector_tensor_class::EXPERT_UP_GATE:
             return 1.12;
-        case nvfp4_selector_tensor_class::ROUTER:
+        case selector_tensor_class::ROUTER:
             return 1.00;
-        case nvfp4_selector_tensor_class::DENSE_MLP:
+        case selector_tensor_class::DENSE_MLP:
             return 0.95;
-        case nvfp4_selector_tensor_class::EMBEDDING_OUTPUT:
+        case selector_tensor_class::EMBEDDING_OUTPUT:
             return 1.25;
-        case nvfp4_selector_tensor_class::OTHER:
+        case selector_tensor_class::OTHER:
             return 1.15;
     }
     return 1.0;
 }
 
-static bool nvfp4_selector_bf16_allowed(nvfp4_selector_tensor_class cls) {
+static bool selector_bf16_allowed(selector_tensor_class cls) {
     switch (cls) {
-        case nvfp4_selector_tensor_class::ROUTER:
-        case nvfp4_selector_tensor_class::SSM:
-        case nvfp4_selector_tensor_class::EMBEDDING_OUTPUT:
-        case nvfp4_selector_tensor_class::ATTN_OUT:
-        case nvfp4_selector_tensor_class::ATTN_QKV:
+        case selector_tensor_class::ROUTER:
+        case selector_tensor_class::SSM:
+        case selector_tensor_class::EMBEDDING_OUTPUT:
+        case selector_tensor_class::ATTN_OUT:
+        case selector_tensor_class::ATTN_QKV:
             return true;
         default:
             return false;
     }
 }
 
-static bool nvfp4_selector_expert_class(nvfp4_selector_tensor_class cls) {
+static bool selector_expert_class(selector_tensor_class cls) {
     return
-        cls == nvfp4_selector_tensor_class::EXPERT_UP_GATE ||
-        cls == nvfp4_selector_tensor_class::EXPERT_DOWN;
+        cls == selector_tensor_class::EXPERT_UP_GATE ||
+        cls == selector_tensor_class::EXPERT_DOWN;
 }
 
-static double nvfp4_selector_rescue_roi(double proxy_score, size_t delta_bytes, double speed_penalty, double type_gain, double speed_weight) {
+static double selector_rescue_roi(double proxy_score, size_t delta_bytes, double speed_penalty, double type_gain, double speed_weight) {
     if (delta_bytes == 0 || !std::isfinite(proxy_score) || proxy_score <= 0.0) {
         return 0.0;
     }
@@ -3806,7 +4013,7 @@ static double nvfp4_selector_rescue_roi(double proxy_score, size_t delta_bytes, 
     return (proxy_score * std::max(0.0, type_gain)) / denom;
 }
 
-static double nvfp4_selector_type_candidate_roi(
+static double selector_type_candidate_roi(
         double proxy_score,
         size_t delta_bytes,
         double speed_penalty,
@@ -3822,7 +4029,7 @@ static double nvfp4_selector_type_candidate_roi(
     return (proxy_score * std::max(0.0, type_gain)) / (size_cost_mb * speed_cost);
 }
 
-static double nvfp4_selector_type_speed_penalty(ggml_type type) {
+static double selector_type_speed_penalty(ggml_type type) {
     switch (type) {
         case GGML_TYPE_MXFP6_E2M3: return 0.03;
         case GGML_TYPE_Q5_0:       return 0.08;
@@ -3836,7 +4043,7 @@ static double nvfp4_selector_type_speed_penalty(ggml_type type) {
     }
 }
 
-static double nvfp4_selector_type_quality_gain(ggml_type type) {
+static double selector_type_quality_gain(ggml_type type) {
     switch (type) {
         case GGML_TYPE_MXFP6_E2M3: return 1.28;
         case GGML_TYPE_Q5_0:       return 1.13;
@@ -3850,24 +4057,24 @@ static double nvfp4_selector_type_quality_gain(ggml_type type) {
     }
 }
 
-static bool nvfp4_selector_type_candidate_allowed(ggml_type type, nvfp4_selector_tensor_class cls) {
+static bool selector_type_candidate_allowed(ggml_type type, selector_tensor_class cls) {
     if (type == GGML_TYPE_COUNT || type == GGML_TYPE_NVFP4) {
         return false;
     }
-    if ((type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) && !nvfp4_selector_bf16_allowed(cls)) {
+    if ((type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) && !selector_bf16_allowed(cls)) {
         return false;
     }
     return true;
 }
 
-static double nvfp4_selector_tensor_role_type_gain(const std::string & name, nvfp4_selector_tensor_class cls, ggml_type type) {
-    const char * role = nvfp4_selector_tensor_role_name(name, cls);
+static double selector_tensor_role_type_gain(const std::string & name, selector_tensor_class cls, ggml_type type) {
+    const char * role = selector_tensor_role_name(name, cls);
     double pref = 1.0;
 
     if (striequals(role, "ssm_control")) {
         pref =
             type == GGML_TYPE_Q8_0 ? 1.55 :
-            nvfp4_selector_type_is_k_rsf_capable(type) ? 0.62 : 0.85;
+            selector_type_is_k_rsf_capable(type) ? 0.62 : 0.85;
     } else if (striequals(role, "attn_gate") || striequals(role, "ssm_out") || striequals(role, "ffn_down")) {
         pref =
             type == GGML_TYPE_Q5_K ? 1.36 :
@@ -3894,15 +4101,15 @@ static double nvfp4_selector_tensor_role_type_gain(const std::string & name, nvf
             type == GGML_TYPE_Q8_0 ? 0.72 : 0.92;
     }
 
-    return nvfp4_selector_type_quality_gain(type) *
-           nvfp4_selector_tensor_role_importance(name, cls) *
+    return selector_type_quality_gain(type) *
+           selector_tensor_role_importance(name, cls) *
            pref;
 }
 
-struct nvfp4_selector_stage1_prior_item {
+struct selector_stage1_prior_item {
     std::string name;
     std::string role;
-    nvfp4_selector_tensor_class cls = nvfp4_selector_tensor_class::OTHER;
+    selector_tensor_class cls = selector_tensor_class::OTHER;
     ggml_tensor * tensor = nullptr;
     size_t nvfp4_nbytes = 0;
     double imatrix_mean = 0.0;
@@ -3911,18 +4118,18 @@ struct nvfp4_selector_stage1_prior_item {
     bool has_imatrix = false;
 };
 
-static bool nvfp4_selector_stage1_exact_seen(
+static bool selector_stage1_exact_seen(
         const std::unordered_set<std::string> & seen,
         const std::string & tensor_name) {
-    return seen.find(nvfp4_selector_regex_escape(tensor_name)) != seen.end();
+    return seen.find(selector_regex_escape(tensor_name)) != seen.end();
 }
 
-static ggml_type nvfp4_selector_stage1_compatible_type(
+static ggml_type selector_stage1_compatible_type(
         const ggml_tensor * tensor,
-        nvfp4_selector_tensor_class cls,
+        selector_tensor_class cls,
         ggml_type requested) {
     auto allowed = [&](ggml_type type) {
-        return nvfp4_selector_type_candidate_allowed(type, cls) &&
+        return selector_type_candidate_allowed(type, cls) &&
                quantize_tensor_nbytes_as_type(tensor, type) > 0;
     };
 
@@ -3940,7 +4147,7 @@ static ggml_type nvfp4_selector_stage1_compatible_type(
     return GGML_TYPE_COUNT;
 }
 
-static bool nvfp4_selector_stage1_conditional_role(const std::string & role, quantize_work_mode mode) {
+static bool selector_stage1_conditional_role(const std::string & role, quantize_work_mode mode) {
     if (striequals(role.c_str(), "attn_gate") ||
         striequals(role.c_str(), "ssm_out") ||
         striequals(role.c_str(), "ssm_control") ||
@@ -3956,7 +4163,7 @@ static bool nvfp4_selector_stage1_conditional_role(const std::string & role, qua
     return mode == quantize_work_mode::DEEP && striequals(role.c_str(), "attn_q");
 }
 
-static ggml_type nvfp4_selector_stage1_requested_type(
+static ggml_type selector_stage1_requested_type(
         const std::string & role,
         quantize_work_mode mode,
         double risk,
@@ -3984,7 +4191,7 @@ static ggml_type nvfp4_selector_stage1_requested_type(
     return GGML_TYPE_Q5_K;
 }
 
-static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
+static std::vector<tensor_type_option> selector_stage1_type_priors(
         const std::string & source_model_path,
         const std::unordered_map<std::string, std::vector<float>> & imatrix_data,
         quantize_work_mode mode,
@@ -4000,7 +4207,7 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
     }
 
     std::vector<std::string> src_splits;
-    std::vector<nvfp4_selector_stage1_prior_item> items;
+    std::vector<selector_stage1_prior_item> items;
     size_t stage1_nvfp4_total_bytes = 0;
     try {
         llama_model_loader src_ml(
@@ -4028,21 +4235,21 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
             if (name.find("mtp") != std::string::npos || name.find("nextn") != std::string::npos) {
                 continue;
             }
-            const nvfp4_selector_tensor_class cls = nvfp4_selector_classify_tensor(name);
+            const selector_tensor_class cls = selector_classify_tensor(name);
             const size_t nvfp4_nbytes = quantize_tensor_nbytes_as_type(tensor, GGML_TYPE_NVFP4);
-            if (cls != nvfp4_selector_tensor_class::EMBEDDING_OUTPUT && nvfp4_nbytes > 0) {
+            if (cls != selector_tensor_class::EMBEDDING_OUTPUT && nvfp4_nbytes > 0) {
                 stage1_nvfp4_total_bytes += nvfp4_nbytes;
             }
-            if (cls == nvfp4_selector_tensor_class::EMBEDDING_OUTPUT ||
-                    cls == nvfp4_selector_tensor_class::OTHER ||
+            if (cls == selector_tensor_class::EMBEDDING_OUTPUT ||
+                    cls == selector_tensor_class::OTHER ||
                     nvfp4_nbytes == 0 ||
-                    nvfp4_selector_stage1_exact_seen(exact_seen, name)) {
+                    selector_stage1_exact_seen(exact_seen, name)) {
                 continue;
             }
 
-            nvfp4_selector_stage1_prior_item item;
+            selector_stage1_prior_item item;
             item.name = name;
-            item.role = nvfp4_selector_tensor_role_name(name, cls);
+            item.role = selector_tensor_role_name(name, cls);
             item.cls = cls;
             item.tensor = tensor;
             item.nvfp4_nbytes = nvfp4_nbytes;
@@ -4069,11 +4276,11 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
                     item.imatrix_mean = sum / (double) n;
                     item.imatrix_max = mx;
                     item.risk = std::sqrt(std::max(0.0, item.imatrix_mean)) *
-                        nvfp4_selector_tensor_role_importance(name, cls);
+                        selector_tensor_role_importance(name, cls);
                 }
             }
 
-            if (nvfp4_selector_stage1_conditional_role(item.role, mode)) {
+            if (selector_stage1_conditional_role(item.role, mode)) {
                 items.push_back(std::move(item));
             }
         }
@@ -4094,9 +4301,9 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
         }
     }
 
-    const double p50 = nvfp4_selector_percentile(risks, 0.50);
-    const double p75 = nvfp4_selector_percentile(risks, 0.75);
-    const double p90 = nvfp4_selector_percentile(risks, 0.90);
+    const double p50 = selector_percentile(risks, 0.50);
+    const double p75 = selector_percentile(risks, 0.75);
+    const double p90 = selector_percentile(risks, 0.90);
     double gate = std::numeric_limits<double>::infinity();
     if (!risks.empty()) {
         switch (mode) {
@@ -4133,13 +4340,13 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
         if (!item.has_imatrix || !std::isfinite(item.risk) || !std::isfinite(gate)) {
             continue;
         }
-        const double role_gate = gate * nvfp4_selector_tensor_role_gate_mul(item.name, item.cls);
+        const double role_gate = gate * selector_tensor_role_gate_mul(item.name, item.cls);
         if (item.risk < role_gate) {
             continue;
         }
 
-        const ggml_type requested = nvfp4_selector_stage1_requested_type(item.role, mode, item.risk, gate);
-        const ggml_type type = nvfp4_selector_stage1_compatible_type(item.tensor, item.cls, requested);
+        const ggml_type requested = selector_stage1_requested_type(item.role, mode, item.risk, gate);
+        const ggml_type type = selector_stage1_compatible_type(item.tensor, item.cls, requested);
         if (type == GGML_TYPE_COUNT) {
             continue;
         }
@@ -4150,9 +4357,9 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
         const size_t delta = type_nbytes > item.nvfp4_nbytes ? type_nbytes - item.nvfp4_nbytes : 0;
 
         tensor_type_option opt;
-        opt.name = nvfp4_selector_regex_escape(item.name);
+        opt.name = selector_regex_escape(item.name);
         opt.type = type;
-        if (nvfp4_selector_type_is_k_rsf_capable(type)) {
+        if (selector_type_is_k_rsf_capable(type)) {
             opt.has_k_rsf_mode = true;
             opt.k_rsf_mode = 2;
         }
@@ -4164,7 +4371,7 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
         proposal.delta_bytes = delta;
         proposal.risk = item.risk;
         proposal.priority =
-            (item.risk * nvfp4_selector_tensor_role_type_gain(item.name, item.cls, type)) / delta_mb;
+            (item.risk * selector_tensor_role_type_gain(item.name, item.cls, type)) / delta_mb;
         proposals.push_back(std::move(proposal));
     }
 
@@ -4234,7 +4441,7 @@ static std::vector<tensor_type_option> nvfp4_selector_stage1_type_priors(
     return out;
 }
 
-static int64_t nvfp4_selector_autotune_sample_blocks(int64_t nb_total, int64_t override_cap = 0) {
+static int64_t selector_sample_blocks(int64_t nb_total, int64_t override_cap = 0) {
     if (nb_total <= 0) {
         return 0;
     }
@@ -4302,14 +4509,14 @@ static bool quantize_tensor_slice_to_f32(
     });
 }
 
-struct nvfp4_selector_source_slice_view {
+struct selector_source_slice_view {
     const void * raw = nullptr;
     bool raw_bf16 = false;
     float x_scale = 1.0f;
     std::vector<float> owned_f32;
 };
 
-static bool nvfp4_selector_prepare_sample_from_f32(
+static bool selector_prepare_sample_from_f32(
     const float * src_f32,
     const float * imatrix_row,
     int64_t nrows,
@@ -4318,15 +4525,15 @@ static bool nvfp4_selector_prepare_sample_from_f32(
     std::vector<float> & sample_qw,
     int64_t sample_blocks_override = 0,
     int64_t sample_phase = 0) {
-    const int64_t nb_total = (nrows * n_per_row) / NVFP4_SELECTOR_BLOCK_SIZE;
-    const int64_t sample_nb = nvfp4_selector_autotune_sample_blocks(nb_total, sample_blocks_override);
+    const int64_t nb_total = (nrows * n_per_row) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+    const int64_t sample_nb = selector_sample_blocks(nb_total, sample_blocks_override);
     if (sample_nb <= 0) {
         return false;
     }
-    sample_x.resize((size_t) sample_nb * (size_t) NVFP4_SELECTOR_BLOCK_SIZE);
+    sample_x.resize((size_t) sample_nb * (size_t) SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE);
     sample_qw.clear();
 
-    const int64_t row_blocks = n_per_row / NVFP4_SELECTOR_BLOCK_SIZE;
+    const int64_t row_blocks = n_per_row / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
     const int64_t slice_elems = nrows * n_per_row;
     const bool build_qw = imatrix_row != nullptr && row_blocks > 0;
     if (build_qw) {
@@ -4335,22 +4542,22 @@ static bool nvfp4_selector_prepare_sample_from_f32(
 
     for (int64_t ib = 0; ib < sample_nb; ++ib) {
         const int64_t src_block = llama_nvfp4_sample_block_index(ib, sample_nb, nb_total, row_blocks, sample_phase);
-        const int64_t src_off = src_block * NVFP4_SELECTOR_BLOCK_SIZE;
-        if (src_off < 0 || src_off + NVFP4_SELECTOR_BLOCK_SIZE > slice_elems) {
+        const int64_t src_off = src_block * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+        if (src_off < 0 || src_off + SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE > slice_elems) {
             return false;
         }
-        const int64_t dst_off = ib * NVFP4_SELECTOR_BLOCK_SIZE;
-        memcpy(sample_x.data() + dst_off, src_f32 + src_off, (size_t) NVFP4_SELECTOR_BLOCK_SIZE * sizeof(float));
+        const int64_t dst_off = ib * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+        memcpy(sample_x.data() + dst_off, src_f32 + src_off, (size_t) SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE * sizeof(float));
         if (build_qw) {
             const int64_t block_in_row = src_block % row_blocks;
-            memcpy(sample_qw.data() + dst_off, imatrix_row + block_in_row * NVFP4_SELECTOR_BLOCK_SIZE, (size_t) NVFP4_SELECTOR_BLOCK_SIZE * sizeof(float));
+            memcpy(sample_qw.data() + dst_off, imatrix_row + block_in_row * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE, (size_t) SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE * sizeof(float));
         }
     }
 
     return true;
 }
 
-static float nvfp4_selector_qw_at(const float * qw, int idx) {
+static float selector_qw_at(const float * qw, int idx) {
     if (qw == nullptr) {
         return 1.0f;
     }
@@ -4358,12 +4565,12 @@ static float nvfp4_selector_qw_at(const float * qw, int idx) {
     return std::isfinite(w) && w > 0.0f ? w : 0.0f;
 }
 
-static bool nvfp4_selector_prepare_sample(
-    const nvfp4_selector_binding & binding,
+static bool selector_prepare_sample(
+    const selector_binding & binding,
     int64_t slice_index,
     std::vector<float> & sample_x,
     std::vector<float> & sample_qw,
-    nvfp4_selector_source_slice_view & source_view,
+    selector_source_slice_view & source_view,
     int64_t sample_blocks_override = 0,
     int64_t sample_phase = 0,
     int host_threads = 1) {
@@ -4396,18 +4603,18 @@ static bool nvfp4_selector_prepare_sample(
         source_view.raw = src_slice;
         source_view.raw_bf16 = false;
         source_view.x_scale = quant_tensor_scale;
-        return nvfp4_selector_prepare_sample_from_f32((const float *) src_slice, imatrix_row, nrows, n_per_row, sample_x, sample_qw, sample_blocks_override, sample_phase);
+        return selector_prepare_sample_from_f32((const float *) src_slice, imatrix_row, nrows, n_per_row, sample_x, sample_qw, sample_blocks_override, sample_phase);
     }
 
-    const int64_t nb_total = (nrows * n_per_row) / NVFP4_SELECTOR_BLOCK_SIZE;
-    const int64_t sample_nb = nvfp4_selector_autotune_sample_blocks(nb_total, sample_blocks_override);
+    const int64_t nb_total = (nrows * n_per_row) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+    const int64_t sample_nb = selector_sample_blocks(nb_total, sample_blocks_override);
     if (sample_nb <= 0) {
         return false;
     }
-    sample_x.resize((size_t) sample_nb * (size_t) NVFP4_SELECTOR_BLOCK_SIZE);
+    sample_x.resize((size_t) sample_nb * (size_t) SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE);
     sample_qw.clear();
 
-    const int64_t row_blocks = n_per_row / NVFP4_SELECTOR_BLOCK_SIZE;
+    const int64_t row_blocks = n_per_row / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
     const bool build_qw = imatrix_row != nullptr && row_blocks > 0;
     if (build_qw) {
         sample_qw.resize(sample_x.size());
@@ -4420,15 +4627,15 @@ static bool nvfp4_selector_prepare_sample(
         const auto * src_bf16 = (const ggml_bf16_t *) src_slice;
         for (int64_t ib = 0; ib < sample_nb; ++ib) {
             const int64_t src_block = llama_nvfp4_sample_block_index(ib, sample_nb, nb_total, row_blocks, sample_phase);
-            const int64_t src_off = src_block * NVFP4_SELECTOR_BLOCK_SIZE;
-            if (src_off < 0 || src_off + NVFP4_SELECTOR_BLOCK_SIZE > slice_elems) {
+            const int64_t src_off = src_block * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+            if (src_off < 0 || src_off + SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE > slice_elems) {
                 return false;
             }
-            const int64_t dst_off = ib * NVFP4_SELECTOR_BLOCK_SIZE;
-            ggml_bf16_to_fp32_row(src_bf16 + src_off, sample_x.data() + dst_off, NVFP4_SELECTOR_BLOCK_SIZE);
+            const int64_t dst_off = ib * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+            ggml_bf16_to_fp32_row(src_bf16 + src_off, sample_x.data() + dst_off, SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE);
             if (build_qw) {
                 const int64_t block_in_row = src_block % row_blocks;
-                memcpy(sample_qw.data() + dst_off, imatrix_row + block_in_row * NVFP4_SELECTOR_BLOCK_SIZE, (size_t) NVFP4_SELECTOR_BLOCK_SIZE * sizeof(float));
+                memcpy(sample_qw.data() + dst_off, imatrix_row + block_in_row * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE, (size_t) SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE * sizeof(float));
             }
         }
         return true;
@@ -4438,15 +4645,15 @@ static bool nvfp4_selector_prepare_sample(
         const auto * src_f16 = (const ggml_fp16_t *) src_slice;
         for (int64_t ib = 0; ib < sample_nb; ++ib) {
             const int64_t src_block = llama_nvfp4_sample_block_index(ib, sample_nb, nb_total, row_blocks, sample_phase);
-            const int64_t src_off = src_block * NVFP4_SELECTOR_BLOCK_SIZE;
-            if (src_off < 0 || src_off + NVFP4_SELECTOR_BLOCK_SIZE > slice_elems) {
+            const int64_t src_off = src_block * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+            if (src_off < 0 || src_off + SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE > slice_elems) {
                 return false;
             }
-            const int64_t dst_off = ib * NVFP4_SELECTOR_BLOCK_SIZE;
-            ggml_fp16_to_fp32_row(src_f16 + src_off, sample_x.data() + dst_off, NVFP4_SELECTOR_BLOCK_SIZE);
+            const int64_t dst_off = ib * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+            ggml_fp16_to_fp32_row(src_f16 + src_off, sample_x.data() + dst_off, SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE);
             if (build_qw) {
                 const int64_t block_in_row = src_block % row_blocks;
-                memcpy(sample_qw.data() + dst_off, imatrix_row + block_in_row * NVFP4_SELECTOR_BLOCK_SIZE, (size_t) NVFP4_SELECTOR_BLOCK_SIZE * sizeof(float));
+                memcpy(sample_qw.data() + dst_off, imatrix_row + block_in_row * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE, (size_t) SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE * sizeof(float));
             }
         }
         if (sample_blocks_override > 0) {
@@ -4468,7 +4675,7 @@ static bool nvfp4_selector_prepare_sample(
     source_view.raw = source_view.owned_f32.data();
     source_view.raw_bf16 = false;
     source_view.x_scale = quant_tensor_scale;
-    return nvfp4_selector_prepare_sample_from_f32(source_view.owned_f32.data(), imatrix_row, nrows, n_per_row, sample_x, sample_qw, sample_blocks_override, sample_phase);
+    return selector_prepare_sample_from_f32(source_view.owned_f32.data(), imatrix_row, nrows, n_per_row, sample_x, sample_qw, sample_blocks_override, sample_phase);
 }
 
 static bool nvfp4_selector_device_sample_supported(const ggml_tensor * src_tensor, float source_tensor_scale) {
@@ -4486,7 +4693,7 @@ static bool nvfp4_selector_device_sample_supported(const ggml_tensor * src_tenso
 }
 
 static bool nvfp4_selector_get_device_sample(
-    const nvfp4_selector_binding & binding,
+    const selector_binding & binding,
     int64_t slice_index,
     int64_t sample_nb,
     int64_t sample_phase,
@@ -4502,10 +4709,10 @@ static bool nvfp4_selector_get_device_sample(
 
     const int64_t n_per_row = src_tensor->ne[0];
     const int64_t nrows = src_tensor->ne[1];
-    if (n_per_row <= 0 || nrows <= 0 || (n_per_row % NVFP4_SELECTOR_BLOCK_SIZE) != 0) {
+    if (n_per_row <= 0 || nrows <= 0 || (n_per_row % SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE) != 0) {
         return false;
     }
-    const int64_t nb_total = (nrows * n_per_row) / NVFP4_SELECTOR_BLOCK_SIZE;
+    const int64_t nb_total = (nrows * n_per_row) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
     if (sample_nb > nb_total || sample_nb * 32 < nb_total) {
         return false;
     }
@@ -4533,7 +4740,7 @@ static bool nvfp4_selector_get_device_sample(
             out.qw_device = entry->qw_device;
             out.n_device = entry->n_device;
             out.x_scale = quant_tensor_scale;
-            return out.x_device != nullptr && out.tune_x_device != nullptr && out.n_device == sample_nb * NVFP4_SELECTOR_BLOCK_SIZE;
+            return out.x_device != nullptr && out.tune_x_device != nullptr && out.n_device == sample_nb * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
         }
     }
 
@@ -4569,7 +4776,7 @@ static bool nvfp4_selector_get_device_sample(
     out.qw_device = entry->qw_device;
     out.n_device = entry->n_device;
     out.x_scale = quant_tensor_scale;
-    const bool ok = out.x_device != nullptr && out.tune_x_device != nullptr && out.n_device == sample_nb * NVFP4_SELECTOR_BLOCK_SIZE;
+    const bool ok = out.x_device != nullptr && out.tune_x_device != nullptr && out.n_device == sample_nb * SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
     if (ok) {
         binding.device_samples->entries.push_back(std::move(entry));
     }
@@ -4577,7 +4784,7 @@ static bool nvfp4_selector_get_device_sample(
 }
 
 static bool nvfp4_selector_quantize_binding(
-    const nvfp4_selector_binding & binding,
+    const selector_binding & binding,
     const nvfp4_cuda_runtime_cfg & cfg,
     int nthread,
     std::vector<uint8_t> & out_bytes,
@@ -4588,7 +4795,7 @@ static bool nvfp4_selector_quantize_binding(
     int64_t sample_blocks_override = 0,
     int64_t sample_phase = 0,
     bool direct_runtime_patch = false,
-    nvfp4_selector_rsf_tensor_record * rsf_record = nullptr,
+    selector_rsf_tensor_record * rsf_record = nullptr,
     bool collect_eval_metrics = true) {
     using qtype = ggml_quantize_type_traits<GGML_TYPE_NVFP4>;
 
@@ -4695,10 +4902,10 @@ static bool nvfp4_selector_quantize_binding(
             }
         }
 
-        nvfp4_selector_source_slice_view source_view;
+        selector_source_slice_view source_view;
         std::vector<float> sample_x;
         std::vector<float> sample_qw;
-        if (!nvfp4_selector_prepare_sample(
+        if (!selector_prepare_sample(
                 binding, i03, sample_x, sample_qw, source_view,
                 sample_blocks_override, sample_phase, shape.host_threads)) {
             fprintf(stderr,
@@ -4739,7 +4946,7 @@ static bool nvfp4_selector_quantize_binding(
         }
         if (!nvfp4_autotune_cuda_cfg(tune_x_ptr, sample_qw.empty() ? nullptr : sample_qw.data(), (int64_t) sample_x.size(), &cfg, &tune, stream_key)) {
             fprintf(stderr,
-                "%s: CUDA autotune failed for %s slice=%" PRId64 " sample_elems=%zu sample_qw=%s choose46=%d refit=%d compand=%d cap6=%.1f cap4=%.1f\n",
+                "%s: CUDA encoder search failed for %s slice=%" PRId64 " sample_elems=%zu sample_qw=%s choose46=%d refit=%d compand=%d cap6=%.1f cap4=%.1f\n",
                 __func__,
                 binding.name.c_str(),
                 i03,
@@ -4844,7 +5051,7 @@ static bool nvfp4_selector_quantize_binding(
 }
 
 static bool mxfp6_selector_quantize_binding(
-    nvfp4_selector_binding & binding,
+    selector_binding & binding,
     float scale_mul,
     int nthread,
     std::vector<uint8_t> & out_bytes,
@@ -4981,7 +5188,7 @@ static bool mxfp6_selector_quantize_binding(
     return count > 0;
 }
 
-struct nvfp4_selector_proxy_metrics {
+struct selector_proxy_metrics {
     bool ok = false;
     double rmse = std::numeric_limits<double>::infinity();
     double abs_mean = std::numeric_limits<double>::infinity();
@@ -4989,12 +5196,12 @@ struct nvfp4_selector_proxy_metrics {
     double score = std::numeric_limits<double>::infinity();
 };
 
-static nvfp4_selector_proxy_metrics nvfp4_selector_proxy_score(
+static selector_proxy_metrics selector_proxy_score(
         double sum_sq,
         double sum_abs,
         double max_abs,
         int64_t count) {
-    nvfp4_selector_proxy_metrics out;
+    selector_proxy_metrics out;
     if (count <= 0) {
         return out;
     }
@@ -5011,10 +5218,10 @@ static nvfp4_selector_proxy_metrics nvfp4_selector_proxy_score(
     return out;
 }
 
-static nvfp4_selector_proxy_metrics nvfp4_selector_policy_proxy_metrics(
-        const nvfp4_selector_policy & policy,
+static selector_proxy_metrics selector_policy_proxy_metrics(
+        const selector_policy & policy,
         bool prefer_survey) {
-    nvfp4_selector_proxy_metrics out;
+    selector_proxy_metrics out;
     if (prefer_survey && policy.has_survey) {
         out.ok = std::isfinite(policy.survey_proxy_score);
         out.rmse = policy.survey_proxy_rmse;
@@ -5031,9 +5238,9 @@ static nvfp4_selector_proxy_metrics nvfp4_selector_policy_proxy_metrics(
     return out;
 }
 
-static bool nvfp4_selector_metric_close(double a, double b, double abs_tol, double rel_tol);
+static bool selector_metric_close(double a, double b, double abs_tol, double rel_tol);
 
-static int nvfp4_selector_policy_proxy_tie_rank(const nvfp4_selector_policy & policy) {
+static int selector_policy_proxy_tie_rank(const selector_policy & policy) {
     int rank = 0;
     if (policy.name.find("recipe_") == 0) {
         rank -= 300;
@@ -5052,20 +5259,20 @@ static int nvfp4_selector_policy_proxy_tie_rank(const nvfp4_selector_policy & po
     return rank;
 }
 
-static bool nvfp4_selector_policy_proxy_less(const nvfp4_selector_policy & a, const nvfp4_selector_policy & b) {
+static bool selector_policy_proxy_less(const selector_policy & a, const selector_policy & b) {
     if (a.has_survey != b.has_survey) return a.has_survey > b.has_survey;
     const bool prefer_survey = a.has_survey && b.has_survey;
-    const nvfp4_selector_proxy_metrics am = nvfp4_selector_policy_proxy_metrics(a, prefer_survey);
-    const nvfp4_selector_proxy_metrics bm = nvfp4_selector_policy_proxy_metrics(b, prefer_survey);
-    if (!nvfp4_selector_metric_close(am.score, bm.score, 1e-8, 1e-7)) return am.score < bm.score;
-    const int ar = nvfp4_selector_policy_proxy_tie_rank(a);
-    const int br = nvfp4_selector_policy_proxy_tie_rank(b);
+    const selector_proxy_metrics am = selector_policy_proxy_metrics(a, prefer_survey);
+    const selector_proxy_metrics bm = selector_policy_proxy_metrics(b, prefer_survey);
+    if (!selector_metric_close(am.score, bm.score, 1e-8, 1e-7)) return am.score < bm.score;
+    const int ar = selector_policy_proxy_tie_rank(a);
+    const int br = selector_policy_proxy_tie_rank(b);
     if (ar != br) return ar < br;
     if (am.score != bm.score) return am.score < bm.score;
     return a.name < b.name;
 }
 
-static bool nvfp4_selector_metric_close(double a, double b, double abs_tol, double rel_tol) {
+static bool selector_metric_close(double a, double b, double abs_tol, double rel_tol) {
     if (!std::isfinite(a) || !std::isfinite(b)) {
         return a == b;
     }
@@ -5073,21 +5280,21 @@ static bool nvfp4_selector_metric_close(double a, double b, double abs_tol, doub
     return std::fabs(a - b) <= tol;
 }
 
-static bool nvfp4_selector_policy_is_recipe(const std::string & name) {
+static bool selector_policy_is_recipe(const std::string & name) {
     return name == "recipe_current" || name.rfind("recipe_", 0) == 0;
 }
 
-static bool nvfp4_selector_proxy_equivalent(
-        const nvfp4_selector_policy & a,
-        const nvfp4_selector_policy & b,
+static bool selector_proxy_equivalent(
+        const selector_policy & a,
+        const selector_policy & b,
         bool prefer_survey) {
-    if (nvfp4_selector_policy_is_recipe(a.name) != nvfp4_selector_policy_is_recipe(b.name)) {
+    if (selector_policy_is_recipe(a.name) != selector_policy_is_recipe(b.name)) {
         return false;
     }
     if (nvfp4_cfg_has_rsf(a.cfg) != nvfp4_cfg_has_rsf(b.cfg)) {
         return false;
     }
-    const bool require_cfg_match = quantize_control_i64("LLAMA_NVFP4_SELECTOR_DEDUP_REQUIRE_CFG", 0) != 0;
+    const bool require_cfg_match = selector_control_i64("DEDUP_REQUIRE_CFG", 0) != 0;
     if (require_cfg_match && (
             a.cfg.choose46_mode != b.cfg.choose46_mode ||
             a.cfg.refit_iters != b.cfg.refit_iters ||
@@ -5098,17 +5305,17 @@ static bool nvfp4_selector_proxy_equivalent(
         return false;
     }
     const bool use_survey = prefer_survey && a.has_survey && b.has_survey;
-    const nvfp4_selector_proxy_metrics am = nvfp4_selector_policy_proxy_metrics(a, use_survey);
-    const nvfp4_selector_proxy_metrics bm = nvfp4_selector_policy_proxy_metrics(b, use_survey);
+    const selector_proxy_metrics am = selector_policy_proxy_metrics(a, use_survey);
+    const selector_proxy_metrics bm = selector_policy_proxy_metrics(b, use_survey);
 
     return
-        nvfp4_selector_metric_close(am.score,    bm.score,    1e-8, 1e-7) &&
-        nvfp4_selector_metric_close(am.rmse,     bm.rmse,     1e-8, 1e-7) &&
-        nvfp4_selector_metric_close(am.abs_mean, bm.abs_mean, 1e-8, 1e-7) &&
-        nvfp4_selector_metric_close(am.max_abs,  bm.max_abs,  1e-7, 1e-7);
+        selector_metric_close(am.score,    bm.score,    1e-8, 1e-7) &&
+        selector_metric_close(am.rmse,     bm.rmse,     1e-8, 1e-7) &&
+        selector_metric_close(am.abs_mean, bm.abs_mean, 1e-8, 1e-7) &&
+        selector_metric_close(am.max_abs,  bm.max_abs,  1e-7, 1e-7);
 }
 
-static bool nvfp4_selector_cfg_equal(const nvfp4_cuda_runtime_cfg & a, const nvfp4_cuda_runtime_cfg & b) {
+static bool selector_cfg_equal(const nvfp4_cuda_runtime_cfg & a, const nvfp4_cuda_runtime_cfg & b) {
     return
         a.choose46_mode == b.choose46_mode &&
         a.refit_iters == b.refit_iters &&
@@ -5118,34 +5325,34 @@ static bool nvfp4_selector_cfg_equal(const nvfp4_cuda_runtime_cfg & a, const nvf
         a.cap_m4 == b.cap_m4;
 }
 
-static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_without_rsf(nvfp4_cuda_runtime_cfg cfg) {
+static nvfp4_cuda_runtime_cfg selector_cfg_without_rsf(nvfp4_cuda_runtime_cfg cfg) {
     cfg.reserved_i32 &= ~(NVFP4_CUDA_FLAG_RSF | NVFP4_CUDA_RSF_MODE_MASK | NVFP4_CUDA_RSF_DEPTH_MASK);
     return cfg;
 }
 
-static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_with_rsf(nvfp4_cuda_runtime_cfg cfg, int rsf_mode, int rsf_depth) {
+static nvfp4_cuda_runtime_cfg selector_cfg_with_rsf(nvfp4_cuda_runtime_cfg cfg, int rsf_mode, int rsf_depth) {
     cfg.reserved_i32 |= NVFP4_CUDA_FLAG_RSF;
     nvfp4_cfg_set_rsf_mode(cfg, rsf_mode);
     nvfp4_cfg_set_rsf_depth(cfg, rsf_depth);
     return cfg;
 }
 
-static nvfp4_cuda_runtime_cfg nvfp4_selector_cfg_as_rsf(nvfp4_cuda_runtime_cfg cfg, int rsf_mode, int rsf_depth) {
-    cfg = nvfp4_selector_cfg_without_rsf(cfg);
-    return nvfp4_selector_cfg_with_rsf(cfg, rsf_mode, rsf_depth);
+static nvfp4_cuda_runtime_cfg selector_cfg_as_rsf(nvfp4_cuda_runtime_cfg cfg, int rsf_mode, int rsf_depth) {
+    cfg = selector_cfg_without_rsf(cfg);
+    return selector_cfg_with_rsf(cfg, rsf_mode, rsf_depth);
 }
 
-static bool nvfp4_selector_policy_name_has_rsf(const std::string & name) {
+static bool selector_policy_name_has_rsf(const std::string & name) {
     return (name.size() >= 4 && name.compare(name.size() - 4, 4, "_rsf") == 0) ||
            name.find("_rsf_") != std::string::npos;
 }
 
-static int nvfp4_selector_effective_rsf_mode(const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr) {
+static int selector_effective_rsf_mode(const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr) {
     int rsf_mode = recipe_cfg != nullptr ? nvfp4_cfg_rsf_mode(*recipe_cfg) : NVFP4_CUDA_RSF_MODE_TENSOR;
-    const std::string rsf_mode_control = quantize_control_string("LLAMA_NVFP4_SELECTOR_RSF_MODE");
+    const std::string rsf_mode_control = selector_control_string("RSF_MODE");
     if (!rsf_mode_control.empty() && !nvfp4_parse_rsf_mode(rsf_mode_control.c_str(), rsf_mode)) {
         fprintf(stderr,
-            "%s: invalid NVFP4 RSF mode '%s'; using tensor\n",
+            "%s: invalid RSF mode '%s'; using tensor\n",
             __func__,
             rsf_mode_control.c_str());
         rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR;
@@ -5153,14 +5360,14 @@ static int nvfp4_selector_effective_rsf_mode(const nvfp4_cuda_runtime_cfg * reci
     return rsf_mode;
 }
 
-static int nvfp4_selector_effective_rsf_depth(const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr) {
+static int selector_effective_rsf_depth(const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr) {
     int rsf_depth = recipe_cfg != nullptr && nvfp4_cfg_has_rsf(*recipe_cfg)
         ? nvfp4_cfg_rsf_depth(*recipe_cfg)
         : NVFP4_CUDA_RSF_DEPTH_DEEPER;
-    const std::string rsf_depth_control = quantize_control_string("LLAMA_NVFP4_SELECTOR_RSF_DEPTH");
+    const std::string rsf_depth_control = selector_control_string("RSF_DEPTH");
     if (!rsf_depth_control.empty() && !nvfp4_parse_rsf_depth(rsf_depth_control.c_str(), rsf_depth)) {
         fprintf(stderr,
-            "%s: invalid NVFP4 RSF depth '%s'; using deeper\n",
+            "%s: invalid RSF depth '%s'; using deeper\n",
             __func__,
             rsf_depth_control.c_str());
         rsf_depth = NVFP4_CUDA_RSF_DEPTH_DEEPER;
@@ -5168,26 +5375,26 @@ static int nvfp4_selector_effective_rsf_depth(const nvfp4_cuda_runtime_cfg * rec
     return rsf_depth;
 }
 
-static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
+static std::vector<selector_policy> selector_default_policies(
         const nvfp4_cuda_runtime_cfg * recipe_cfg = nullptr,
         const std::string & recipe_policy_name = {}) {
-    std::vector<nvfp4_selector_policy> out;
-    const int rsf_mode = nvfp4_selector_effective_rsf_mode(recipe_cfg);
-    const int rsf_depth = nvfp4_selector_effective_rsf_depth(recipe_cfg);
+    std::vector<selector_policy> out;
+    const int rsf_mode = selector_effective_rsf_mode(recipe_cfg);
+    const int rsf_depth = selector_effective_rsf_depth(recipe_cfg);
     auto push = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
         for (const auto & existing : out) {
-            if (nvfp4_selector_cfg_equal(existing.cfg, cfg)) {
+            if (selector_cfg_equal(existing.cfg, cfg)) {
                 return false;
             }
         }
-        nvfp4_selector_policy p;
+        selector_policy p;
         p.name = name;
         p.cfg = cfg;
         out.push_back(std::move(p));
         return true;
     };
     auto push_family = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
-        cfg = nvfp4_selector_cfg_as_rsf(cfg, rsf_mode, rsf_depth);
+        cfg = selector_cfg_as_rsf(cfg, rsf_mode, rsf_depth);
         push(name, cfg);
     };
     if (recipe_cfg != nullptr) {
@@ -5199,22 +5406,22 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_default_policies(
     return out;
 }
 
-static bool nvfp4_selector_policy_is_awq_tail(const std::string & name) {
+static bool selector_policy_is_awq_tail(const std::string & name) {
     return name.find("asym_tail") != std::string::npos ||
            name.find("awq_tail") != std::string::npos;
 }
 
-static bool nvfp4_selector_policy_is_rsf_family(const nvfp4_selector_policy & policy) {
+static bool selector_policy_is_rsf_family(const selector_policy & policy) {
     return nvfp4_cfg_has_rsf(policy.cfg) ||
-           nvfp4_selector_policy_name_has_rsf(policy.name);
+           selector_policy_name_has_rsf(policy.name);
 }
 
-static bool nvfp4_selector_ends_with(const std::string & value, const std::string & suffix) {
+static bool selector_ends_with(const std::string & value, const std::string & suffix) {
     return value.size() >= suffix.size() &&
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-static std::string nvfp4_selector_rsf_base_policy_name(const std::string & name) {
+static std::string selector_rsf_base_policy_name(const std::string & name) {
     if (name.size() >= 4 && name.compare(name.size() - 4, 4, "_rsf") == 0) {
         return name.substr(0, name.size() - 4);
     }
@@ -5227,7 +5434,7 @@ static std::string nvfp4_selector_rsf_base_policy_name(const std::string & name)
     return name;
 }
 
-static std::vector<std::string> nvfp4_selector_rsf_base_policy_candidates(const std::string & name) {
+static std::vector<std::string> selector_rsf_base_policy_candidates(const std::string & name) {
     std::vector<std::string> out;
     auto push = [&](const std::string & candidate) {
         if (!candidate.empty() &&
@@ -5237,7 +5444,7 @@ static std::vector<std::string> nvfp4_selector_rsf_base_policy_candidates(const 
         }
     };
 
-    const std::string direct = nvfp4_selector_rsf_base_policy_name(name);
+    const std::string direct = selector_rsf_base_policy_name(name);
     push(direct);
 
     static const std::array<const char *, 5> refine_suffixes = {
@@ -5248,20 +5455,20 @@ static std::vector<std::string> nvfp4_selector_rsf_base_policy_candidates(const 
         "_compand_flip",
     };
     for (const char * suffix : refine_suffixes) {
-        if (nvfp4_selector_ends_with(direct, suffix)) {
+        if (selector_ends_with(direct, suffix)) {
             push(direct.substr(0, direct.size() - std::strlen(suffix)));
         }
-        if (nvfp4_selector_ends_with(name, suffix)) {
+        if (selector_ends_with(name, suffix)) {
             const std::string parent = name.substr(0, name.size() - std::strlen(suffix));
-            push(nvfp4_selector_rsf_base_policy_name(parent));
+            push(selector_rsf_base_policy_name(parent));
         }
     }
 
     return out;
 }
 
-static bool nvfp4_selector_policy_is_fixed_cap_sweep(const std::string & name) {
-    const std::string base = nvfp4_selector_rsf_base_policy_name(name);
+static bool selector_policy_is_fixed_cap_sweep(const std::string & name) {
+    const std::string base = selector_rsf_base_policy_name(name);
     return
         base.find("_recover_") != std::string::npos ||
         base.find("asym_tail") != std::string::npos ||
@@ -5272,14 +5479,14 @@ static bool nvfp4_selector_policy_is_fixed_cap_sweep(const std::string & name) {
         base == "baseline_refit24_384_256";
 }
 
-static const nvfp4_selector_policy * nvfp4_selector_find_rsf_base_policy(
-        const std::vector<nvfp4_selector_policy> & policies,
-        const nvfp4_selector_policy & policy,
+static const selector_policy * selector_find_rsf_base_policy(
+        const std::vector<selector_policy> & policies,
+        const selector_policy & policy,
         bool require_measured = false) {
-    for (const std::string & candidate : nvfp4_selector_rsf_base_policy_candidates(policy.name)) {
-        auto it = std::find_if(policies.begin(), policies.end(), [&](const nvfp4_selector_policy & p) {
+    for (const std::string & candidate : selector_rsf_base_policy_candidates(policy.name)) {
+        auto it = std::find_if(policies.begin(), policies.end(), [&](const selector_policy & p) {
             return p.name == candidate &&
-                   !nvfp4_selector_policy_is_rsf_family(p) &&
+                   !selector_policy_is_rsf_family(p) &&
                    (!require_measured || p.measured.ok);
         });
         if (it != policies.end()) {
@@ -5289,12 +5496,12 @@ static const nvfp4_selector_policy * nvfp4_selector_find_rsf_base_policy(
     return nullptr;
 }
 
-static bool nvfp4_selector_write_rsf_report(
+static bool selector_write_rsf_report(
         const std::string & report_path,
-        const std::vector<nvfp4_selector_policy> & policies) {
-    std::vector<const nvfp4_selector_policy *> rsf_policies;
+        const std::vector<selector_policy> & policies) {
+    std::vector<const selector_policy *> rsf_policies;
     for (const auto & policy : policies) {
-        if (nvfp4_selector_policy_is_rsf_family(policy) && !policy.tensor_records.empty()) {
+        if (selector_policy_is_rsf_family(policy) && !policy.tensor_records.empty()) {
             rsf_policies.push_back(&policy);
         }
     }
@@ -5332,11 +5539,11 @@ static bool nvfp4_selector_write_rsf_report(
     out << "policy_delta_* fields are measured policy-wide KLD/PPL deltas versus the non-RSF companion.\n\n";
     out << "policy                         tensors tested    proxy wins    avg scale_mul    p10/p50/p90 scale_mul\n";
     for (const auto * policy : rsf_policies) {
-        const nvfp4_selector_policy * base_policy =
-            nvfp4_selector_find_rsf_base_policy(policies, *policy);
+        const selector_policy * base_policy =
+            selector_find_rsf_base_policy(policies, *policy);
         const auto base_records = base_policy != nullptr
-            ? nvfp4_selector_rsf_record_map(*base_policy)
-            : std::unordered_map<std::string, const nvfp4_selector_rsf_tensor_record *>();
+            ? selector_rsf_record_map(*base_policy)
+            : std::unordered_map<std::string, const selector_rsf_tensor_record *>();
 
         int tested = 0;
         int wins = 0;
@@ -5346,9 +5553,9 @@ static bool nvfp4_selector_write_rsf_report(
                 continue;
             }
             ++tested;
-            const double scale_mul = nvfp4_selector_rsf_record_scale_mul(record);
+            const double scale_mul = selector_rsf_record_scale_mul(record);
             scale_muls.push_back(scale_mul);
-            hist_by_class[nvfp4_selector_rsf_hist_class(record.tensor, record.cls)].push_back(scale_mul);
+            hist_by_class[selector_rsf_hist_class(record.tensor, record.cls)].push_back(scale_mul);
 
             double proxy_delta = std::numeric_limits<double>::quiet_NaN();
             auto bit = base_records.find(record.tensor);
@@ -5361,7 +5568,7 @@ static bool nvfp4_selector_write_rsf_report(
             tensor_row row;
             row.tensor = record.tensor;
             row.policy = policy->name;
-            row.cls = nvfp4_selector_rsf_hist_class(record.tensor, record.cls);
+            row.cls = selector_rsf_hist_class(record.tensor, record.cls);
             row.scale_mul = scale_mul;
             row.proxy_delta = proxy_delta;
             row.win = win;
@@ -5384,9 +5591,9 @@ static bool nvfp4_selector_write_rsf_report(
             << std::setw(17) << std::fixed << std::setprecision(3) << avg
             << "           "
             << std::fixed << std::setprecision(3)
-            << nvfp4_selector_percentile(scale_muls, 0.10) << '/'
-            << nvfp4_selector_percentile(scale_muls, 0.50) << '/'
-            << nvfp4_selector_percentile(scale_muls, 0.90) << '\n';
+            << selector_percentile(scale_muls, 0.10) << '/'
+            << selector_percentile(scale_muls, 0.50) << '/'
+            << selector_percentile(scale_muls, 0.90) << '\n';
     }
 
     std::stable_sort(rows.begin(), rows.end(), [](const tensor_row & a, const tensor_row & b) {
@@ -5461,9 +5668,9 @@ static bool nvfp4_selector_write_rsf_report(
     return true;
 }
 
-static std::unordered_set<std::string> selector_policy_set_from_control(const char * key) {
+static std::unordered_set<std::string> selector_policy_set_from_control(const char * suffix) {
     std::unordered_set<std::string> out;
-    const std::string raw = quantize_control_string(key);
+    const std::string raw = selector_control_string(suffix);
     if (raw.empty()) {
         return out;
     }
@@ -5486,9 +5693,9 @@ static std::unordered_set<std::string> selector_policy_set_from_control(const ch
     return out;
 }
 
-static std::vector<ggml_type> selector_type_list_from_control(const char * key) {
+static std::vector<ggml_type> selector_type_list_from_control(const char * suffix) {
     std::vector<ggml_type> out;
-    const std::string raw = quantize_control_string(key);
+    const std::string raw = selector_control_string(suffix);
     if (raw.empty()) {
         return out;
     }
@@ -5518,20 +5725,20 @@ static std::vector<ggml_type> selector_type_list_from_control(const char * key) 
     return out;
 }
 
-static void nvfp4_selector_push_policy_unique(std::vector<nvfp4_selector_policy> & out, std::string name, const nvfp4_cuda_runtime_cfg & cfg) {
+static void selector_push_policy_unique(std::vector<selector_policy> & out, std::string name, const nvfp4_cuda_runtime_cfg & cfg) {
     for (const auto & p : out) {
-        if (nvfp4_selector_cfg_equal(p.cfg, cfg)) {
+        if (selector_cfg_equal(p.cfg, cfg)) {
             return;
         }
     }
-    nvfp4_selector_policy p;
+    selector_policy p;
     p.name = std::move(name);
     p.cfg = cfg;
     out.push_back(std::move(p));
 }
 
-static std::vector<std::pair<float, float>> nvfp4_selector_cap_pairs_for_class(
-    nvfp4_selector_tensor_class cls,
+static std::vector<std::pair<float, float>> selector_cap_pairs_for_class(
+    selector_tensor_class cls,
     const nvfp4_cuda_runtime_cfg & base_cfg) {
     std::vector<std::pair<float, float>> out;
     auto add = [&](float c6, float c4) {
@@ -5549,9 +5756,9 @@ static std::vector<std::pair<float, float>> nvfp4_selector_cap_pairs_for_class(
     add(base_cfg.cap_m6, base_cfg.cap_m4);
 
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:
-        case nvfp4_selector_tensor_class::ATTN_OUT:
-        case nvfp4_selector_tensor_class::SSM:
+        case selector_tensor_class::ATTN_QKV:
+        case selector_tensor_class::ATTN_OUT:
+        case selector_tensor_class::SSM:
             add(320.0f, 224.0f);
             add(352.0f, 224.0f);
             add(416.0f, 192.0f);
@@ -5562,8 +5769,8 @@ static std::vector<std::pair<float, float>> nvfp4_selector_cap_pairs_for_class(
             add(480.0f, 320.0f);
             add(384.0f, 384.0f);
             break;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:
+        case selector_tensor_class::EXPERT_UP_GATE:
+        case selector_tensor_class::EXPERT_DOWN:
             add(352.0f, 224.0f);
             add(384.0f, 224.0f);
             add(384.0f, 256.0f);
@@ -5592,8 +5799,8 @@ static std::vector<std::pair<float, float>> nvfp4_selector_cap_pairs_for_class(
     return out;
 }
 
-static std::vector<int> nvfp4_selector_refit_candidates_for_class(
-    nvfp4_selector_tensor_class cls,
+static std::vector<int> selector_refit_candidates_for_class(
+    selector_tensor_class cls,
     int base_refit) {
     std::vector<int> out;
     auto add = [&](int refit) {
@@ -5609,28 +5816,28 @@ static std::vector<int> nvfp4_selector_refit_candidates_for_class(
     add(12);
     add(16);
     add(24);
-    if (cls == nvfp4_selector_tensor_class::ATTN_QKV ||
-        cls == nvfp4_selector_tensor_class::ATTN_OUT ||
-        cls == nvfp4_selector_tensor_class::SSM ||
-        cls == nvfp4_selector_tensor_class::EXPERT_UP_GATE ||
-        cls == nvfp4_selector_tensor_class::EXPERT_DOWN) {
+    if (cls == selector_tensor_class::ATTN_QKV ||
+        cls == selector_tensor_class::ATTN_OUT ||
+        cls == selector_tensor_class::SSM ||
+        cls == selector_tensor_class::EXPERT_UP_GATE ||
+        cls == selector_tensor_class::EXPERT_DOWN) {
         add(32);
     }
     return out;
 }
 
-static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(
-        const std::vector<nvfp4_selector_policy> & ranked,
+static std::vector<selector_policy> selector_refine_policies(
+        const std::vector<selector_policy> & ranked,
         int rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR,
         int rsf_depth = NVFP4_CUDA_RSF_DEPTH_DEEPER) {
-    const int refine_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_TOP", 4));
-    const int refine_budget = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", 24));
+    const int refine_top = (int) std::max<int64_t>(1, selector_control_i64("REFINE_TOP", 4));
+    const int refine_budget = (int) std::max<int64_t>(0, selector_control_i64("REFINE_BUDGET", 24));
     if (refine_budget <= 0 || ranked.empty()) {
         return {};
     }
 
     auto clamp_cfg = [](nvfp4_cuda_runtime_cfg cfg) {
-        cfg = nvfp4_selector_cfg_without_rsf(cfg);
+        cfg = selector_cfg_without_rsf(cfg);
         cfg.refit_iters = std::max(2, std::min(32, cfg.refit_iters));
         cfg.cap_m6 = std::clamp(cfg.cap_m6, 256.0f, 544.0f);
         cfg.cap_m4 = std::clamp(cfg.cap_m4, 160.0f, 352.0f);
@@ -5640,28 +5847,28 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(
         return cfg;
     };
 
-    std::vector<nvfp4_selector_policy> out;
+    std::vector<selector_policy> out;
     auto push_variant = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
         if ((int) out.size() >= refine_budget) {
             return;
         }
         cfg = clamp_cfg(cfg);
-        cfg = nvfp4_selector_cfg_as_rsf(cfg, rsf_mode, rsf_depth);
-        for (const nvfp4_selector_policy & existing : ranked) {
-            if (nvfp4_selector_cfg_equal(existing.cfg, cfg)) {
+        cfg = selector_cfg_as_rsf(cfg, rsf_mode, rsf_depth);
+        for (const selector_policy & existing : ranked) {
+            if (selector_cfg_equal(existing.cfg, cfg)) {
                 return;
             }
         }
-        nvfp4_selector_push_policy_unique(out, name, cfg);
+        selector_push_policy_unique(out, name, cfg);
     };
 
     for (int i = 0; i < refine_top && i < (int) ranked.size() && (int) out.size() < refine_budget; ++i) {
-        const nvfp4_selector_policy & seed = ranked[(size_t) i];
+        const selector_policy & seed = ranked[(size_t) i];
         if (seed.proxy_rejected || !std::isfinite(seed.proxy_score)) {
             continue;
         }
 
-        const std::string base_name = nvfp4_selector_rsf_base_policy_name(seed.name);
+        const std::string base_name = selector_rsf_base_policy_name(seed.name);
         const nvfp4_cuda_runtime_cfg base = clamp_cfg(seed.cfg);
 
         push_variant(base_name + "_frontier", base);
@@ -5690,19 +5897,19 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_refine_policies(
     return out;
 }
 
-static int64_t nvfp4_selector_rescue_sample_blocks(int64_t nb_total, nvfp4_selector_tensor_class cls) {
-    const int64_t base = nvfp4_selector_autotune_sample_blocks(nb_total);
+static int64_t selector_rescue_sample_blocks(int64_t nb_total, selector_tensor_class cls) {
+    const int64_t base = selector_sample_blocks(nb_total);
     const int64_t mult = SELECTOR_RESCUE_NVFP4_SAMPLE_MULT;
-    const int64_t max_blocks = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_MAX_BLOCKS", 16384);
+    const int64_t max_blocks = selector_control_i64("RESCUE_NVFP4_MAX_BLOCKS", 16384);
     int64_t min_blocks = SELECTOR_RESCUE_NVFP4_MIN_BLOCKS;
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:
-        case nvfp4_selector_tensor_class::ATTN_OUT:
-        case nvfp4_selector_tensor_class::SSM:
+        case selector_tensor_class::ATTN_QKV:
+        case selector_tensor_class::ATTN_OUT:
+        case selector_tensor_class::SSM:
             min_blocks = std::max<int64_t>(min_blocks, 8192);
             break;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:
+        case selector_tensor_class::EXPERT_UP_GATE:
+        case selector_tensor_class::EXPERT_DOWN:
             min_blocks = std::max<int64_t>(min_blocks, 16384);
             break;
         default:
@@ -5712,18 +5919,18 @@ static int64_t nvfp4_selector_rescue_sample_blocks(int64_t nb_total, nvfp4_selec
     return std::min<int64_t>(nb_total, std::max<int64_t>(1, std::min<int64_t>(target, max_blocks)));
 }
 
-static int64_t nvfp4_selector_rescue_refine_blocks(int64_t nb_total, nvfp4_selector_tensor_class cls, int64_t coarse_blocks) {
+static int64_t selector_rescue_refine_blocks(int64_t nb_total, selector_tensor_class cls, int64_t coarse_blocks) {
     const int64_t mult = SELECTOR_RESCUE_NVFP4_REFINE_MULT;
-    const int64_t max_blocks = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_MAX_BLOCKS", 32768);
+    const int64_t max_blocks = selector_control_i64("RESCUE_NVFP4_REFINE_MAX_BLOCKS", 32768);
     int64_t min_blocks = SELECTOR_RESCUE_NVFP4_REFINE_MIN_BLOCKS;
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:
-        case nvfp4_selector_tensor_class::ATTN_OUT:
-        case nvfp4_selector_tensor_class::SSM:
+        case selector_tensor_class::ATTN_QKV:
+        case selector_tensor_class::ATTN_OUT:
+        case selector_tensor_class::SSM:
             min_blocks = std::max<int64_t>(min_blocks, 16384);
             break;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:
+        case selector_tensor_class::EXPERT_UP_GATE:
+        case selector_tensor_class::EXPERT_DOWN:
             min_blocks = std::max<int64_t>(min_blocks, 32768);
             break;
         default:
@@ -5733,18 +5940,18 @@ static int64_t nvfp4_selector_rescue_refine_blocks(int64_t nb_total, nvfp4_selec
     return std::min<int64_t>(nb_total, std::max<int64_t>(1, std::min<int64_t>(target, max_blocks)));
 }
 
-static int64_t nvfp4_selector_rescue_guard_blocks(int64_t nb_total, nvfp4_selector_tensor_class cls, int64_t refine_blocks) {
+static int64_t selector_rescue_guard_blocks(int64_t nb_total, selector_tensor_class cls, int64_t refine_blocks) {
     const int64_t mult = SELECTOR_RESCUE_NVFP4_GUARD_MULT;
-    const int64_t max_blocks = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_MAX_BLOCKS", 32768);
+    const int64_t max_blocks = selector_control_i64("RESCUE_NVFP4_GUARD_MAX_BLOCKS", 32768);
     int64_t min_blocks = SELECTOR_RESCUE_NVFP4_GUARD_MIN_BLOCKS;
     switch (cls) {
-        case nvfp4_selector_tensor_class::ATTN_QKV:
-        case nvfp4_selector_tensor_class::ATTN_OUT:
-        case nvfp4_selector_tensor_class::SSM:
+        case selector_tensor_class::ATTN_QKV:
+        case selector_tensor_class::ATTN_OUT:
+        case selector_tensor_class::SSM:
             min_blocks = std::max<int64_t>(min_blocks, 32768);
             break;
-        case nvfp4_selector_tensor_class::EXPERT_UP_GATE:
-        case nvfp4_selector_tensor_class::EXPERT_DOWN:
+        case selector_tensor_class::EXPERT_UP_GATE:
+        case selector_tensor_class::EXPERT_DOWN:
             min_blocks = std::max<int64_t>(min_blocks, 65536);
             break;
         default:
@@ -5754,33 +5961,31 @@ static int64_t nvfp4_selector_rescue_guard_blocks(int64_t nb_total, nvfp4_select
     return std::min<int64_t>(nb_total, std::max<int64_t>(1, std::min<int64_t>(target, max_blocks)));
 }
 
-static std::vector<nvfp4_selector_policy> nvfp4_selector_rescue_policies(
+static std::vector<selector_policy> selector_rescue_policies(
     const nvfp4_cuda_runtime_cfg & base_cfg,
-    nvfp4_selector_tensor_class cls) {
-    std::vector<nvfp4_selector_policy> out;
-    const int rsf_mode = nvfp4_selector_effective_rsf_mode(&base_cfg);
-    const int rsf_depth = nvfp4_selector_effective_rsf_depth(&base_cfg);
-    nvfp4_selector_push_policy_unique(out, "rescue_base",
-        nvfp4_selector_cfg_as_rsf(base_cfg, rsf_mode, rsf_depth));
+    selector_tensor_class cls) {
+    std::vector<selector_policy> out;
+    const int rsf_mode = selector_effective_rsf_mode(&base_cfg);
+    const int rsf_depth = selector_effective_rsf_depth(&base_cfg);
+    selector_push_policy_unique(out, "rescue_base",
+        selector_cfg_as_rsf(base_cfg, rsf_mode, rsf_depth));
 
     const int rescue_budget = (int) std::max<int64_t>(
         8,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_POLICY_BUDGET",
-            SELECTOR_RESCUE_NVFP4_POLICY_BUDGET));
+        selector_control_i64("RESCUE_NVFP4_POLICY_BUDGET", SELECTOR_RESCUE_NVFP4_POLICY_BUDGET));
     auto add = [&](const std::string & name, nvfp4_cuda_runtime_cfg cfg) {
         if ((int) out.size() >= rescue_budget) {
             return;
         }
-        cfg = nvfp4_selector_cfg_without_rsf(cfg);
+        cfg = selector_cfg_without_rsf(cfg);
         cfg.refit_iters = std::max(2, std::min(32, cfg.refit_iters));
         cfg.cap_m6 = std::clamp(cfg.cap_m6, 256.0f, 544.0f);
         cfg.cap_m4 = std::clamp(cfg.cap_m4, 160.0f, 352.0f);
-        cfg = nvfp4_selector_cfg_as_rsf(cfg, rsf_mode, rsf_depth);
-        nvfp4_selector_push_policy_unique(out, name, cfg);
+        cfg = selector_cfg_as_rsf(cfg, rsf_mode, rsf_depth);
+        selector_push_policy_unique(out, name, cfg);
     };
 
-    const auto refits = nvfp4_selector_refit_candidates_for_class(cls, base_cfg.refit_iters);
+    const auto refits = selector_refit_candidates_for_class(cls, base_cfg.refit_iters);
 
     for (int refit : refits) {
         if (refit != base_cfg.refit_iters) {
@@ -5801,8 +6006,8 @@ static std::vector<nvfp4_selector_policy> nvfp4_selector_rescue_policies(
     return out;
 }
 
-static bool nvfp4_selector_find_tensor_rescue_cfg(
-    const nvfp4_selector_binding & binding,
+static bool selector_find_tensor_rescue_cfg(
+    const selector_binding & binding,
     const nvfp4_cuda_runtime_cfg & base_cfg,
     int nthread,
     nvfp4_cuda_runtime_cfg & out_cfg,
@@ -5810,18 +6015,18 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
     int64_t & out_sample_blocks,
     double & out_base_score,
     double & out_best_score) {
-    const int64_t nb_total = (binding.source->ne[0] * binding.source->ne[1]) / NVFP4_SELECTOR_BLOCK_SIZE;
-    const int64_t sample_blocks = nvfp4_selector_rescue_sample_blocks(nb_total, binding.cls);
-    const int64_t refine_blocks = nvfp4_selector_rescue_refine_blocks(nb_total, binding.cls, sample_blocks);
-    const int64_t guard_blocks  = nvfp4_selector_rescue_guard_blocks(nb_total, binding.cls, refine_blocks);
+    const int64_t nb_total = (binding.source->ne[0] * binding.source->ne[1]) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+    const int64_t sample_blocks = selector_rescue_sample_blocks(nb_total, binding.cls);
+    const int64_t refine_blocks = selector_rescue_refine_blocks(nb_total, binding.cls, sample_blocks);
+    const int64_t guard_blocks  = selector_rescue_guard_blocks(nb_total, binding.cls, refine_blocks);
     const int phase_count =
-        (binding.cls == nvfp4_selector_tensor_class::EXPERT_UP_GATE || binding.cls == nvfp4_selector_tensor_class::EXPERT_DOWN ||
-         binding.cls == nvfp4_selector_tensor_class::ATTN_QKV || binding.cls == nvfp4_selector_tensor_class::ATTN_OUT ||
-         binding.cls == nvfp4_selector_tensor_class::SSM) ? 2 :
+        (binding.cls == selector_tensor_class::EXPERT_UP_GATE || binding.cls == selector_tensor_class::EXPERT_DOWN ||
+         binding.cls == selector_tensor_class::ATTN_QKV || binding.cls == selector_tensor_class::ATTN_OUT ||
+         binding.cls == selector_tensor_class::SSM) ? 2 :
         1;
     const double phase_tail_weight = SELECTOR_RESCUE_NVFP4_PHASE_TAIL_WEIGHT;
-    const int64_t phase_stride = nvfp4_selector_sample_phase_stride(nb_total, binding.cls);
-    auto policies = nvfp4_selector_rescue_policies(base_cfg, binding.cls);
+    const int64_t phase_stride = selector_sample_phase_stride(nb_total, binding.cls);
+    auto policies = selector_rescue_policies(base_cfg, binding.cls);
     if (policies.empty()) {
         return false;
     }
@@ -5837,7 +6042,7 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
         double score = std::numeric_limits<double>::infinity();
     };
 
-    auto score_policy = [&](const nvfp4_selector_policy & policy, int64_t blocks, std::vector<uint8_t> & tmp_bytes, double & score_out) -> bool {
+    auto score_policy = [&](const selector_policy & policy, int64_t blocks, std::vector<uint8_t> & tmp_bytes, double & score_out) -> bool {
         double phase_sum = 0.0;
         double phase_worst = 0.0;
         int phases_done = 0;
@@ -5852,8 +6057,8 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
             if (!nvfp4_selector_quantize_binding(binding, policy.cfg, nthread, tmp_bytes, sum_sq, sum_abs, max_abs, count, blocks, sample_phase) || count <= 0) {
                 return false;
             }
-            const nvfp4_selector_proxy_metrics phase_metrics =
-                nvfp4_selector_proxy_score(sum_sq, sum_abs, max_abs, count);
+            const selector_proxy_metrics phase_metrics =
+                selector_proxy_score(sum_sq, sum_abs, max_abs, count);
             if (!phase_metrics.ok) {
                 return false;
             }
@@ -5871,14 +6076,10 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
 
     const int refine_top = (int) std::max<int64_t>(
         1,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_TOP",
-            SELECTOR_RESCUE_NVFP4_REFINE_TOP));
+        selector_control_i64("RESCUE_NVFP4_REFINE_TOP", SELECTOR_RESCUE_NVFP4_REFINE_TOP));
     const int guard_top  = (int) std::max<int64_t>(
         1,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_TOP",
-            SELECTOR_RESCUE_NVFP4_GUARD_TOP));
+        selector_control_i64("RESCUE_NVFP4_GUARD_TOP", SELECTOR_RESCUE_NVFP4_GUARD_TOP));
 
     std::vector<uint8_t> tmp_bytes;
     std::vector<scored_policy> coarse_ranked;
@@ -5889,7 +6090,7 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
             continue;
         }
         coarse_ranked.push_back({ i, score });
-        if (nvfp4_selector_cfg_equal(policies[i].cfg, base_cfg)) {
+        if (selector_cfg_equal(policies[i].cfg, base_cfg)) {
             out_base_score = score;
         }
         if (score < out_best_score) {
@@ -5926,7 +6127,7 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
             maybe_push_refine(coarse_ranked[(size_t) i].index);
         }
         for (size_t i = 0; i < policies.size(); ++i) {
-            if (nvfp4_selector_cfg_equal(policies[i].cfg, base_cfg)) {
+            if (selector_cfg_equal(policies[i].cfg, base_cfg)) {
                 maybe_push_refine(i);
                 break;
             }
@@ -5942,7 +6143,7 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
             out_cfg = policies[coarse_ranked.front().index].cfg;
             out_policy_name = policies[coarse_ranked.front().index].name;
             for (const auto & ranked : coarse_ranked) {
-                if (nvfp4_selector_cfg_equal(policies[ranked.index].cfg, base_cfg)) {
+                if (selector_cfg_equal(policies[ranked.index].cfg, base_cfg)) {
                     out_base_score = ranked.score;
                     break;
                 }
@@ -5968,7 +6169,7 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
             maybe_push_guard(coarse_ranked[(size_t) i].index);
         }
         for (size_t i = 0; i < policies.size(); ++i) {
-            if (nvfp4_selector_cfg_equal(policies[i].cfg, base_cfg)) {
+            if (selector_cfg_equal(policies[i].cfg, base_cfg)) {
                 maybe_push_guard(i);
                 break;
             }
@@ -5983,7 +6184,7 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
             out_cfg = policies[guard_ranked.front().index].cfg;
             out_policy_name = policies[guard_ranked.front().index].name;
             for (const auto & ranked : guard_ranked) {
-                if (nvfp4_selector_cfg_equal(policies[ranked.index].cfg, base_cfg)) {
+                if (selector_cfg_equal(policies[ranked.index].cfg, base_cfg)) {
                     out_base_score = ranked.score;
                     break;
                 }
@@ -5998,19 +6199,19 @@ static bool nvfp4_selector_find_tensor_rescue_cfg(
     return std::isfinite(out_best_score);
 }
 
-static bool nvfp4_selector_choose_policy(
+static bool selector_choose_policy(
     const std::string & source_model_path,
     const std::string & checkpoint_model_path,
     const std::unordered_map<std::string, std::vector<float>> & imatrix_data,
     int nthread,
-    const nvfp4_selector_kld_subset & kld,
-    const nvfp4_selector_kld_subset * kld_holdout,
+    const selector_kld_subset & kld,
+    const selector_kld_subset * kld_holdout,
     const selector_rank_config & rank_cfg,
     const nvfp4_cuda_runtime_cfg * recipe_cfg,
     const std::string & recipe_policy_name,
     int32_t nvfp4_input_scale_policy,
     int32_t selector_eval_batch_override,
-    int32_t nvfp4_autotune_threads,
+    int32_t nvfp4_encoder_threads,
     nvfp4_cuda_runtime_cfg & out_cfg,
     std::string & out_name,
         bool * out_kept_seed,
@@ -6019,7 +6220,7 @@ static bool nvfp4_selector_choose_policy(
     if (out_kept_seed != nullptr) {
         *out_kept_seed = false;
     }
-    nvfp4_selector_progress_heartbeat full_quant_eta("full_quant_eta");
+    selector_progress_heartbeat full_quant_eta("full_quant_eta");
     int64_t full_quant_eta_done = 0;
     int64_t full_quant_eta_total = 0;
     int64_t stageb_policy_total = 0;
@@ -6068,16 +6269,16 @@ static bool nvfp4_selector_choose_policy(
                 --remaining_policies;
             }
             remaining_s += (double) remaining_policies * avg_policy_s;
-            return nvfp4_selector_format_duration(remaining_s) + " avg_measured_policy";
+            return selector_format_duration(remaining_s) + " avg_measured_policy";
         }
         if (stageb_policy_active && stageb_policy_active_estimated_total_seconds > 0.0 && remaining_policies > 0) {
             double remaining_s = std::max(0.0, stageb_policy_active_estimated_total_seconds - active_s);
             --remaining_policies;
             remaining_s += (double) remaining_policies * stageb_policy_active_estimated_total_seconds;
-            return "~" + nvfp4_selector_format_duration(remaining_s) + " rough_active_progress";
+            return "~" + selector_format_duration(remaining_s) + " rough_active_progress";
         }
         if (stageb_policy_active && active_s > 0.0 && remaining_policies > 0) {
-            return ">=" + nvfp4_selector_format_duration(active_s * (double) remaining_policies) + " active_policy";
+            return ">=" + selector_format_duration(active_s * (double) remaining_policies) + " active_policy";
         }
         return "warming-up";
     };
@@ -6095,7 +6296,7 @@ static bool nvfp4_selector_choose_policy(
                     stageb_policy_eta_done,
                     stageb_policy_active_index,
                     stageb_policy_total,
-                    nvfp4_selector_format_duration(stageb_policy_active_estimated_total_seconds).c_str(),
+                    selector_format_duration(stageb_policy_active_estimated_total_seconds).c_str(),
                     stageb_policy_active_estimate_basis.c_str(),
                     stageb_policy_active_name.c_str());
             } else {
@@ -6148,16 +6349,16 @@ static bool nvfp4_selector_choose_policy(
     };
     update_full_quant_eta("selector-setup", true);
 
-    nvfp4_selector_ledger selector_ledger(quantize_control_string("LLAMA_NVFP4_SELECTOR_LEDGER_FILE"));
-    selector_ledger.load_local_metrics();
+    selector_ledger ledger(selector_control_string("LEDGER_FILE"));
+    ledger.load_local_metrics();
     const bool selector_tensor_plan_enabled =
         out_tensor_overrides != nullptr &&
-        quantize_control_i64("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", 1) != 0;
+        selector_control_i64("TENSOR_POLICY_MAP", 1) != 0;
     const bool selector_fresh_tensor_plan =
         selector_tensor_plan_enabled &&
-        !quantize_control_has("LLAMA_NVFP4_SELECTOR_CHECKPOINT_MODEL");
+        !selector_control_has("CHECKPOINT_MODEL");
 
-    selector_ledger.append_context("selector_setup", {
+    ledger.append_context("selector_setup", {
         {"source_model", source_model_path},
         {"checkpoint_model", checkpoint_model_path},
         {"nthread", nthread},
@@ -6166,11 +6367,11 @@ static bool nvfp4_selector_choose_policy(
     });
 
     const int eval_top_default = selector_fresh_tensor_plan ? 0 : 16;
-    const int eval_top = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_EVAL_TOP", eval_top_default));
+    const int eval_top = (int) std::max<int64_t>(0, selector_control_i64("EVAL_TOP", eval_top_default));
     const bool want_measured_eval_requested = eval_top > 0 || selector_fresh_tensor_plan;
-    const bool want_measured_eval = want_measured_eval_requested && quantize_control_i64("LLAMA_NVFP4_SELECTOR_ENABLE_EVAL", 0) != 0;
-    const bool require_runtime_cache = quantize_control_i64("LLAMA_NVFP4_SELECTOR_REQUIRE_RUNTIME_CACHE", 0) != 0;
-    nvfp4_selector_stageb_digest imatrix_digest;
+    const bool want_measured_eval = want_measured_eval_requested && selector_control_i64("ENABLE_EVAL", 0) != 0;
+    const bool require_runtime_cache = selector_control_i64("REQUIRE_RUNTIME_CACHE", 0) != 0;
+    selector_stageb_digest imatrix_digest;
     std::vector<std::string> imatrix_keys;
     imatrix_keys.reserve(imatrix_data.size());
     for (const auto & kv : imatrix_data) {
@@ -6236,21 +6437,21 @@ static bool nvfp4_selector_choose_policy(
         return false;
     }
 
-    const int32_t n_layer = nvfp4_selector_detect_n_layer(seed_tmap);
-    std::vector<std::string> tensor_names = nvfp4_selector_build_stress_tensors(seed_tmap, n_layer);
-    const int64_t max_tensors = std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_MAX_TENSORS", 24));
+    const int32_t n_layer = selector_detect_n_layer(seed_tmap);
+    std::vector<std::string> tensor_names = selector_build_stress_tensors(seed_tmap, n_layer);
+    const int64_t max_tensors = std::max<int64_t>(1, selector_control_i64("MAX_TENSORS", 24));
     if ((int64_t) tensor_names.size() > max_tensors) {
         tensor_names.resize((size_t) max_tensors);
     }
 
     std::unordered_set<std::string> stress_name_set(tensor_names.begin(), tensor_names.end());
-    std::vector<nvfp4_selector_binding> all_bindings;
+    std::vector<selector_binding> all_bindings;
     all_bindings.reserve(seed_tmap.size());
-    std::vector<nvfp4_selector_binding> mxfp6_bindings;
+    std::vector<selector_binding> mxfp6_bindings;
     mxfp6_bindings.reserve(seed_tmap.size());
     std::vector<size_t> stress_binding_indices;
     const float selector_correction_denom =
-        (float) quantize_control_f64("LLAMA_NVFP4_SELECTOR_CORRECTION_DENOM", NVFP4_SELECTOR_CORRECTION_DENOM_DEFAULT);
+        (float) selector_control_f64("CORRECTION_DENOM", NVFP4_SELECTOR_CORRECTION_DENOM_DEFAULT);
     for (const auto & kv : seed_tmap) {
         const std::string & tname = kv.first;
         ggml_tensor * target_tensor = kv.second;
@@ -6270,14 +6471,14 @@ static bool nvfp4_selector_choose_policy(
             imatrix_row = it->second.data();
         }
 
-        nvfp4_selector_binding b;
+        selector_binding b;
         b.name = tname;
-        b.cls = nvfp4_selector_classify_tensor(tname);
-        if (b.cls == nvfp4_selector_tensor_class::EMBEDDING_OUTPUT) {
+        b.cls = selector_classify_tensor(tname);
+        if (b.cls == selector_tensor_class::EMBEDDING_OUTPUT) {
             continue;
         }
-        b.layer = nvfp4_selector_parse_layer(tname);
-        b.bucket = nvfp4_selector_layer_bucket(b.layer, n_layer);
+        b.layer = selector_parse_layer(tname);
+        b.bucket = selector_layer_bucket(b.layer, n_layer);
         b.target = target_tensor;
         if (is_mxfp6_target) {
             const std::string scale_name = llama_nvfp4_scale_tensor_name(tname);
@@ -6335,7 +6536,7 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
-    nvfp4_selector_restore_counters runtime_restore_counters;
+    selector_restore_counters runtime_restore_counters;
     auto restore_all = [&]() {
         if (!want_measured_eval) {
             return;
@@ -6399,15 +6600,15 @@ static bool nvfp4_selector_choose_policy(
         all_binding_indices.push_back(i);
     }
 
-    selector_ledger.append_context("selector_bindings_loaded", {
+    ledger.append_context("selector_bindings_loaded", {
         {"source_model", source_model_path},
         {"checkpoint_model", checkpoint_model_path},
         {"imatrix", {
             {"entries", imatrix_data.size()},
             {"hash", imatrix_hash},
         }},
-        {"search_kld", nvfp4_selector_stageb_kld_json(kld)},
-        {"validation_kld", kld_holdout != nullptr ? nvfp4_selector_stageb_kld_json(*kld_holdout) : nlohmann::ordered_json(nullptr)},
+        {"search_kld", selector_stageb_kld_json(kld)},
+        {"validation_kld", kld_holdout != nullptr ? selector_stageb_kld_json(*kld_holdout) : nlohmann::ordered_json(nullptr)},
         {"eval", {
             {"enabled", want_measured_eval},
             {"requested", want_measured_eval_requested},
@@ -6444,7 +6645,7 @@ static bool nvfp4_selector_choose_policy(
             const char * phase,
             const std::string & policy_name,
             const nvfp4_cuda_runtime_cfg & cfg,
-            const nvfp4_selector_binding & binding,
+            const selector_binding & binding,
             int64_t sample_blocks_requested,
             int64_t sample_phase) {
         nlohmann::ordered_json key = nlohmann::ordered_json::object();
@@ -6456,7 +6657,7 @@ static bool nvfp4_selector_choose_policy(
         key["imatrix_hash"] = imatrix_hash;
         key["phase"] = phase != nullptr ? phase : "";
         key["policy"] = policy_name;
-        key["policy_cfg"] = nvfp4_selector_stageb_cfg_json(cfg);
+        key["policy_cfg"] = selector_stageb_cfg_json(cfg);
         key["tensor"] = binding.name;
         key["source_type"] = binding.source != nullptr ? ggml_type_name(binding.source->type) : "unknown";
         key["target_type"] = binding.target != nullptr ? ggml_type_name(binding.target->type) : "unknown";
@@ -6469,9 +6670,9 @@ static bool nvfp4_selector_choose_policy(
 
     auto emit_selector_local_metric = [&](
             const char * phase,
-            const nvfp4_selector_policy & policy,
-            const nvfp4_selector_binding & binding,
-            const nvfp4_selector_rsf_tensor_record & rsf_record,
+            const selector_policy & policy,
+            const selector_binding & binding,
+            const selector_rsf_tensor_record & rsf_record,
             const nvfp4_cuda_runtime_cfg & cfg,
             int64_t sample_blocks_requested,
             int64_t sample_phase,
@@ -6482,18 +6683,18 @@ static bool nvfp4_selector_choose_policy(
         if (tensor_n <= 0) {
             return;
         }
-        const nvfp4_selector_proxy_metrics proxy_metrics =
-            nvfp4_selector_proxy_score(tensor_sq, tensor_abs, tensor_max, tensor_n);
+        const selector_proxy_metrics proxy_metrics =
+            selector_proxy_score(tensor_sq, tensor_abs, tensor_max, tensor_n);
 
         nlohmann::ordered_json row = nlohmann::ordered_json::object();
         row["phase"] = phase != nullptr ? phase : "";
         row["objective"] = "weight_reconstruction_sampled";
         row["policy"] = policy.name;
-        row["policy_cfg"] = nvfp4_selector_stageb_cfg_json(cfg);
+        row["policy_cfg"] = selector_stageb_cfg_json(cfg);
         row["key"] = selector_local_metric_key(
             phase, policy.name, cfg, binding, sample_blocks_requested, sample_phase);
         row["tensor"] = binding.name;
-        row["class"] = nvfp4_selector_tensor_class_name(binding.cls);
+        row["class"] = selector_tensor_class_name(binding.cls);
         row["bucket"] = binding.bucket;
         row["layer"] = binding.layer;
         row["source_type"] = binding.source != nullptr ? ggml_type_name(binding.source->type) : "unknown";
@@ -6501,7 +6702,7 @@ static bool nvfp4_selector_choose_policy(
         row["source_nbytes"] = binding.source_nbytes;
         row["target_nbytes"] = binding.target_nbytes;
         row["sample_blocks_requested"] = sample_blocks_requested;
-        row["sample_blocks_evaluated"] = (tensor_n + NVFP4_SELECTOR_BLOCK_SIZE - 1) / NVFP4_SELECTOR_BLOCK_SIZE;
+        row["sample_blocks_evaluated"] = (tensor_n + SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE - 1) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
         row["sample_phase"] = sample_phase;
         row["count"] = tensor_n;
         row["sum_sq"] = tensor_sq;
@@ -6528,17 +6729,17 @@ static bool nvfp4_selector_choose_policy(
             rsf["scale_mul_max"] = *minmax.second;
         }
         row["rsf"] = std::move(rsf);
-        selector_ledger.append_tensor_local_metric(std::move(row));
+        ledger.append_tensor_local_metric(std::move(row));
     };
 
-    auto score_proxy_policy = [&](nvfp4_selector_policy & policy, const std::vector<size_t> & binding_indices) -> bool {
+    auto score_proxy_policy = [&](selector_policy & policy, const std::vector<size_t> & binding_indices) -> bool {
         restore_all();
         double sum_sq = 0.0;
         double sum_abs = 0.0;
         double max_abs = 0.0;
         int64_t count = 0;
         const int64_t stagea_default_sample_blocks = want_measured_eval ? 2048 : 0;
-        const int64_t stagea_sample_blocks = std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", stagea_default_sample_blocks));
+        const int64_t stagea_sample_blocks = std::max<int64_t>(0, selector_control_i64("STAGEA_SAMPLE_BLOCKS", stagea_default_sample_blocks));
         policy.proxy_rejected = false;
         if (binding_indices.empty()) {
             policy.proxy_rmse = 0.0;
@@ -6566,10 +6767,10 @@ static bool nvfp4_selector_choose_policy(
         const int default_policy_threads = std::max<int>(1, nthread / 4);
         const int policy_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
             (int64_t) binding_indices.size(),
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", default_policy_threads)));
+            selector_control_i64("POLICY_THREADS", default_policy_threads)));
         const int binding_nthread = std::max(1, nthread / std::max(1, policy_threads));
         std::vector<binding_score> binding_scores(binding_indices.size());
-        std::vector<nvfp4_selector_rsf_tensor_record> tensor_records(binding_indices.size());
+        std::vector<selector_rsf_tensor_record> tensor_records(binding_indices.size());
         for (size_t ib = 0; ib < binding_indices.size(); ++ib) {
             const auto & b = all_bindings[binding_indices[ib]];
             tensor_records[ib].tensor = b.name;
@@ -6580,7 +6781,7 @@ static bool nvfp4_selector_choose_policy(
         }
         const bool may_use_cached_local_metrics = !(want_measured_eval && stagea_sample_blocks <= 0);
         std::atomic<size_t> ledger_hits{0};
-        auto apply_cached_local_metric = [&](size_t ib, const nvfp4_selector_ledger::local_metric & cached) {
+        auto apply_cached_local_metric = [&](size_t ib, const selector_ledger::local_metric & cached) {
             auto & bs = binding_scores[ib];
             auto & rsf = tensor_records[ib];
             bs.cached = true;
@@ -6605,10 +6806,10 @@ static bool nvfp4_selector_choose_policy(
             for (size_t ib = 0; ib < binding_indices.size(); ++ib) {
                 auto & b = all_bindings[binding_indices[ib]];
                 std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes;
-                nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
-                nvfp4_selector_ledger::local_metric cached;
+                selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                selector_ledger::local_metric cached;
                 const auto key = selector_local_metric_key("stage-a", policy.name, policy.cfg, b, stagea_sample_blocks, 0);
-                if (may_use_cached_local_metrics && selector_ledger.find_local_metric(key, cached)) {
+                if (may_use_cached_local_metrics && ledger.find_local_metric(key, cached)) {
                     apply_cached_local_metric(ib, cached);
                     continue;
                 }
@@ -6633,10 +6834,10 @@ static bool nvfp4_selector_choose_policy(
                         }
                         auto & b = all_bindings[binding_indices[ib]];
                         std::vector<uint8_t> & quant_bytes = want_measured_eval ? b.working_target_bytes : tmp_bytes_local;
-                        nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
-                        nvfp4_selector_ledger::local_metric cached;
+                        selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                        selector_ledger::local_metric cached;
                         const auto key = selector_local_metric_key("stage-a", policy.name, policy.cfg, b, stagea_sample_blocks, 0);
-                        if (may_use_cached_local_metrics && selector_ledger.find_local_metric(key, cached)) {
+                        if (may_use_cached_local_metrics && ledger.find_local_metric(key, cached)) {
                             apply_cached_local_metric(ib, cached);
                             continue;
                         }
@@ -6673,8 +6874,8 @@ static bool nvfp4_selector_choose_policy(
             max_abs = std::max(max_abs, bs.tensor_max);
             count += bs.tensor_n;
             if (bs.tensor_n > 0) {
-                const nvfp4_selector_proxy_metrics tensor_proxy =
-                    nvfp4_selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
+                const selector_proxy_metrics tensor_proxy =
+                    selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
                 tensor_records[ib].proxy_score = tensor_proxy.score;
                 if (!bs.cached) {
                     emit_selector_local_metric(
@@ -6698,8 +6899,8 @@ static bool nvfp4_selector_choose_policy(
             }
         }
 
-        const nvfp4_selector_proxy_metrics proxy_metrics =
-            nvfp4_selector_proxy_score(sum_sq, sum_abs, max_abs, count);
+        const selector_proxy_metrics proxy_metrics =
+            selector_proxy_score(sum_sq, sum_abs, max_abs, count);
         if (proxy_metrics.ok) {
             policy.proxy_rmse = proxy_metrics.rmse;
             policy.proxy_abs_mean = proxy_metrics.abs_mean;
@@ -6728,7 +6929,7 @@ static bool nvfp4_selector_choose_policy(
         return true;
     };
 
-    auto score_proxy_policy_extended = [&](nvfp4_selector_policy & policy,
+    auto score_proxy_policy_extended = [&](selector_policy & policy,
                                           const std::vector<size_t> & binding_indices,
                                           int64_t sample_blocks_override,
                                           bool store_survey,
@@ -6779,10 +6980,10 @@ static bool nvfp4_selector_choose_policy(
         const int default_policy_threads = std::max<int>(1, nthread / 4);
         const int policy_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
             (int64_t) binding_indices.size(),
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", default_policy_threads)));
+            selector_control_i64("POLICY_THREADS", default_policy_threads)));
         const int binding_nthread = std::max(1, nthread / std::max(1, policy_threads));
         std::vector<binding_score> binding_scores(binding_indices.size());
-        std::vector<nvfp4_selector_rsf_tensor_record> tensor_records(binding_indices.size());
+        std::vector<selector_rsf_tensor_record> tensor_records(binding_indices.size());
         for (size_t ib = 0; ib < binding_indices.size(); ++ib) {
             const auto & b = all_bindings[binding_indices[ib]];
             tensor_records[ib].tensor = b.name;
@@ -6792,7 +6993,7 @@ static bool nvfp4_selector_choose_policy(
             tensor_records[ib].layer = b.layer;
         }
         std::atomic<size_t> ledger_hits{0};
-        auto apply_cached_local_metric = [&](size_t ib, const nvfp4_selector_ledger::local_metric & cached) {
+        auto apply_cached_local_metric = [&](size_t ib, const selector_ledger::local_metric & cached) {
             auto & bs = binding_scores[ib];
             auto & rsf = tensor_records[ib];
             bs.cached = true;
@@ -6817,10 +7018,10 @@ static bool nvfp4_selector_choose_policy(
             for (size_t ib = 0; ib < binding_indices.size(); ++ib) {
                 auto & b = all_bindings[binding_indices[ib]];
                 std::vector<uint8_t> & quant_bytes = materializes_full_policy ? b.working_target_bytes : tmp_bytes;
-                nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
-                nvfp4_selector_ledger::local_metric cached;
+                selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                selector_ledger::local_metric cached;
                 const auto key = selector_local_metric_key(label, policy.name, proxy_cfg, b, sample_blocks_override, 0);
-                if (proxy_only && selector_ledger.find_local_metric(key, cached)) {
+                if (proxy_only && ledger.find_local_metric(key, cached)) {
                     apply_cached_local_metric(ib, cached);
                     continue;
                 }
@@ -6845,10 +7046,10 @@ static bool nvfp4_selector_choose_policy(
                         }
                         auto & b = all_bindings[binding_indices[ib]];
                         std::vector<uint8_t> & quant_bytes = materializes_full_policy ? b.working_target_bytes : tmp_bytes_local;
-                        nvfp4_selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
-                        nvfp4_selector_ledger::local_metric cached;
+                        selector_rsf_tensor_record * rsf_record = &tensor_records[ib];
+                        selector_ledger::local_metric cached;
                         const auto key = selector_local_metric_key(label, policy.name, proxy_cfg, b, sample_blocks_override, 0);
-                        if (proxy_only && selector_ledger.find_local_metric(key, cached)) {
+                        if (proxy_only && ledger.find_local_metric(key, cached)) {
                             apply_cached_local_metric(ib, cached);
                             continue;
                         }
@@ -6885,8 +7086,8 @@ static bool nvfp4_selector_choose_policy(
             max_abs = std::max(max_abs, bs.tensor_max);
             count += bs.tensor_n;
             if (bs.tensor_n > 0) {
-                const nvfp4_selector_proxy_metrics tensor_proxy =
-                    nvfp4_selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
+                const selector_proxy_metrics tensor_proxy =
+                    selector_proxy_score(bs.tensor_sq, bs.tensor_abs, bs.tensor_max, bs.tensor_n);
                 tensor_records[ib].proxy_score = tensor_proxy.score;
                 if (!bs.cached) {
                     emit_selector_local_metric(
@@ -6905,8 +7106,8 @@ static bool nvfp4_selector_choose_policy(
             }
         }
 
-        const nvfp4_selector_proxy_metrics proxy_metrics =
-            nvfp4_selector_proxy_score(sum_sq, sum_abs, max_abs, count);
+        const selector_proxy_metrics proxy_metrics =
+            selector_proxy_score(sum_sq, sum_abs, max_abs, count);
         if (proxy_metrics.ok) {
             if (store_survey) {
                 policy.has_survey = true;
@@ -6947,7 +7148,7 @@ static bool nvfp4_selector_choose_policy(
         return true;
     };
 
-    auto reject_policy = [&](nvfp4_selector_policy & policy, const char * phase) {
+    auto reject_policy = [&](selector_policy & policy, const char * phase) {
         restore_all();
         policy.proxy_score = std::numeric_limits<double>::infinity();
         policy.proxy_rmse = std::numeric_limits<double>::infinity();
@@ -6965,7 +7166,7 @@ static bool nvfp4_selector_choose_policy(
         if (skip_remaining_tuning) {
             return true;
         }
-        if (!nvfp4_selector_skip_requested(phase)) {
+        if (!selector_skip_requested(phase)) {
             return false;
         }
         skip_remaining_tuning = true;
@@ -6976,20 +7177,19 @@ static bool nvfp4_selector_choose_policy(
         return true;
     };
 
-    const int selector_rsf_mode = nvfp4_selector_effective_rsf_mode(recipe_cfg);
-    const int selector_rsf_depth = nvfp4_selector_effective_rsf_depth(recipe_cfg);
-    auto policies = nvfp4_selector_default_policies(recipe_cfg, recipe_policy_name);
-    const bool has_expert_bindings = std::any_of(all_bindings.begin(), all_bindings.end(), [](const nvfp4_selector_binding & b) {
+    const int selector_rsf_mode = selector_effective_rsf_mode(recipe_cfg);
+    const int selector_rsf_depth = selector_effective_rsf_depth(recipe_cfg);
+    auto policies = selector_default_policies(recipe_cfg, recipe_policy_name);
+    const bool has_expert_bindings = std::any_of(all_bindings.begin(), all_bindings.end(), [](const selector_binding & b) {
         return b.name.find(".ffn_gate_exps.weight") != std::string::npos ||
                b.name.find(".ffn_up_exps.weight") != std::string::npos ||
                b.name.find(".ffn_down_exps.weight") != std::string::npos;
     });
-    const bool include_moe_policies = quantize_control_i64(
-        "LLAMA_NVFP4_SELECTOR_INCLUDE_MOE_POLICIES", has_expert_bindings ? 1 : 0) != 0;
+    const bool include_moe_policies = selector_control_i64("INCLUDE_MOE_POLICIES", has_expert_bindings ? 1 : 0) != 0;
     if (!include_moe_policies) {
         const size_t before = policies.size();
-        policies.erase(std::remove_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
-            return !nvfp4_selector_policy_is_recipe(policy.name) &&
+        policies.erase(std::remove_if(policies.begin(), policies.end(), [](const selector_policy & policy) {
+            return !selector_policy_is_recipe(policy.name) &&
                    (policy.name.find("_moe") != std::string::npos ||
                     policy.name.find("moe_") != std::string::npos ||
                     policy.name.find("awq_tail_moe") != std::string::npos);
@@ -7002,15 +7202,15 @@ static bool nvfp4_selector_choose_policy(
         }
     }
     const std::unordered_set<std::string> include_policy_names =
-        selector_policy_set_from_control("LLAMA_NVFP4_SELECTOR_INCLUDE_POLICIES");
+        selector_policy_set_from_control("INCLUDE_POLICIES");
     const std::unordered_set<std::string> skip_policy_names =
-        selector_policy_set_from_control("LLAMA_NVFP4_SELECTOR_SKIP_POLICIES");
-    auto selector_policy_excluded_by_include = [&](const nvfp4_selector_policy & policy) {
+        selector_policy_set_from_control("SKIP_POLICIES");
+    auto selector_policy_excluded_by_include = [&](const selector_policy & policy) {
         return policy.name != "seed_keep" &&
                !include_policy_names.empty() &&
                include_policy_names.find(policy.name) == include_policy_names.end();
     };
-    auto selector_policy_skipped = [&](const nvfp4_selector_policy & policy) {
+    auto selector_policy_skipped = [&](const selector_policy & policy) {
         return policy.name != "seed_keep" &&
                (selector_policy_excluded_by_include(policy) ||
                 skip_policy_names.find(policy.name) != skip_policy_names.end());
@@ -7025,9 +7225,9 @@ static bool nvfp4_selector_choose_policy(
     }
     if (include_policy_names.empty()) {
         const size_t before = policies.size();
-        policies.erase(std::remove_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
-            return !nvfp4_selector_policy_is_recipe(policy.name) &&
-                   nvfp4_selector_policy_is_fixed_cap_sweep(policy.name);
+        policies.erase(std::remove_if(policies.begin(), policies.end(), [](const selector_policy & policy) {
+            return !selector_policy_is_recipe(policy.name) &&
+                   selector_policy_is_fixed_cap_sweep(policy.name);
         }), policies.end());
         if (before != policies.size()) {
             fprintf(stderr,
@@ -7036,15 +7236,15 @@ static bool nvfp4_selector_choose_policy(
                 before - policies.size());
         }
     }
-    const int stagea_max_policies = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", 0));
+    const int stagea_max_policies = (int) std::max<int64_t>(0, selector_control_i64("STAGEA_MAX_POLICIES", 0));
     if (stagea_max_policies > 0 && (int) policies.size() > stagea_max_policies) {
         const int awq_keep = std::min<int>(
             stagea_max_policies,
-            (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_AWQ_TOP", 0)));
+            (int) std::max<int64_t>(0, selector_control_i64("AWQ_TOP", 0)));
         if (awq_keep > 0) {
-            std::vector<nvfp4_selector_policy> limited;
+            std::vector<selector_policy> limited;
             limited.reserve((size_t) stagea_max_policies);
-            auto push_policy = [&](const nvfp4_selector_policy & policy) {
+            auto push_policy = [&](const selector_policy & policy) {
                 for (const auto & existing : limited) {
                     if (existing.name == policy.name) {
                         return false;
@@ -7062,7 +7262,7 @@ static bool nvfp4_selector_choose_policy(
                 if ((int) limited.size() >= primary_keep) {
                     break;
                 }
-                if (!nvfp4_selector_policy_is_awq_tail(policy.name)) {
+                if (!selector_policy_is_awq_tail(policy.name)) {
                     push_policy(policy);
                 }
             }
@@ -7071,7 +7271,7 @@ static bool nvfp4_selector_choose_policy(
                 if ((int) awq_added >= awq_keep) {
                     break;
                 }
-                if (nvfp4_selector_policy_is_awq_tail(policy.name)) {
+                if (selector_policy_is_awq_tail(policy.name)) {
                     if (push_policy(policy)) {
                         ++awq_added;
                     }
@@ -7119,10 +7319,10 @@ static bool nvfp4_selector_choose_policy(
     }
     note_skip_remaining("stage-a");
 
-    std::sort(policies.begin(), policies.end(), nvfp4_selector_policy_proxy_less);
+    std::sort(policies.begin(), policies.end(), selector_policy_proxy_less);
 
     if (!skip_remaining_tuning) {
-        auto refined = nvfp4_selector_refine_policies(policies, selector_rsf_mode, selector_rsf_depth);
+        auto refined = selector_refine_policies(policies, selector_rsf_mode, selector_rsf_depth);
         for (size_t policy_idx = 0; policy_idx < refined.size(); ++policy_idx) {
             auto & policy = refined[policy_idx];
             if (selector_policy_excluded_by_include(policy)) {
@@ -7150,7 +7350,7 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
-    auto baseline_it = std::find_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
+    auto baseline_it = std::find_if(policies.begin(), policies.end(), [](const selector_policy & policy) {
         return policy.name == "baseline";
     });
     if (baseline_it != policies.end() &&
@@ -7158,7 +7358,7 @@ static bool nvfp4_selector_choose_policy(
         baseline_it = policies.end();
     }
     if (baseline_it == policies.end()) {
-        baseline_it = std::find_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
+        baseline_it = std::find_if(policies.begin(), policies.end(), [](const selector_policy & policy) {
             return !policy.proxy_rejected && std::isfinite(policy.proxy_score);
         });
     }
@@ -7197,11 +7397,11 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
-    std::sort(policies.begin(), policies.end(), nvfp4_selector_policy_proxy_less);
+    std::sort(policies.begin(), policies.end(), selector_policy_proxy_less);
 
-    const int survey_top = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", 48));
-    const int64_t survey_sample_blocks = std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", 2048));
-    const bool dedup_survey = NVFP4_SELECTOR_DEDUP_SURVEY_DEFAULT;
+    const int survey_top = (int) std::max<int64_t>(1, selector_control_i64("SURVEY_TOP", 48));
+    const int64_t survey_sample_blocks = std::max<int64_t>(0, selector_control_i64("SURVEY_SAMPLE_BLOCKS", 2048));
+    const bool dedup_survey = SELECTOR_DEDUP_SURVEY_DEFAULT;
     std::vector<size_t> survey_policy_indices;
     survey_policy_indices.reserve((size_t) survey_top + 1);
     auto append_policy_index = [&](std::vector<size_t> & indices, size_t idx) {
@@ -7220,15 +7420,15 @@ static bool nvfp4_selector_choose_policy(
         indices.push_back(idx);
         return true;
     };
-    auto find_rsf_companion_index = [&](const nvfp4_selector_policy & policy) -> size_t {
-        const bool want_rsf = !nvfp4_selector_policy_is_rsf_family(policy);
-        const std::string base = nvfp4_selector_rsf_base_policy_name(policy.name);
+    auto find_rsf_companion_index = [&](const selector_policy & policy) -> size_t {
+        const bool want_rsf = !selector_policy_is_rsf_family(policy);
+        const std::string base = selector_rsf_base_policy_name(policy.name);
         for (size_t i = 0; i < policies.size(); ++i) {
-            const bool is_rsf = nvfp4_selector_policy_is_rsf_family(policies[i]);
+            const bool is_rsf = selector_policy_is_rsf_family(policies[i]);
             if (is_rsf != want_rsf) {
                 continue;
             }
-            if (nvfp4_selector_rsf_base_policy_name(policies[i].name) == base) {
+            if (selector_rsf_base_policy_name(policies[i].name) == base) {
                 return i;
             }
         }
@@ -7256,11 +7456,11 @@ static bool nvfp4_selector_choose_policy(
     };
     auto stable_sort_rsf_pairs = [&](std::vector<size_t> & indices) {
         std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            const std::string abase = nvfp4_selector_rsf_base_policy_name(policies[a].name);
-            const std::string bbase = nvfp4_selector_rsf_base_policy_name(policies[b].name);
+            const std::string abase = selector_rsf_base_policy_name(policies[a].name);
+            const std::string bbase = selector_rsf_base_policy_name(policies[b].name);
             if (abase == bbase) {
-                return !nvfp4_selector_policy_is_rsf_family(policies[a]) &&
-                       nvfp4_selector_policy_is_rsf_family(policies[b]);
+                return !selector_policy_is_rsf_family(policies[a]) &&
+                       selector_policy_is_rsf_family(policies[b]);
             }
             return false;
         });
@@ -7272,8 +7472,8 @@ static bool nvfp4_selector_choose_policy(
         for (size_t idx : indices) {
             bool duplicate = false;
             for (size_t selected : compact) {
-                if (nvfp4_selector_cfg_equal(policies[idx].cfg, policies[selected].cfg) ||
-                        nvfp4_selector_proxy_equivalent(policies[idx], policies[selected], prefer_survey)) {
+                if (selector_cfg_equal(policies[idx].cfg, policies[selected].cfg) ||
+                        selector_proxy_equivalent(policies[idx], policies[selected], prefer_survey)) {
                     duplicate = true;
                     break;
                 }
@@ -7304,7 +7504,7 @@ static bool nvfp4_selector_choose_policy(
         if (dedup_survey) {
             bool duplicate = false;
             for (size_t selected : survey_policy_indices) {
-                if (nvfp4_selector_proxy_equivalent(policies[i], policies[selected], false)) {
+                if (selector_proxy_equivalent(policies[i], policies[selected], false)) {
                     duplicate = true;
                     break;
                 }
@@ -7354,7 +7554,7 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
-    std::sort(policies.begin(), policies.end(), nvfp4_selector_policy_proxy_less);
+    std::sort(policies.begin(), policies.end(), selector_policy_proxy_less);
 
     fprintf(stderr,
         "%s: selector survey complete; shortlisted %zu policies for full-model proxy ranking, top policy=%s\n",
@@ -7362,7 +7562,7 @@ static bool nvfp4_selector_choose_policy(
         survey_policy_indices.size(),
         policies.empty() ? "<none>" : policies.front().name.c_str());
 
-    const bool dedup_eval = NVFP4_SELECTOR_DEDUP_EVAL_DEFAULT;
+    const bool dedup_eval = SELECTOR_DEDUP_EVAL_DEFAULT;
     const int64_t proxy_eval_top = std::max<int64_t>(0, eval_top);
     std::vector<size_t> eval_policy_indices;
     eval_policy_indices.reserve((size_t) std::max<int64_t>(0, eval_top) + 1);
@@ -7378,7 +7578,7 @@ static bool nvfp4_selector_choose_policy(
             if (dedup_eval) {
                 bool duplicate = false;
                 for (size_t selected : eval_policy_indices) {
-                    if (nvfp4_selector_proxy_equivalent(policies[i], policies[selected], true)) {
+                    if (selector_proxy_equivalent(policies[i], policies[selected], true)) {
                         duplicate = true;
                         break;
                     }
@@ -7437,8 +7637,8 @@ static bool nvfp4_selector_choose_policy(
         stageb_policy_active_index = 0;
         update_full_quant_eta(skip_remaining_tuning ? "selector-skipping-to-final-materialization" : "selector-proxy-only", true);
     }
-    const nvfp4_selector_kld_subset kld_budget = kld;
-    const std::unique_ptr<nvfp4_selector_kld_subset> holdout_budget;
+    const selector_kld_subset kld_budget = kld;
+    const std::unique_ptr<selector_kld_subset> holdout_budget;
     bool selector_cuda_memory_known = false;
     double selector_cuda_free_gib = 0.0;
     double selector_cuda_total_gib = 0.0;
@@ -7454,7 +7654,7 @@ static bool nvfp4_selector_choose_policy(
                 __func__,
                 (double) cuda_free / (1024.0 * 1024.0 * 1024.0),
                 (double) cuda_total / (1024.0 * 1024.0 * 1024.0));
-            if (nvfp4_selector_reset_cuda_device(0)) {
+            if (selector_reset_cuda_device(0)) {
                 ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
             }
         }
@@ -7465,9 +7665,9 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 #endif
-    const bool selector_n_seq_explicit = quantize_control_has("LLAMA_NVFP4_SELECTOR_N_SEQ");
-    const nvfp4_selector_logits_budget logits_budget = nvfp4_selector_default_logits_budget();
-    double max_logits_gib = std::max(NVFP4_SELECTOR_LOGITS_MIN_GIB, logits_budget.max_gib);
+    const bool selector_n_seq_explicit = selector_control_has("N_SEQ");
+    const selector_logits_budget logits_budget = selector_default_logits_budget();
+    double max_logits_gib = std::max(SELECTOR_LOGITS_MIN_GIB, logits_budget.max_gib);
     double cuda_reserve_gib = 0.0;
     if (selector_cuda_memory_known && selector_cuda_free_gib > 0.0 && std::isfinite(selector_cuda_free_gib)) {
         cuda_reserve_gib = std::min(
@@ -7476,7 +7676,7 @@ static bool nvfp4_selector_choose_policy(
                 SELECTOR_N_SEQ_CUDA_RESERVE_MIN_GIB,
                 selector_cuda_total_gib * SELECTOR_N_SEQ_CUDA_RESERVE_FRACTION));
         const double cuda_logits_gib =
-            std::max(NVFP4_SELECTOR_LOGITS_MIN_GIB, selector_cuda_free_gib - cuda_reserve_gib);
+            std::max(SELECTOR_LOGITS_MIN_GIB, selector_cuda_free_gib - cuda_reserve_gib);
         max_logits_gib = std::min(max_logits_gib, cuda_logits_gib);
     }
     const double logits_gib_per_seq =
@@ -7486,7 +7686,7 @@ static bool nvfp4_selector_choose_policy(
     if (logits_gib_per_seq > 0.0 && std::isfinite(logits_gib_per_seq)) {
         const int max_n_seq_by_logits = std::max(1, (int) std::floor(max_logits_gib / logits_gib_per_seq));
         if (selector_n_seq_explicit) {
-            selector_n_seq = (int) std::max<int64_t>(1, quantize_control_i64("LLAMA_NVFP4_SELECTOR_N_SEQ", 1));
+            selector_n_seq = (int) std::max<int64_t>(1, selector_control_i64("N_SEQ", 1));
             if (selector_n_seq > max_n_seq_by_logits) {
                 fprintf(stderr,
                     "%s: selector eval n_seq capped %d -> %d to keep logits workspace under %.2f GiB "
@@ -7530,7 +7730,7 @@ static bool nvfp4_selector_choose_policy(
         : params.n_ctx;
     params.n_ubatch = params.n_batch;
     params.n_parallel = selector_n_seq;
-    params.n_gpu_layers = (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_N_GPU_LAYERS", 9999);
+    params.n_gpu_layers = (int32_t) selector_control_i64("N_GPU_LAYERS", 9999);
     params.cpuparams.n_threads = std::max(1, nthread);
     params.cpuparams_batch.n_threads = std::max(1, nthread);
     // Selector full PPL/KLD evaluation patches tensor buffers in a calibration-only context with
@@ -7549,14 +7749,14 @@ static bool nvfp4_selector_choose_policy(
     params.warmup = false;
     params.verbosity = 0;
     params.graph_reuse_disable = true;
-    std::unique_ptr<nvfp4_selector_progress_heartbeat> load_heartbeat;
+    std::unique_ptr<selector_progress_heartbeat> load_heartbeat;
     if (run_stageb_eval) {
-        load_heartbeat = std::make_unique<nvfp4_selector_progress_heartbeat>(
+        load_heartbeat = std::make_unique<selector_progress_heartbeat>(
             "selector stage-b checkpoint load",
             10000);
     }
     params.load_progress_callback = [](float progress, void * user_data) -> bool {
-        auto * heartbeat = static_cast<nvfp4_selector_progress_heartbeat *>(user_data);
+        auto * heartbeat = static_cast<selector_progress_heartbeat *>(user_data);
         if (heartbeat != nullptr) {
             const int64_t done = (int64_t) std::llround(
                 10000.0 * std::max(0.0f, std::min(1.0f, progress)));
@@ -7567,7 +7767,7 @@ static bool nvfp4_selector_choose_policy(
     params.load_progress_callback_user_data = load_heartbeat.get();
 
     auto stageb_binding_hash = [&](const std::vector<size_t> & indices) {
-        nvfp4_selector_stageb_digest digest;
+        selector_stageb_digest digest;
         for (size_t idx : indices) {
             if (idx < all_bindings.size()) {
                 digest.add_string(all_bindings[idx].name);
@@ -7575,7 +7775,7 @@ static bool nvfp4_selector_choose_policy(
         }
         return digest.hex();
     };
-    nvfp4_selector_stageb_digest mxfp6_binding_digest;
+    selector_stageb_digest mxfp6_binding_digest;
     for (const auto & b : mxfp6_bindings) {
         mxfp6_binding_digest.add_string(b.name);
     }
@@ -7585,14 +7785,14 @@ static bool nvfp4_selector_choose_policy(
     auto make_stageb_base_key = [&]() {
         nlohmann::ordered_json key = nlohmann::ordered_json::object();
         key["cache_version"] = SELECTOR_ENCODER_EVIDENCE_VERSION;
-        key["source_model"] = nvfp4_selector_stageb_file_json(source_model_path);
-        key["checkpoint_model"] = nvfp4_selector_stageb_file_json(checkpoint_model_path);
+        key["source_model"] = selector_stageb_file_json(source_model_path);
+        key["checkpoint_model"] = selector_stageb_file_json(checkpoint_model_path);
         key["imatrix"] = {
             {"entries", imatrix_data.size()},
             {"hash", imatrix_hash},
         };
-        key["search_kld"] = nvfp4_selector_stageb_kld_json(kld_budget);
-        key["validation_kld"] = holdout_budget ? nvfp4_selector_stageb_kld_json(*holdout_budget) : nlohmann::ordered_json(nullptr);
+        key["search_kld"] = selector_stageb_kld_json(kld_budget);
+        key["validation_kld"] = holdout_budget ? selector_stageb_kld_json(*holdout_budget) : nlohmann::ordered_json(nullptr);
         key["eval"] = {
             {"chunks", kld_budget.n_chunk},
             {"n_seq", selector_n_seq},
@@ -7608,7 +7808,7 @@ static bool nvfp4_selector_choose_policy(
             {"rsf_mode", nvfp4_rsf_mode_name(selector_rsf_mode)},
             {"rsf_depth", nvfp4_rsf_depth_name(selector_rsf_depth)},
         };
-        key["rank"] = nvfp4_selector_stageb_rank_json(rank_cfg);
+        key["rank"] = selector_stageb_rank_json(rank_cfg);
         key["bindings"] = {
             {"nvfp4_count", all_bindings.size()},
             {"nvfp4_all_hash", all_binding_hash},
@@ -7618,12 +7818,12 @@ static bool nvfp4_selector_choose_policy(
         };
         return key;
     };
-    auto make_stageb_policy_key = [&](const nvfp4_selector_policy & policy, const std::vector<size_t> & binding_indices) {
+    auto make_stageb_policy_key = [&](const selector_policy & policy, const std::vector<size_t> & binding_indices) {
         nlohmann::ordered_json key = make_stageb_base_key();
         key["kind"] = "policy";
         key["policy"] = {
             {"name", policy.name},
-            {"cfg", nvfp4_selector_stageb_cfg_json(policy.cfg)},
+            {"cfg", selector_stageb_cfg_json(policy.cfg)},
             {"binding_mode", covers_all_nvfp4_bindings(binding_indices) ? "all" : "partial"},
             {"tensor_count", binding_indices.size()},
             {"tensor_hash", stageb_binding_hash(binding_indices)},
@@ -7631,43 +7831,175 @@ static bool nvfp4_selector_choose_policy(
         };
         return key;
     };
-    auto find_current_baseline_policy = [&]() -> const nvfp4_selector_policy * {
-        auto it = std::find_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
+    auto find_current_baseline_policy = [&]() -> const selector_policy * {
+        auto it = std::find_if(policies.begin(), policies.end(), [](const selector_policy & policy) {
             return policy.name == "baseline";
         });
         if (it != policies.end()) {
             return &*it;
         }
-        it = std::find_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
-            return !nvfp4_selector_policy_is_rsf_family(policy);
+        it = std::find_if(policies.begin(), policies.end(), [](const selector_policy & policy) {
+            return !selector_policy_is_rsf_family(policy);
         });
         return it == policies.end() ? nullptr : &*it;
     };
     auto make_stageb_baseline_key = [&]() {
         nlohmann::ordered_json key = make_stageb_base_key();
-        const nvfp4_selector_policy * baseline_policy = find_current_baseline_policy();
+        const selector_policy * baseline_policy = find_current_baseline_policy();
         key["kind"] = "baseline";
         key["policy"] = {
             {"name", "seed_keep"},
-            {"cfg", baseline_policy != nullptr ? nvfp4_selector_stageb_cfg_json(baseline_policy->cfg) : nlohmann::ordered_json(nullptr)},
+            {"cfg", baseline_policy != nullptr ? selector_stageb_cfg_json(baseline_policy->cfg) : nlohmann::ordered_json(nullptr)},
             {"binding_mode", "runtime_checkpoint"},
             {"tensor_count", all_bindings.size()},
             {"tensor_hash", all_binding_hash},
         };
         return key;
     };
-    nvfp4_selector_stageb_cache stageb_result_cache;
-    stageb_result_cache.ledger = &selector_ledger;
+    auto make_tensor_rescue_key = [&](
+            const selector_binding & b,
+            const nvfp4_cuda_runtime_cfg & base_cfg,
+            int64_t sample_blocks,
+            int64_t refine_blocks,
+            int64_t guard_blocks) {
+        auto shape_json = [](const ggml_tensor * tensor) {
+            nlohmann::ordered_json shape = nlohmann::ordered_json::array();
+            if (tensor == nullptr) {
+                return shape;
+            }
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                shape.push_back(tensor->ne[i]);
+            }
+            return shape;
+        };
+
+        nlohmann::ordered_json key = nlohmann::ordered_json::object();
+        key["cache_version"] = SELECTOR_ENCODER_EVIDENCE_VERSION;
+        key["kind"] = "tensor_rescue";
+        key["selector"] = make_stageb_base_key();
+        key["tensor"] = {
+            {"name", b.name},
+            {"class", selector_tensor_class_name(b.cls)},
+            {"bucket", b.bucket},
+            {"layer", b.layer},
+            {"source_type", b.source != nullptr ? ggml_type_name(b.source->type) : "unknown"},
+            {"target_type", b.target != nullptr ? ggml_type_name(b.target->type) : "unknown"},
+            {"source_nbytes", b.source_nbytes},
+            {"target_nbytes", b.target_nbytes},
+            {"source_shape", shape_json(b.source)},
+            {"target_shape", shape_json(b.target)},
+        };
+        key["base_cfg"] = selector_stageb_cfg_json(base_cfg);
+        key["rescue"] = {
+            {"sample_blocks", sample_blocks},
+            {"refine_blocks", refine_blocks},
+            {"guard_blocks", guard_blocks},
+            {"policy_budget", selector_control_i64("RESCUE_NVFP4_POLICY_BUDGET", SELECTOR_RESCUE_NVFP4_POLICY_BUDGET)},
+            {"refine_top", selector_control_i64("RESCUE_NVFP4_REFINE_TOP", SELECTOR_RESCUE_NVFP4_REFINE_TOP)},
+            {"guard_top", selector_control_i64("RESCUE_NVFP4_GUARD_TOP", SELECTOR_RESCUE_NVFP4_GUARD_TOP)},
+            {"max_blocks", selector_control_i64("RESCUE_NVFP4_MAX_BLOCKS", 16384)},
+            {"refine_max_blocks", selector_control_i64("RESCUE_NVFP4_REFINE_MAX_BLOCKS", 32768)},
+            {"guard_max_blocks", selector_control_i64("RESCUE_NVFP4_GUARD_MAX_BLOCKS", 32768)},
+        };
+        return key;
+    };
+    selector_stageb_cache stageb_result_cache;
+    stageb_result_cache.ledger = &ledger;
     if (run_stageb_eval) {
         stageb_result_cache.load(checkpoint_model_path + ".stageb-results.jsonl");
-        if (selector_ledger.enabled()) {
-            stageb_result_cache.load_exact_eval_ledger(selector_ledger.path());
+        if (ledger.enabled()) {
+            stageb_result_cache.load_exact_eval_ledger(ledger.path());
         }
     }
+    selector_tensor_rescue_cache tensor_rescue_cache;
+    tensor_rescue_cache.load(checkpoint_model_path + ".tensor-rescue-results.jsonl");
+
+    selector_derived_metrics baseline_eval;
+    selector_derived_metrics baseline_holdout_eval;
+    bool has_holdout_eval = false;
+    bool stageb_cache_only_eval = false;
+    bool stageb_runtime_decoded = false;
+
+    auto try_stageb_cache_only_eval = [&]() -> bool {
+        if (!run_stageb_eval) {
+            return false;
+        }
+        if (!mxfp6_bindings.empty()) {
+            return false;
+        }
+        if (!selector_control_string("SENSITIVITY_REPORT_FILE").empty()) {
+            return false;
+        }
+
+        const nlohmann::ordered_json baseline_cache_key = make_stageb_baseline_key();
+        selector_stageb_cache_entry cached_baseline;
+        if (!stageb_result_cache.find(baseline_cache_key, "seed_keep", cached_baseline) ||
+                !cached_baseline.search.ok) {
+            return false;
+        }
+
+        struct cached_policy_eval {
+            size_t policy_index = 0;
+            selector_stageb_cache_entry entry;
+        };
+        std::vector<cached_policy_eval> cached_policies;
+        cached_policies.reserve(eval_policy_indices.size());
+        for (size_t policy_index : eval_policy_indices) {
+            if (policy_index >= policies.size()) {
+                return false;
+            }
+            const auto & policy = policies[policy_index];
+            const std::vector<size_t> & eval_binding_indices =
+                policy.has_survey ? all_binding_indices : stress_binding_indices;
+            const nlohmann::ordered_json policy_cache_key =
+                make_stageb_policy_key(policy, eval_binding_indices);
+            selector_stageb_cache_entry cached_policy;
+            if (!stageb_result_cache.find(policy_cache_key, policy.name, cached_policy) ||
+                    !cached_policy.search.ok) {
+                return false;
+            }
+            cached_policies.push_back({ policy_index, cached_policy });
+        }
+
+        baseline_eval = cached_baseline.search;
+        baseline_holdout_eval = cached_baseline.validation;
+        has_holdout_eval = cached_baseline.has_validation && baseline_holdout_eval.ok;
+
+        for (const auto & cached : cached_policies) {
+            auto & policy = policies[cached.policy_index];
+            policy.measured = cached.entry.search;
+            policy.measured_holdout = cached.entry.validation;
+            policy.has_holdout = cached.entry.has_validation && policy.measured_holdout.ok;
+            const selector_metric_rank policy_rank =
+                selector_rank_policy_metrics(
+                    policy.measured,
+                    policy.has_holdout ? &policy.measured_holdout : nullptr,
+                    baseline_eval,
+                    has_holdout_eval ? &baseline_holdout_eval : nullptr,
+                    rank_cfg);
+            policy.measured_pass = policy_rank.pass;
+            policy.measured_score = policy_rank.score;
+        }
+
+        stageb_policy_done = (int64_t) eval_policy_indices.size();
+        stageb_policy_active = false;
+        stageb_policy_active_name.clear();
+        stageb_policy_active_index = 0;
+        full_quant_eta_done = std::min<int64_t>(full_quant_eta_total, 2 + stageb_policy_done);
+        fprintf(stderr,
+            "%s: selector stage-b exact cache complete; skipping runtime checkpoint load policies=%zu search_chunks=%d validation_chunks=%d\n",
+            __func__,
+            cached_policies.size(),
+            kld_budget.n_chunk,
+            holdout_budget ? holdout_budget->n_chunk : 0);
+        update_full_quant_eta("selector-stage-b-cache-complete", true);
+        return true;
+    };
+    stageb_cache_only_eval = try_stageb_cache_only_eval();
 
     common_init_result_ptr init_res;
     llama_context * lctx = nullptr;
-    if (run_stageb_eval) {
+    if (run_stageb_eval && !stageb_cache_only_eval) {
 #if defined(GGML_USE_CUDA)
         if (ggml_backend_cuda_get_device_count() > 0) {
             size_t cuda_free = 0;
@@ -7696,7 +8028,8 @@ static bool nvfp4_selector_choose_policy(
         }
         lctx = init_res ? init_res->context() : nullptr;
     }
-    const bool have_measured_eval = run_stageb_eval && lctx != nullptr;
+    bool have_runtime_eval = run_stageb_eval && lctx != nullptr;
+    bool have_measured_eval = stageb_cache_only_eval || have_runtime_eval;
     if (run_stageb_eval && !have_measured_eval) {
         fprintf(stderr, "%s: selector stage-b unavailable for checkpoint %s; continuing with proxy-only selection and tensor plan\n", __func__, checkpoint_model_path.c_str());
         if (require_runtime_cache) {
@@ -7704,8 +8037,8 @@ static bool nvfp4_selector_choose_policy(
             return false;
         }
     }
-    if (have_measured_eval) {
-        nvfp4_selector_progress_heartbeat runtime_bind_heartbeat(
+    if (have_runtime_eval) {
+        selector_progress_heartbeat runtime_bind_heartbeat(
             "selector stage-b runtime bind",
             (int64_t) all_bindings.size() + (int64_t) mxfp6_bindings.size());
         runtime_bind_heartbeat.detail("binding runtime tensors", true);
@@ -7791,23 +8124,19 @@ static bool nvfp4_selector_choose_policy(
         }
         runtime_bind_heartbeat.finish("runtime tensors bound");
     }
-    const bool have_runtime_eval = run_stageb_eval && lctx != nullptr;
-
-    nvfp4_selector_derived_metrics baseline_eval;
-    nvfp4_selector_derived_metrics baseline_holdout_eval;
-    bool has_holdout_eval = false;
-    bool stageb_runtime_decoded = false;
-    auto apply_rsf_holdout_guard = [&](nvfp4_selector_policy & policy) {
-        if (!nvfp4_selector_policy_is_rsf_family(policy)) {
+    have_runtime_eval = run_stageb_eval && lctx != nullptr;
+    have_measured_eval = stageb_cache_only_eval || have_runtime_eval;
+    auto apply_rsf_holdout_guard = [&](selector_policy & policy) {
+        if (!selector_policy_is_rsf_family(policy)) {
             return;
         }
-        const nvfp4_selector_policy * base_policy =
-            nvfp4_selector_find_rsf_base_policy(policies, policy, true);
+        const selector_policy * base_policy =
+            selector_find_rsf_base_policy(policies, policy, true);
         if (base_policy == nullptr) {
             return;
         }
         std::string reason;
-        if (!nvfp4_selector_rsf_holdout_guard(policy, *base_policy, rank_cfg, reason)) {
+        if (!selector_rsf_holdout_guard(policy, *base_policy, rank_cfg, reason)) {
             policy.measured_pass = false;
             policy.measured_score = std::numeric_limits<double>::infinity();
             fprintf(stderr,
@@ -7819,8 +8148,8 @@ static bool nvfp4_selector_choose_policy(
             return;
         }
 
-        const nvfp4_selector_metric_rank accepted_rank =
-            nvfp4_selector_rank_policy_metrics(
+        const selector_metric_rank accepted_rank =
+            selector_rank_policy_metrics(
                 policy.measured,
                 policy.has_holdout ? &policy.measured_holdout : nullptr,
                 baseline_eval,
@@ -7852,7 +8181,7 @@ static bool nvfp4_selector_choose_policy(
                 runtime_cache_tasks.push_back({true, i});
             }
         }
-        nvfp4_selector_progress_heartbeat runtime_cache_heartbeat(
+        selector_progress_heartbeat runtime_cache_heartbeat(
             "selector stage-b runtime cache",
             (int64_t) runtime_cache_tasks.size());
         runtime_cache_heartbeat.detail("caching original runtime tensors", true);
@@ -7890,7 +8219,7 @@ static bool nvfp4_selector_choose_policy(
         };
         const int runtime_cache_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
             (int64_t) runtime_cache_tasks.size(),
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", std::max(1, nthread))));
+            selector_control_i64("POLICY_THREADS", std::max(1, nthread))));
         if (runtime_cache_threads <= 1 || runtime_cache_tasks.size() <= 1) {
             int64_t runtime_cache_done = 0;
             for (size_t pos = 0; pos < runtime_cache_tasks.size(); ++pos) {
@@ -7948,7 +8277,7 @@ static bool nvfp4_selector_choose_policy(
                 "caching original runtime tensors");
         }
         runtime_cache_heartbeat.finish("original runtime tensors cached");
-        int64_t kld_metric_threads = nvfp4_selector_kld_threads_override();
+        int64_t kld_metric_threads = selector_kld_threads_override();
         if (kld_metric_threads <= 0) {
             kld_metric_threads = std::max<unsigned int>(1, std::thread::hardware_concurrency());
         }
@@ -7965,36 +8294,36 @@ static bool nvfp4_selector_choose_policy(
         full_quant_eta_done = 1;
         update_full_quant_eta("selector-stage-b-baseline-kld", true);
         const nlohmann::ordered_json baseline_cache_key = make_stageb_baseline_key();
-        nvfp4_selector_stageb_cache_entry cached_baseline;
+        selector_stageb_cache_entry cached_baseline;
         if (stageb_result_cache.find(baseline_cache_key, "seed_keep", cached_baseline)) {
             baseline_eval = cached_baseline.search;
             baseline_holdout_eval = cached_baseline.validation;
             has_holdout_eval = cached_baseline.has_validation && baseline_holdout_eval.ok;
         } else {
-            nvfp4_selector_kld_metrics baseline_km;
-            if (!nvfp4_selector_eval_kld_subset(
+            selector_kld_metrics baseline_km;
+            if (!selector_eval_kld_subset(
                     lctx, kld_budget, params.n_batch, baseline_km, true,
                     "selector stage-b baseline search kld")) {
                 restore_all();
                 return false;
             }
             stageb_runtime_decoded = true;
-            baseline_eval = nvfp4_selector_derive_metrics(baseline_km);
+            baseline_eval = selector_derive_metrics(baseline_km);
 
             if (holdout_budget && holdout_budget->n_chunk > 0) {
-                nvfp4_selector_kld_metrics baseline_holdout_km;
-                if (!nvfp4_selector_eval_kld_subset(
+                selector_kld_metrics baseline_holdout_km;
+                if (!selector_eval_kld_subset(
                         lctx, *holdout_budget, params.n_batch, baseline_holdout_km, true,
                         "selector stage-b baseline validation kld")) {
                     restore_all();
                     return false;
                 }
                 stageb_runtime_decoded = true;
-                baseline_holdout_eval = nvfp4_selector_derive_metrics(baseline_holdout_km);
+                baseline_holdout_eval = selector_derive_metrics(baseline_holdout_km);
                 has_holdout_eval = baseline_holdout_eval.ok;
             }
-            const nvfp4_selector_metric_rank baseline_rank =
-                nvfp4_selector_rank_policy_metrics(
+            const selector_metric_rank baseline_rank =
+                selector_rank_policy_metrics(
                     baseline_eval,
                     has_holdout_eval ? &baseline_holdout_eval : nullptr,
                     baseline_eval,
@@ -8011,13 +8340,13 @@ static bool nvfp4_selector_choose_policy(
         }
 
         const std::string baseline_main_summary =
-            nvfp4_selector_format_metrics("search", baseline_eval);
+            selector_format_metrics("search", baseline_eval);
         fprintf(stderr,
             "selector stage-b baseline %s\n",
             baseline_main_summary.c_str());
         if (has_holdout_eval) {
             const std::string baseline_holdout_summary =
-                nvfp4_selector_format_metrics("validation", baseline_holdout_eval);
+                selector_format_metrics("validation", baseline_holdout_eval);
             fprintf(stderr,
                 "selector stage-b baseline %s\n",
                 baseline_holdout_summary.c_str());
@@ -8045,13 +8374,13 @@ static bool nvfp4_selector_choose_policy(
                 holdout_budget ? holdout_budget->n_chunk : 0);
             const std::vector<size_t> & eval_binding_indices = policy.has_survey ? all_binding_indices : stress_binding_indices;
             const nlohmann::ordered_json policy_cache_key = make_stageb_policy_key(policy, eval_binding_indices);
-            nvfp4_selector_stageb_cache_entry cached_policy;
+            selector_stageb_cache_entry cached_policy;
             if (stageb_result_cache.find(policy_cache_key, policy.name, cached_policy)) {
                 policy.measured = cached_policy.search;
                 policy.measured_holdout = cached_policy.validation;
                 policy.has_holdout = cached_policy.has_validation && policy.measured_holdout.ok;
-                const nvfp4_selector_metric_rank policy_rank =
-                    nvfp4_selector_rank_policy_metrics(
+                const selector_metric_rank policy_rank =
+                    selector_rank_policy_metrics(
                         policy.measured,
                         policy.has_holdout ? &policy.measured_holdout : nullptr,
                         baseline_eval,
@@ -8066,7 +8395,7 @@ static bool nvfp4_selector_choose_policy(
                     kld_budget.n_chunk,
                     policy.has_holdout ? (holdout_budget ? holdout_budget->n_chunk : 0) : 0);
                 const std::string policy_main_summary =
-                    nvfp4_selector_format_metrics("search", policy.measured);
+                    selector_format_metrics("search", policy.measured);
                 fprintf(stderr,
                     "selector stage-b policy=%s measured_score=%.6f pass=%s %s\n",
                     policy.name.c_str(),
@@ -8075,7 +8404,7 @@ static bool nvfp4_selector_choose_policy(
                     policy_main_summary.c_str());
                 if (policy.has_holdout) {
                     const std::string policy_holdout_summary =
-                        nvfp4_selector_format_metrics("validation", policy.measured_holdout);
+                        selector_format_metrics("validation", policy.measured_holdout);
                     fprintf(stderr,
                         "selector stage-b policy=%s %s\n",
                         policy.name.c_str(),
@@ -8115,29 +8444,29 @@ static bool nvfp4_selector_choose_policy(
             // will read.
             const bool stageb_direct_patch = true;
             const bool stageb_collect_patch_eval_metrics =
-                quantize_control_bool("LLAMA_NVFP4_SELECTOR_STAGEB_PATCH_EVAL", false);
+                selector_control_bool("STAGEB_PATCH_EVAL", false);
             const bool stageb_verify_direct_patch =
-                quantize_control_bool("LLAMA_NVFP4_SELECTOR_STAGEB_DIRECT_VERIFY", !nvfp4_cfg_has_rsf(policy.cfg));
+                selector_control_bool("STAGEB_DIRECT_VERIFY", !nvfp4_cfg_has_rsf(policy.cfg));
             std::vector<stageb_patch_result> patch_results(eval_binding_indices.size());
-            const bool stageb_policy_threads_explicit = quantize_control_has("LLAMA_NVFP4_SELECTOR_POLICY_THREADS");
+            const bool stageb_policy_threads_explicit = selector_control_has("POLICY_THREADS");
             const int requested_stageb_patch_threads = (int) std::max<int64_t>(1, std::min<int64_t>(
                 (int64_t) eval_binding_indices.size(),
-                quantize_control_i64("LLAMA_NVFP4_SELECTOR_POLICY_THREADS",
+                selector_control_i64("POLICY_THREADS",
                     std::max<int>(1, nthread))));
-            const int stageb_autotune_threads = nvfp4_autotune_threads > 0 ?
-                std::min<int>(4, std::max<int>(1, nvfp4_autotune_threads)) : 4;
-            const int default_stageb_patch_threads = std::max<int>(1, nthread / stageb_autotune_threads);
+            const int stageb_encoder_threads = nvfp4_encoder_threads > 0 ?
+                std::min<int>(4, std::max<int>(1, nvfp4_encoder_threads)) : 4;
+            const int default_stageb_patch_threads = std::max<int>(1, nthread / stageb_encoder_threads);
             const int stageb_patch_threads = stageb_policy_threads_explicit ?
                 requested_stageb_patch_threads :
                 std::max<int>(1, std::min<int>(requested_stageb_patch_threads, default_stageb_patch_threads));
             const int stageb_binding_nthread = std::max(1, nthread / std::max(1, stageb_patch_threads));
             if (stageb_patch_threads > 1) {
                 fprintf(stderr,
-                    "selector stage-b patch policy=%s threads=%d tensor_threads=%d autotune_threads=%d tensors=%zu patch_eval=%s direct_verify=%s\n",
+                    "selector stage-b patch policy=%s threads=%d tensor_threads=%d encoder_threads=%d tensors=%zu patch_eval=%s direct_verify=%s\n",
                     policy.name.c_str(),
                     stageb_patch_threads,
                     stageb_binding_nthread,
-                    stageb_autotune_threads,
+                    stageb_encoder_threads,
                     eval_binding_indices.size(),
                     stageb_collect_patch_eval_metrics ? "yes" : "no",
                     stageb_verify_direct_patch ? "yes" : "skipped_rsf");
@@ -8176,7 +8505,7 @@ static bool nvfp4_selector_choose_policy(
                     }
                     return detail;
                 };
-                nvfp4_selector_progress_heartbeat patch_heartbeat(
+                selector_progress_heartbeat patch_heartbeat(
                     "selector stage-b patch",
                     (int64_t) eval_binding_indices.size());
                 std::atomic<int64_t> patch_done { 0 };
@@ -8288,8 +8617,9 @@ static bool nvfp4_selector_choose_policy(
             const std::string stageb_binding_threads_text = std::to_string(stageb_binding_nthread);
             // Stage-B has already split nthread across patch workers; keep a
             // recipe-level selector.threads from expanding each binding patch.
+            const std::string stageb_selector_threads_key = selector_generic_control_key("THREADS");
             scoped_quantize_control stageb_selector_threads(
-                "LLAMA_NVFP4_SELECTOR_THREADS",
+                stageb_selector_threads_key.c_str(),
                 stageb_binding_threads_text.c_str());
             size_t failed_patch_pos = no_failed_patch;
             bool stageb_patch_quant_ok = patch_policy_once(1, failed_patch_pos);
@@ -8472,33 +8802,33 @@ static bool nvfp4_selector_choose_policy(
                 continue;
             }
 
-            nvfp4_selector_kld_metrics km;
+            selector_kld_metrics km;
             const std::string policy_search_kld_label =
                 "selector stage-b policy=" + policy.name + " search kld";
-            if (!nvfp4_selector_eval_kld_subset(
+            if (!selector_eval_kld_subset(
                     lctx, kld_budget, params.n_batch, km, true,
                     policy_search_kld_label)) {
                 restore_all();
                 return false;
             }
             stageb_runtime_decoded = true;
-            policy.measured = nvfp4_selector_derive_metrics(km);
+            policy.measured = selector_derive_metrics(km);
             if (holdout_budget && has_holdout_eval) {
-                nvfp4_selector_kld_metrics km_holdout;
+                selector_kld_metrics km_holdout;
                 const std::string policy_validation_kld_label =
                     "selector stage-b policy=" + policy.name + " validation kld";
-                if (!nvfp4_selector_eval_kld_subset(
+                if (!selector_eval_kld_subset(
                         lctx, *holdout_budget, params.n_batch, km_holdout, true,
                         policy_validation_kld_label)) {
                     restore_all();
                     return false;
                 }
                 stageb_runtime_decoded = true;
-                policy.measured_holdout = nvfp4_selector_derive_metrics(km_holdout);
+                policy.measured_holdout = selector_derive_metrics(km_holdout);
                 policy.has_holdout = policy.measured_holdout.ok;
             }
-            const nvfp4_selector_metric_rank policy_rank =
-                nvfp4_selector_rank_policy_metrics(
+            const selector_metric_rank policy_rank =
+                selector_rank_policy_metrics(
                     policy.measured,
                     policy.has_holdout ? &policy.measured_holdout : nullptr,
                     baseline_eval,
@@ -8508,7 +8838,7 @@ static bool nvfp4_selector_choose_policy(
             policy.measured_score = policy_rank.score;
             apply_rsf_holdout_guard(policy);
             const std::string policy_main_summary =
-                nvfp4_selector_format_metrics("search", policy.measured);
+                selector_format_metrics("search", policy.measured);
             fprintf(stderr,
                 "selector stage-b policy=%s measured_score=%.6f pass=%s %s\n",
                 policy.name.c_str(),
@@ -8517,7 +8847,7 @@ static bool nvfp4_selector_choose_policy(
                 policy_main_summary.c_str());
             if (policy.has_holdout) {
                 const std::string policy_holdout_summary =
-                    nvfp4_selector_format_metrics("validation", policy.measured_holdout);
+                    selector_format_metrics("validation", policy.measured_holdout);
                 fprintf(stderr,
                     "selector stage-b policy=%s %s\n",
                     policy.name.c_str(),
@@ -8536,17 +8866,17 @@ static bool nvfp4_selector_choose_policy(
                 break;
             }
         }
-    } else {
+    } else if (!stageb_cache_only_eval) {
         for (auto & policy : policies) {
             policy.measured_pass = !policy.proxy_rejected;
             policy.measured_score = policy.proxy_score;
         }
     }
 
-    std::optional<nvfp4_selector_policy> seed_keep_policy;
-    if (have_runtime_eval && baseline_eval.ok) {
-        const nvfp4_selector_policy * baseline_policy = find_current_baseline_policy();
-        nvfp4_selector_policy seed;
+    std::optional<selector_policy> seed_keep_policy;
+    if (have_measured_eval && baseline_eval.ok) {
+        const selector_policy * baseline_policy = find_current_baseline_policy();
+        selector_policy seed;
         seed.name = "seed_keep";
         seed.cfg = baseline_policy != nullptr ? baseline_policy->cfg : seed.cfg;
         seed.proxy_score = 0.0;
@@ -8556,8 +8886,8 @@ static bool nvfp4_selector_choose_policy(
         seed.measured = baseline_eval;
         seed.measured_holdout = baseline_holdout_eval;
         seed.has_holdout = has_holdout_eval;
-        const nvfp4_selector_metric_rank seed_rank =
-            nvfp4_selector_rank_policy_metrics(
+        const selector_metric_rank seed_rank =
+            selector_rank_policy_metrics(
                 seed.measured,
                 seed.has_holdout ? &seed.measured_holdout : nullptr,
                 baseline_eval,
@@ -8567,7 +8897,7 @@ static bool nvfp4_selector_choose_policy(
         seed.measured_score = seed_rank.score;
         seed_keep_policy = seed;
         const std::string seed_summary =
-            nvfp4_selector_format_metrics("search", seed.measured);
+            selector_format_metrics("search", seed.measured);
         fprintf(stderr,
             "selector stage-b seed_keep measured_score=%.6f %s\n",
             seed.measured_score,
@@ -8576,11 +8906,9 @@ static bool nvfp4_selector_choose_policy(
 
     auto best_it = policies.begin();
     if (have_measured_eval) {
-        if (have_runtime_eval) {
-            for (size_t idx : eval_policy_indices) {
-                if (idx < policies.size()) {
-                    apply_rsf_holdout_guard(policies[idx]);
-                }
+        for (size_t idx : eval_policy_indices) {
+            if (idx < policies.size()) {
+                apply_rsf_holdout_guard(policies[idx]);
             }
         }
         if (seed_keep_policy.has_value()) {
@@ -8609,24 +8937,24 @@ static bool nvfp4_selector_choose_policy(
         }
 
         const std::vector<size_t> & best_input = gated_candidates.empty() ? eval_candidates : gated_candidates;
-        std::vector<size_t> best_set = nvfp4_selector_best_set(policies, best_input, rank_cfg);
+        std::vector<size_t> best_set = selector_best_set(policies, best_input, rank_cfg);
         if (best_set.empty() && !gated_candidates.empty()) {
-            best_set = nvfp4_selector_best_set(policies, eval_candidates, rank_cfg);
+            best_set = selector_best_set(policies, eval_candidates, rank_cfg);
         }
 
-        const nvfp4_selector_best_set_stats best_stats =
-            nvfp4_selector_best_set_stats_for(policies, best_set, rank_cfg);
+        const selector_best_set_stats best_stats =
+            selector_best_set_stats_for(policies, best_set, rank_cfg);
         bool have_best = false;
         size_t best_idx = 0;
         double best_utility = std::numeric_limits<double>::infinity();
         for (size_t idx : best_set) {
-            const double utility = nvfp4_selector_best_set_utility(
+            const double utility = selector_best_set_utility(
                 policies[idx],
                 best_stats,
                 rank_cfg);
             bool better = !have_best || utility < best_utility;
             if (!better && have_best && std::fabs(utility - best_utility) <= 1e-9) {
-                better = nvfp4_selector_compare_policy_measured(
+                better = selector_compare_policy_measured(
                         policies[idx],
                         policies[best_idx],
                         baseline_eval,
@@ -8652,8 +8980,8 @@ static bool nvfp4_selector_choose_policy(
                 best_utility);
             for (size_t rank = 0; rank < best_set.size(); ++rank) {
                 const auto & p = policies[best_set[rank]];
-                const auto obj = nvfp4_selector_best_objectives_for(p, rank_cfg.holdout_weight);
-                const double utility = nvfp4_selector_best_set_utility(p, best_stats, rank_cfg);
+                const auto obj = selector_best_objectives_for(p, rank_cfg.holdout_weight);
+                const double utility = selector_best_set_utility(p, best_stats, rank_cfg);
                 fprintf(stderr,
                     "%s: selector Best[%zu] policy=%s pass=%s score=%.6f utility=%.6f ln=%.6f kld=%.6f p95=%.6f p99=%.6f p999=%.6f tail99=%.6f max=%.6f rms=%.6f top=%.4f flip_w=%.6f top_p=%.6f entropy=%.6f\n",
                     __func__,
@@ -8685,34 +9013,34 @@ static bool nvfp4_selector_choose_policy(
         });
     }
 
-    const bool have_rsf_policies = std::any_of(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
-        return nvfp4_selector_policy_is_rsf_family(policy) && !policy.tensor_records.empty();
+    const bool have_rsf_policies = std::any_of(policies.begin(), policies.end(), [](const selector_policy & policy) {
+        return selector_policy_is_rsf_family(policy) && !policy.tensor_records.empty();
     });
     if (have_rsf_policies) {
         const std::string configured_rsf_report =
-            quantize_control_string("LLAMA_NVFP4_SELECTOR_RSF_REPORT_FILE");
+            selector_control_string("RSF_REPORT_FILE");
         const std::string rsf_report_file = configured_rsf_report.empty()
             ? checkpoint_model_path + ".rsf-report.txt"
             : configured_rsf_report;
-        nvfp4_selector_write_rsf_report(rsf_report_file, policies);
+        selector_write_rsf_report(rsf_report_file, policies);
     }
 
-    const std::string sensitivity_report_file = quantize_control_string("LLAMA_NVFP4_SELECTOR_SENSITIVITY_REPORT_FILE");
+    const std::string sensitivity_report_file = selector_control_string("SENSITIVITY_REPORT_FILE");
     if (!skip_remaining_tuning &&
             have_runtime_eval &&
             !sensitivity_report_file.empty() &&
             best_it != policies.end()) {
         const std::string tensor_filter =
-            quantize_control_string("LLAMA_NVFP4_SELECTOR_SENSITIVITY_TENSOR");
+            selector_control_string("SENSITIVITY_TENSOR");
         const int32_t layer_filter =
-            (int32_t) quantize_control_i64("LLAMA_NVFP4_SELECTOR_SENSITIVITY_LAYER", -999999);
+            (int32_t) selector_control_i64("SENSITIVITY_LAYER", -999999);
         const int sensitivity_top = (int) std::max<int64_t>(
             0,
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_SENSITIVITY_TOP",
+            selector_control_i64("SENSITIVITY_TOP",
                 (!tensor_filter.empty() || layer_filter != -999999) ? 0 : 16));
         const int64_t sensitivity_sample_blocks = std::max<int64_t>(
             0,
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_SENSITIVITY_SAMPLE_BLOCKS", 8192));
+            selector_control_i64("SENSITIVITY_SAMPLE_BLOCKS", 8192));
 
         std::ofstream sensitivity_report(sensitivity_report_file, std::ios::trunc);
         if (!sensitivity_report) {
@@ -8728,7 +9056,7 @@ static bool nvfp4_selector_choose_policy(
                 sensitivity_sample_blocks);
 
             auto quantize_apply_sensitivity_patch = [&](
-                    nvfp4_selector_binding & b,
+                    selector_binding & b,
                     const nvfp4_cuda_runtime_cfg & cfg,
                     double & sq,
                     double & ab,
@@ -8778,24 +9106,24 @@ static bool nvfp4_selector_choose_policy(
                 }
             }
 
-            nvfp4_selector_derived_metrics sensitivity_base = best_it->measured;
+            selector_derived_metrics sensitivity_base = best_it->measured;
             if (best_patch_ok) {
-                nvfp4_selector_kld_metrics base_km;
-                if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, base_km, true)) {
+                selector_kld_metrics base_km;
+                if (!selector_eval_kld_subset(lctx, kld_budget, params.n_batch, base_km, true)) {
                     restore_all();
                     return false;
                 }
                 stageb_runtime_decoded = true;
-                sensitivity_base = nvfp4_selector_derive_metrics(base_km);
+                sensitivity_base = selector_derive_metrics(base_km);
             }
 
             sensitivity_report
                 << "{\"schema\":\"blackwell-selector-sensitivity-v1\", \"event\":\"baseline\", \"policy\":\""
-                << nvfp4_selector_json_escape(best_it->name)
+                << selector_json_escape(best_it->name)
                 << "\", \"chunks\": " << kld_budget.n_chunk
                 << ", \"ctx\": " << kld_budget.n_ctx
                 << ", \"score_tokens\": " << kld_budget.n_score;
-            nvfp4_selector_write_metric_json_fields(sensitivity_report, sensitivity_base, "");
+            selector_write_metric_json_fields(sensitivity_report, sensitivity_base, "");
             sensitivity_report << "}\n";
 
             std::vector<size_t> sensitivity_indices;
@@ -8813,8 +9141,8 @@ static bool nvfp4_selector_choose_policy(
             std::sort(sensitivity_indices.begin(), sensitivity_indices.end(), [&](size_t ai, size_t bi) {
                 const auto & a = all_bindings[ai];
                 const auto & b = all_bindings[bi];
-                const double as = nvfp4_selector_class_hotness(a.cls) * (double) std::max<size_t>(1, a.source_nbytes);
-                const double bs = nvfp4_selector_class_hotness(b.cls) * (double) std::max<size_t>(1, b.source_nbytes);
+                const double as = selector_class_hotness(a.cls) * (double) std::max<size_t>(1, a.source_nbytes);
+                const double bs = selector_class_hotness(b.cls) * (double) std::max<size_t>(1, b.source_nbytes);
                 if (as != bs) return as > bs;
                 if (a.layer != b.layer) return a.layer < b.layer;
                 return a.name < b.name;
@@ -8837,7 +9165,7 @@ static bool nvfp4_selector_choose_policy(
                 auto find_sensitivity_alt = [&](size_t idx, sensitivity_alt & out_alt) -> bool {
                     auto & b = all_bindings[idx];
                     out_alt.index = idx;
-                    if (!nvfp4_selector_find_tensor_rescue_cfg(
+                    if (!selector_find_tensor_rescue_cfg(
                             b,
                             best_it->cfg,
                             nthread,
@@ -8846,7 +9174,7 @@ static bool nvfp4_selector_choose_policy(
                             out_alt.sample_blocks,
                             out_alt.base_proxy_score,
                             out_alt.alt_proxy_score) ||
-                            nvfp4_selector_cfg_equal(out_alt.cfg, best_it->cfg)) {
+                            selector_cfg_equal(out_alt.cfg, best_it->cfg)) {
                         return false;
                     }
                     return true;
@@ -8899,24 +9227,24 @@ static bool nvfp4_selector_choose_policy(
                         }
 
                         if (layer_patch_ok) {
-                            nvfp4_selector_kld_metrics km;
-                            if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
+                            selector_kld_metrics km;
+                            if (!selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
                                 restore_all();
                                 return false;
                             }
                             stageb_runtime_decoded = true;
-                            const nvfp4_selector_derived_metrics dm = nvfp4_selector_derive_metrics(km);
+                            const selector_derived_metrics dm = selector_derive_metrics(km);
                             const double utility = dm.ok
-                                ? nvfp4_selector_measured_score(dm, nullptr, rank_cfg)
+                                ? selector_measured_score(dm, nullptr, rank_cfg)
                                 : std::numeric_limits<double>::infinity();
-                            const double base_utility = nvfp4_selector_measured_score(sensitivity_base, nullptr, rank_cfg);
+                            const double base_utility = selector_measured_score(sensitivity_base, nullptr, rank_cfg);
                             const double delta_utility = utility - base_utility;
 
                             sensitivity_report
                                 << "{\"schema\":\"blackwell-selector-sensitivity-v1\", \"event\":\"layer_delta\""
                                 << ", \"layer\": " << layer_filter
                                 << ", \"tensor_count\": " << layer_alts.size()
-                                << ", \"base_policy\":\"" << nvfp4_selector_json_escape(best_it->name) << "\""
+                                << ", \"base_policy\":\"" << selector_json_escape(best_it->name) << "\""
                                 << ", \"alt_policy\":\"rescue_adaptive_layer\""
                                 << ", \"alt_sample_blocks\": " << alt_sample_blocks_max
                                 << ", \"measured_mode\":\"exact_layer\""
@@ -8925,15 +9253,15 @@ static bool nvfp4_selector_choose_policy(
                                 if (ti > 0) {
                                     sensitivity_report << ",";
                                 }
-                                sensitivity_report << nvfp4_selector_json_escape(tensor_names[ti]);
+                                sensitivity_report << selector_json_escape(tensor_names[ti]);
                             }
                             sensitivity_report
                                 << "\"";
-                            nvfp4_selector_write_json_number_field(sensitivity_report, "proxy_gain_sum", proxy_gain_sum);
-                            nvfp4_selector_write_json_number_field(sensitivity_report, "utility", utility);
-                            nvfp4_selector_write_json_number_field(sensitivity_report, "delta_utility", delta_utility);
-                            nvfp4_selector_write_metric_json_fields(sensitivity_report, dm, "");
-                            nvfp4_selector_write_delta_metric_json_fields(sensitivity_report, dm, sensitivity_base);
+                            selector_write_json_number_field(sensitivity_report, "proxy_gain_sum", proxy_gain_sum);
+                            selector_write_json_number_field(sensitivity_report, "utility", utility);
+                            selector_write_json_number_field(sensitivity_report, "delta_utility", delta_utility);
+                            selector_write_metric_json_fields(sensitivity_report, dm, "");
+                            selector_write_delta_metric_json_fields(sensitivity_report, dm, sensitivity_base);
                             sensitivity_report << "}\n";
 
                             fprintf(stderr,
@@ -8988,37 +9316,37 @@ static bool nvfp4_selector_choose_policy(
                         continue;
                     }
 
-                    nvfp4_selector_kld_metrics km;
-                    if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
+                    selector_kld_metrics km;
+                    if (!selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
                         restore_all();
                         return false;
                     }
                     stageb_runtime_decoded = true;
-                    const nvfp4_selector_derived_metrics dm = nvfp4_selector_derive_metrics(km);
+                    const selector_derived_metrics dm = selector_derive_metrics(km);
                     const double utility = dm.ok
-                        ? nvfp4_selector_measured_score(dm, nullptr, rank_cfg)
+                        ? selector_measured_score(dm, nullptr, rank_cfg)
                         : std::numeric_limits<double>::infinity();
-                    const double base_utility = nvfp4_selector_measured_score(sensitivity_base, nullptr, rank_cfg);
+                    const double base_utility = selector_measured_score(sensitivity_base, nullptr, rank_cfg);
                     const double delta_utility = utility - base_utility;
 
                     sensitivity_report
                         << "{\"schema\":\"blackwell-selector-sensitivity-v1\", \"event\":\"tensor_delta\", \"rank\": "
                         << (rank + 1)
-                        << ", \"tensor\":\"" << nvfp4_selector_json_escape(b.name) << "\""
-                        << ", \"class\":\"" << nvfp4_selector_tensor_class_name(b.cls) << "\""
+                        << ", \"tensor\":\"" << selector_json_escape(b.name) << "\""
+                        << ", \"class\":\"" << selector_tensor_class_name(b.cls) << "\""
                         << ", \"layer\": " << b.layer
                         << ", \"bucket\": " << b.bucket
-                        << ", \"base_policy\":\"" << nvfp4_selector_json_escape(best_it->name) << "\""
-                        << ", \"alt_policy\":\"" << nvfp4_selector_json_escape(alt.policy_name) << "\""
+                        << ", \"base_policy\":\"" << selector_json_escape(best_it->name) << "\""
+                        << ", \"alt_policy\":\"" << selector_json_escape(alt.policy_name) << "\""
                         << ", \"alt_sample_blocks\": " << alt.sample_blocks
                         << ", \"measured_mode\":\"exact_single_tensor\"";
-                    nvfp4_selector_write_json_number_field(sensitivity_report, "base_proxy_score", alt.base_proxy_score);
-                    nvfp4_selector_write_json_number_field(sensitivity_report, "alt_proxy_score", alt.alt_proxy_score);
-                    nvfp4_selector_write_json_number_field(sensitivity_report, "proxy_gain", alt.base_proxy_score - alt.alt_proxy_score);
-                    nvfp4_selector_write_json_number_field(sensitivity_report, "utility", utility);
-                    nvfp4_selector_write_json_number_field(sensitivity_report, "delta_utility", delta_utility);
-                    nvfp4_selector_write_metric_json_fields(sensitivity_report, dm, "");
-                    nvfp4_selector_write_delta_metric_json_fields(sensitivity_report, dm, sensitivity_base);
+                    selector_write_json_number_field(sensitivity_report, "base_proxy_score", alt.base_proxy_score);
+                    selector_write_json_number_field(sensitivity_report, "alt_proxy_score", alt.alt_proxy_score);
+                    selector_write_json_number_field(sensitivity_report, "proxy_gain", alt.base_proxy_score - alt.alt_proxy_score);
+                    selector_write_json_number_field(sensitivity_report, "utility", utility);
+                    selector_write_json_number_field(sensitivity_report, "delta_utility", delta_utility);
+                    selector_write_metric_json_fields(sensitivity_report, dm, "");
+                    selector_write_delta_metric_json_fields(sensitivity_report, dm, sensitivity_base);
                     sensitivity_report << "}\n";
                     ++sensitivity_written;
 
@@ -9051,25 +9379,25 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
-    std::unordered_map<std::string, const nvfp4_selector_policy *> tensor_policy_map;
+    std::unordered_map<std::string, const selector_policy *> tensor_policy_map;
     bool tensor_plan_materialization_state_ready = false;
     if (out_tensor_overrides &&
             best_it != policies.end() &&
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", 1) != 0) {
-        const nvfp4_selector_policy * selected_global_policy = &*best_it;
-        auto choose_tensor_plan_seed_policy = [&]() -> const nvfp4_selector_policy * {
+            selector_control_i64("TENSOR_POLICY_MAP", 1) != 0) {
+        const selector_policy * selected_global_policy = &*best_it;
+        auto choose_tensor_plan_seed_policy = [&]() -> const selector_policy * {
             if (selected_global_policy != nullptr &&
                     !selected_global_policy->proxy_rejected &&
                     !selected_global_policy->tensor_records.empty()) {
                 return selected_global_policy;
             }
-            const nvfp4_selector_policy * baseline_policy = find_current_baseline_policy();
+            const selector_policy * baseline_policy = find_current_baseline_policy();
             if (baseline_policy != nullptr && !baseline_policy->proxy_rejected && !baseline_policy->tensor_records.empty()) {
                 return baseline_policy;
             }
             if (recipe_cfg != nullptr) {
-                auto recipe_it = std::find_if(policies.begin(), policies.end(), [](const nvfp4_selector_policy & policy) {
-                    return nvfp4_selector_policy_is_recipe(policy.name) &&
+                auto recipe_it = std::find_if(policies.begin(), policies.end(), [](const selector_policy & policy) {
+                    return selector_policy_is_recipe(policy.name) &&
                            !policy.proxy_rejected &&
                            !policy.tensor_records.empty();
                 });
@@ -9080,14 +9408,14 @@ static bool nvfp4_selector_choose_policy(
             return best_it->tensor_records.empty() ? nullptr : &*best_it;
         };
 
-        const nvfp4_selector_policy * tensor_plan_seed_policy = choose_tensor_plan_seed_policy();
+        const selector_policy * tensor_plan_seed_policy = choose_tensor_plan_seed_policy();
         const auto base_records = tensor_plan_seed_policy != nullptr
-            ? nvfp4_selector_rsf_record_map(*tensor_plan_seed_policy)
-            : std::unordered_map<std::string, const nvfp4_selector_rsf_tensor_record *>();
+            ? selector_rsf_record_map(*tensor_plan_seed_policy)
+            : std::unordered_map<std::string, const selector_rsf_tensor_record *>();
 
         struct tensor_policy_choice {
             std::string tensor;
-            const nvfp4_selector_policy * policy = nullptr;
+            const selector_policy * policy = nullptr;
             double base_score = std::numeric_limits<double>::infinity();
             double alt_score = std::numeric_limits<double>::infinity();
             double gain = 0.0;
@@ -9118,10 +9446,10 @@ static bool nvfp4_selector_choose_policy(
                         policy.name == "seed_keep" ||
                         policy.proxy_rejected ||
                         policy.tensor_records.empty() ||
-                        nvfp4_selector_cfg_equal(policy.cfg, tensor_plan_seed_policy->cfg)) {
+                        selector_cfg_equal(policy.cfg, tensor_plan_seed_policy->cfg)) {
                     continue;
                 }
-                const auto alt_records = nvfp4_selector_rsf_record_map(policy);
+                const auto alt_records = selector_rsf_record_map(policy);
                 for (const auto & b : all_bindings) {
                     const auto bit = base_records.find(b.name);
                     const auto ait = alt_records.find(b.name);
@@ -9186,7 +9514,7 @@ static bool nvfp4_selector_choose_policy(
                     kv.second);
             }
 
-            auto tensor_plan_policy_for = [&](const nvfp4_selector_binding & b) -> const nvfp4_selector_policy * {
+            auto tensor_plan_policy_for = [&](const selector_binding & b) -> const selector_policy * {
                 const auto mit = tensor_policy_map.find(b.name);
                 return mit != tensor_policy_map.end() && mit->second != nullptr
                     ? mit->second
@@ -9194,9 +9522,9 @@ static bool nvfp4_selector_choose_policy(
             };
 
             auto tensor_plan_digest_hex = [&]() {
-                nvfp4_selector_stageb_digest digest;
+                selector_stageb_digest digest;
                 for (const auto & b : all_bindings) {
-                    const nvfp4_selector_policy * p = tensor_plan_policy_for(b);
+                    const selector_policy * p = tensor_plan_policy_for(b);
                     digest.add_string(b.name);
                     digest.add_string(p != nullptr ? p->name : "");
                     if (p != nullptr) {
@@ -9216,7 +9544,7 @@ static bool nvfp4_selector_choose_policy(
                 key["kind"] = "tensor_plan";
                 key["plan"] = {
                     {"seed", tensor_plan_seed_policy->name},
-	                    {"seed_cfg", nvfp4_selector_stageb_cfg_json(tensor_plan_seed_policy->cfg)},
+	                    {"seed_cfg", selector_stageb_cfg_json(tensor_plan_seed_policy->cfg)},
 	                    {"tensor_count", all_bindings.size()},
 	                    {"switch_count", tensor_policy_map.size()},
 	                    {"plan_hash", tensor_plan_digest_hex()},
@@ -9226,11 +9554,11 @@ static bool nvfp4_selector_choose_policy(
             };
 
 	            bool tensor_plan_keep = true;
-	            nvfp4_selector_derived_metrics tensor_plan_dm;
+	            selector_derived_metrics tensor_plan_dm;
             double tensor_plan_score = std::numeric_limits<double>::infinity();
             auto tensor_plan_exact_guard = [&](
-                    const nvfp4_selector_derived_metrics & plan_dm,
-                    const nvfp4_selector_policy & global_policy,
+                    const selector_derived_metrics & plan_dm,
+                    const selector_policy & global_policy,
                     std::string & reason) -> bool {
                 if (!plan_dm.ok || !global_policy.measured.ok) {
                     reason = "missing exact tensor-plan or global policy metrics";
@@ -9260,10 +9588,10 @@ static bool nvfp4_selector_choose_policy(
                     return false;
                 };
 
-                const nvfp4_selector_derived_metrics & global_dm = global_policy.measured;
-                const double plan_score_one = nvfp4_selector_measured_score_one(plan_dm, rank_cfg);
-                const double global_score_one = nvfp4_selector_measured_score_one(global_dm, rank_cfg);
-                if (nvfp4_selector_compare_measured_score(plan_score_one, global_score_one) > 0) {
+                const selector_derived_metrics & global_dm = global_policy.measured;
+                const double plan_score_one = selector_measured_score_one(plan_dm, rank_cfg);
+                const double global_score_one = selector_measured_score_one(global_dm, rank_cfg);
+                if (selector_compare_measured_score(plan_score_one, global_score_one) > 0) {
                     return reject("score", plan_score_one, global_score_one);
                 }
                 if (!lower_no_worse(plan_dm.mean_kld, global_dm.mean_kld, rank_cfg.mean_kld_abs_floor, 0.0)) {
@@ -9293,11 +9621,11 @@ static bool nvfp4_selector_choose_policy(
             };
             if (have_measured_eval) {
                 const nlohmann::ordered_json tensor_plan_key = make_tensor_plan_key();
-                nvfp4_selector_stageb_cache_entry cached_plan;
+                selector_stageb_cache_entry cached_plan;
                 if (stageb_result_cache.find(tensor_plan_key, "tensor_plan", cached_plan)) {
                     tensor_plan_dm = cached_plan.search;
-                    const nvfp4_selector_metric_rank cached_rank =
-                        nvfp4_selector_rank_policy_metrics(
+                    const selector_metric_rank cached_rank =
+                        selector_rank_policy_metrics(
                             tensor_plan_dm,
                             cached_plan.has_validation ? &cached_plan.validation : nullptr,
                             baseline_eval,
@@ -9311,10 +9639,15 @@ static bool nvfp4_selector_choose_policy(
                         tensor_policy_map.size(),
                         tensor_plan_score,
                         tensor_plan_keep ? "yes" : "no");
+                } else if (!have_runtime_eval) {
+                    tensor_plan_keep = false;
+                    fprintf(stderr,
+                        "%s: selector tensor plan exact cache missing and runtime was skipped; falling back to measured global policy\n",
+                        __func__);
                 } else {
                     auto apply_tensor_plan_patch = [&](
-                            nvfp4_selector_binding & b,
-                            const nvfp4_selector_policy & policy) -> bool {
+                            selector_binding & b,
+                            const selector_policy & policy) -> bool {
                         if (!quantize_binding_ensure_target_bytes(b)) {
                             return false;
                         }
@@ -9392,7 +9725,7 @@ static bool nvfp4_selector_choose_policy(
                     const auto patch_t0 = std::chrono::steady_clock::now();
                     bool plan_patch_ok = true;
                     for (auto & b : all_bindings) {
-                        const nvfp4_selector_policy * materialize_policy = tensor_plan_policy_for(b);
+                        const selector_policy * materialize_policy = tensor_plan_policy_for(b);
                         if (materialize_policy == nullptr ||
                                 !apply_tensor_plan_patch(b, *materialize_policy)) {
                             fprintf(stderr,
@@ -9415,8 +9748,8 @@ static bool nvfp4_selector_choose_policy(
                             all_bindings.size(),
                             tensor_policy_map.size(),
                             std::chrono::duration<double>(patch_t1 - patch_t0).count());
-                        nvfp4_selector_kld_metrics plan_km;
-                        if (!nvfp4_selector_eval_kld_subset(
+                        selector_kld_metrics plan_km;
+                        if (!selector_eval_kld_subset(
                                 lctx,
                                 kld_budget,
                                 params.n_batch,
@@ -9428,9 +9761,9 @@ static bool nvfp4_selector_choose_policy(
                         }
 	                        stageb_runtime_decoded = true;
 	                        tensor_plan_materialization_state_ready = true;
-	                        tensor_plan_dm = nvfp4_selector_derive_metrics(plan_km);
-                        const nvfp4_selector_metric_rank plan_rank =
-                            nvfp4_selector_rank_policy_metrics(
+	                        tensor_plan_dm = selector_derive_metrics(plan_km);
+                        const selector_metric_rank plan_rank =
+                            selector_rank_policy_metrics(
                                 tensor_plan_dm,
                                 nullptr,
                                 baseline_eval,
@@ -9454,7 +9787,7 @@ static bool nvfp4_selector_choose_policy(
                     tensor_plan_score,
                     tensor_plan_keep ? "yes" : "no",
                     tensor_policy_map.size(),
-                    nvfp4_selector_format_metrics("search", tensor_plan_dm).c_str());
+                    selector_format_metrics("search", tensor_plan_dm).c_str());
                 if (tensor_plan_keep &&
                         selected_global_policy != nullptr &&
                         selected_global_policy->measured.ok) {
@@ -9471,7 +9804,7 @@ static bool nvfp4_selector_choose_policy(
             }
 
             if (tensor_plan_keep) {
-                auto seed_it = std::find_if(policies.begin(), policies.end(), [&](const nvfp4_selector_policy & policy) {
+                auto seed_it = std::find_if(policies.begin(), policies.end(), [&](const selector_policy & policy) {
                     return &policy == tensor_plan_seed_policy;
                 });
                 if (seed_it != policies.end()) {
@@ -9500,20 +9833,20 @@ static bool nvfp4_selector_choose_policy(
         *out_kept_seed = out_name == "seed_keep";
     }
 
-    std::vector<ggml_type> candidate_types = selector_type_list_from_control("LLAMA_NVFP4_SELECTOR_CANDIDATE_TYPES");
+    std::vector<ggml_type> candidate_types = selector_type_list_from_control("CANDIDATE_TYPES");
 
-    const std::string candidate_top_raw = quantize_control_string("LLAMA_NVFP4_SELECTOR_CANDIDATE_TOP");
-    const std::string rescue_top_raw = quantize_control_string("LLAMA_NVFP4_SELECTOR_RESCUE_TOP");
-    const int rescue_apply_top = (int) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_TOP", 0));
+    const std::string candidate_top_raw = selector_control_string("CANDIDATE_TOP");
+    const std::string rescue_top_raw = selector_control_string("RESCUE_TOP");
+    const int rescue_apply_top = (int) std::max<int64_t>(0, selector_control_i64("RESCUE_TOP", 0));
     int candidate_apply_top = 0;
     if (!skip_remaining_tuning && out_tensor_overrides && !candidate_types.empty()) {
         if (!candidate_top_raw.empty() || !rescue_top_raw.empty()) {
             candidate_apply_top = (int) std::max<int64_t>(
                 0,
-                quantize_control_i64("LLAMA_NVFP4_SELECTOR_CANDIDATE_TOP", rescue_apply_top));
+                selector_control_i64("CANDIDATE_TOP", rescue_apply_top));
         } else {
             const double candidate_fraction = std::clamp(
-                quantize_control_f64("LLAMA_NVFP4_SELECTOR_CANDIDATE_FRACTION", 0.10),
+                selector_control_f64("CANDIDATE_FRACTION", 0.10),
                 0.0,
                 1.0);
             candidate_apply_top = (int) std::ceil(candidate_fraction * (double) all_bindings.size());
@@ -9522,43 +9855,38 @@ static bool nvfp4_selector_choose_policy(
     const int candidate_report_top_default = candidate_apply_top > 0 ? 12 : 0;
     const int candidate_report_top = (int) std::max<int64_t>(
         0,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_TOP",
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_REPORT_TOP", candidate_report_top_default)));
+        selector_control_i64("CANDIDATE_REPORT_TOP",
+            selector_control_i64("RESCUE_REPORT_TOP", candidate_report_top_default)));
     const size_t candidate_budget_bytes = (size_t) std::max<int64_t>(
         0,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_CANDIDATE_BUDGET_MB",
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_BUDGET_MB", 0))) * 1024ull * 1024ull;
-    const size_t rescue_bf16_budget_bytes = (size_t) std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_BF16_BUDGET_MB", 0)) * 1024ull * 1024ull;
+        selector_control_i64("CANDIDATE_BUDGET_MB",
+            selector_control_i64("RESCUE_BUDGET_MB", 0))) * 1024ull * 1024ull;
+    const size_t rescue_bf16_budget_bytes = (size_t) std::max<int64_t>(0, selector_control_i64("RESCUE_BF16_BUDGET_MB", 0)) * 1024ull * 1024ull;
     const int candidate_class_limit = (int) std::max<int64_t>(
         0,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_CANDIDATE_CLASS_LIMIT",
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_CLASS_LIMIT", 0)));
+        selector_control_i64("CANDIDATE_CLASS_LIMIT",
+            selector_control_i64("RESCUE_CLASS_LIMIT", 0)));
     const int candidate_encoder_refine_top = (int) std::max<int64_t>(
         0,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_CANDIDATE_NVFP4_TOP",
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_TOP", 0)));
+        selector_control_i64("CANDIDATE_NVFP4_TOP",
+            selector_control_i64("RESCUE_NVFP4_TOP", 0)));
     const int64_t candidate_sens_sample_blocks = std::max<int64_t>(
         0,
-        quantize_control_i64(
-            "LLAMA_NVFP4_SELECTOR_CANDIDATE_SAMPLE_BLOCKS",
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_RESCUE_SENS_SAMPLE_BLOCKS", 8192)));
+        selector_control_i64("CANDIDATE_SAMPLE_BLOCKS",
+            selector_control_i64("RESCUE_SENS_SAMPLE_BLOCKS", 8192)));
     const double rescue_nvfp4_min_gain = SELECTOR_RESCUE_NVFP4_MIN_GAIN;
     const double rescue_nvfp4_min_rel_gain = SELECTOR_RESCUE_NVFP4_MIN_REL_GAIN;
     const double rescue_nvfp4_prefer_gain = SELECTOR_RESCUE_NVFP4_PREFER_GAIN;
     const double rescue_nvfp4_prefer_rel_gain = SELECTOR_RESCUE_NVFP4_PREFER_REL_GAIN;
     const double rescue_speed_weight = SELECTOR_RESCUE_SPEED_WEIGHT;
-    const std::string candidate_report_file = !quantize_control_string("LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_FILE").empty()
-        ? quantize_control_string("LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_FILE")
-        : quantize_control_string("LLAMA_NVFP4_SELECTOR_RESCUE_REPORT_FILE");
-	    const std::string candidate_tensor_types_file = !quantize_control_string("LLAMA_NVFP4_SELECTOR_CANDIDATE_TENSOR_TYPES_FILE").empty()
-	        ? quantize_control_string("LLAMA_NVFP4_SELECTOR_CANDIDATE_TENSOR_TYPES_FILE")
-	        : quantize_control_string("LLAMA_NVFP4_SELECTOR_RESCUE_TENSOR_TYPES_FILE");
+    const std::string candidate_report_file = !selector_control_string("CANDIDATE_REPORT_FILE").empty()
+        ? selector_control_string("CANDIDATE_REPORT_FILE")
+        : selector_control_string("RESCUE_REPORT_FILE");
+	    const std::string candidate_tensor_types_file = !selector_control_string("CANDIDATE_TENSOR_TYPES_FILE").empty()
+	        ? selector_control_string("CANDIDATE_TENSOR_TYPES_FILE")
+	        : selector_control_string("RESCUE_TENSOR_TYPES_FILE");
 	    const bool selector_trace = quantize_control_i64("LLAMA_NVFP4_TRACE", 0) != 0;
-	    auto tensor_plan_policy_for_binding = [&](const nvfp4_selector_binding & b) -> const nvfp4_selector_policy * {
+	    auto tensor_plan_policy_for_binding = [&](const selector_binding & b) -> const selector_policy * {
 	        const auto mit = tensor_policy_map.find(b.name);
 	        if (mit != tensor_policy_map.end() && mit->second != nullptr) {
 	            return mit->second;
@@ -9581,7 +9909,7 @@ static bool nvfp4_selector_choose_policy(
 		        size_t replayed = 0;
 	        std::vector<uint8_t> ignored_bytes;
 	        for (auto & b : all_bindings) {
-	            const nvfp4_selector_policy * policy = tensor_plan_policy_for_binding(b);
+	            const selector_policy * policy = tensor_plan_policy_for_binding(b);
 	            if (policy == nullptr || !quantize_binding_ensure_target_bytes(b)) {
 	                return false;
 	            }
@@ -9659,13 +9987,13 @@ static bool nvfp4_selector_choose_policy(
                     continue;
                 }
                 tensor_type_option opt;
-                opt.name = nvfp4_selector_regex_escape(b.name);
+                opt.name = selector_regex_escape(b.name);
                 opt.type = GGML_TYPE_NVFP4;
 	                opt.has_nvfp4_cfg = true;
 	                opt.nvfp4_cfg = mit->second->cfg;
 	                opt.nvfp4_policy_name = mit->second->name;
 	                if (exact_materialization_scales) {
-	                    nvfp4_selector_attach_exact_scales(opt, b);
+	                    selector_attach_exact_scales(opt, b);
 	                }
 	                out_tensor_overrides->push_back(std::move(opt));
 	            }
@@ -9677,19 +10005,19 @@ static bool nvfp4_selector_choose_policy(
         } else if (out_name != "seed_keep" && !all_bindings.empty()) {
             out_tensor_overrides->reserve(out_tensor_overrides->size() + all_bindings.size());
             for (const auto & b : all_bindings) {
-                const nvfp4_selector_policy * materialize_policy = &*best_it;
+                const selector_policy * materialize_policy = &*best_it;
                 const auto mit = tensor_policy_map.find(b.name);
                 if (mit != tensor_policy_map.end() && mit->second != nullptr) {
                     materialize_policy = mit->second;
                 }
                 tensor_type_option opt;
-                opt.name = nvfp4_selector_regex_escape(b.name);
+                opt.name = selector_regex_escape(b.name);
                 opt.type = GGML_TYPE_NVFP4;
 	                opt.has_nvfp4_cfg = true;
 	                opt.nvfp4_cfg = materialize_policy->cfg;
 	                opt.nvfp4_policy_name = materialize_policy->name;
 	                if (exact_materialization_scales) {
-	                    nvfp4_selector_attach_exact_scales(opt, b);
+	                    selector_attach_exact_scales(opt, b);
 	                }
 	                out_tensor_overrides->push_back(std::move(opt));
 	            }
@@ -9698,7 +10026,7 @@ static bool nvfp4_selector_choose_policy(
                 __func__,
                 all_bindings.size(),
                 best_it->name.c_str(),
-                nvfp4_selector_policy_is_rsf_family(*best_it) ? " (RSF)" : "",
+                selector_policy_is_rsf_family(*best_it) ? " (RSF)" : "",
                 tensor_policy_map.size());
         }
     }
@@ -9721,7 +10049,7 @@ static bool nvfp4_selector_choose_policy(
             candidate_report_top,
             candidate_encoder_refine_top,
             format_candidate_types().c_str());
-        std::vector<nvfp4_selector_tensor_sensitivity> sens;
+        std::vector<selector_tensor_sensitivity> sens;
         sens.reserve(all_bindings.size());
         for (size_t bind_i = 0; bind_i < all_bindings.size(); ++bind_i) {
             auto & b = all_bindings[bind_i];
@@ -9731,7 +10059,7 @@ static bool nvfp4_selector_choose_policy(
                     bind_i + 1,
                     all_bindings.size(),
                     b.name.c_str(),
-                    nvfp4_selector_tensor_class_name(b.cls),
+                    selector_tensor_class_name(b.cls),
                     b.bucket,
                     b.layer);
             }
@@ -9740,26 +10068,26 @@ static bool nvfp4_selector_choose_policy(
             double tensor_max = 0.0;
             int64_t tensor_n = 0;
             std::vector<uint8_t> sens_bytes;
-            const nvfp4_selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
+            const selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
             if (!nvfp4_selector_quantize_binding(
                     b, tensor_base_policy->cfg, nthread, sens_bytes,
                     tensor_sq, tensor_abs, tensor_max, tensor_n,
                     candidate_sens_sample_blocks) || tensor_n <= 0) {
                 continue;
             }
-            nvfp4_selector_tensor_sensitivity s;
+            selector_tensor_sensitivity s;
             s.name = b.name;
-            s.role = nvfp4_selector_tensor_role_name(b.name, b.cls);
+            s.role = selector_tensor_role_name(b.name, b.cls);
             s.cls = b.cls;
             s.bucket = b.bucket;
             s.layer = b.layer;
             s.binding_index = &b - all_bindings.data();
             s.target_nbytes = b.target_nbytes;
-            s.q8_type = candidate_types.empty() ? GGML_TYPE_Q8_0 : candidate_types.front();
-            s.q8_nbytes = quantize_tensor_nbytes_as_type(b.source, s.q8_type);
+            s.best_candidate_type = candidate_types.empty() ? GGML_TYPE_Q8_0 : candidate_types.front();
+            s.best_candidate_nbytes = quantize_tensor_nbytes_as_type(b.source, s.best_candidate_type);
             s.bf16_nbytes = quantize_tensor_nbytes_as_type(b.source, GGML_TYPE_BF16);
-            const nvfp4_selector_proxy_metrics proxy_metrics =
-                nvfp4_selector_proxy_score(tensor_sq, tensor_abs, tensor_max, tensor_n);
+            const selector_proxy_metrics proxy_metrics =
+                selector_proxy_score(tensor_sq, tensor_abs, tensor_max, tensor_n);
             if (!proxy_metrics.ok) {
                 continue;
             }
@@ -9769,7 +10097,7 @@ static bool nvfp4_selector_choose_policy(
             s.proxy_score = proxy_metrics.score;
             if (selector_trace) {
                 fprintf(stderr,
-                    "selector sensitivity result [%zu/%zu] tensor=%s nvfp4_error=%.6f rmse=%.6f abs=%.6f max=%.6f samples=%" PRId64 "\n",
+                    "selector sensitivity result [%zu/%zu] tensor=%s baseline_error=%.6f rmse=%.6f abs=%.6f max=%.6f samples=%" PRId64 "\n",
                     bind_i + 1,
                     all_bindings.size(),
                     b.name.c_str(),
@@ -9779,23 +10107,23 @@ static bool nvfp4_selector_choose_policy(
                     s.proxy_max_abs,
                     tensor_n);
             }
-            s.q8_delta_bytes = s.q8_nbytes > s.target_nbytes ? s.q8_nbytes - s.target_nbytes : 0;
+            s.best_candidate_delta_bytes = s.best_candidate_nbytes > s.target_nbytes ? s.best_candidate_nbytes - s.target_nbytes : 0;
             s.bf16_delta_bytes = s.bf16_nbytes > s.target_nbytes ? s.bf16_nbytes - s.target_nbytes : 0;
-            const double hotness = nvfp4_selector_class_hotness(b.cls);
+            const double hotness = selector_class_hotness(b.cls);
             for (const ggml_type candidate_type : candidate_types) {
-                if (!nvfp4_selector_type_candidate_allowed(candidate_type, s.cls)) {
+                if (!selector_type_candidate_allowed(candidate_type, s.cls)) {
                     continue;
                 }
-                nvfp4_selector_type_candidate cand;
+                selector_type_candidate cand;
                 cand.type = candidate_type;
                 cand.nbytes = quantize_tensor_nbytes_as_type(b.source, candidate_type);
                 if (cand.nbytes == 0) {
                     continue;
                 }
                 cand.delta_bytes = cand.nbytes > s.target_nbytes ? cand.nbytes - s.target_nbytes : 0;
-                cand.speed_penalty = hotness * nvfp4_selector_type_speed_penalty(candidate_type);
-                cand.type_gain = nvfp4_selector_tensor_role_type_gain(b.name, b.cls, candidate_type);
-                cand.roi = nvfp4_selector_type_candidate_roi(
+                cand.speed_penalty = hotness * selector_type_speed_penalty(candidate_type);
+                cand.type_gain = selector_tensor_role_type_gain(b.name, b.cls, candidate_type);
+                cand.roi = selector_type_candidate_roi(
                     s.proxy_score,
                     cand.delta_bytes,
                     cand.speed_penalty,
@@ -9811,18 +10139,18 @@ static bool nvfp4_selector_choose_policy(
             });
             if (!s.type_candidates.empty()) {
                 const auto & best_candidate = s.type_candidates.front();
-                s.q8_type = best_candidate.type;
-                s.q8_nbytes = best_candidate.nbytes;
-                s.q8_delta_bytes = best_candidate.delta_bytes;
-                s.q8_speed_penalty = best_candidate.speed_penalty;
-                s.q8_roi = best_candidate.roi;
+                s.best_candidate_type = best_candidate.type;
+                s.best_candidate_nbytes = best_candidate.nbytes;
+                s.best_candidate_delta_bytes = best_candidate.delta_bytes;
+                s.best_candidate_speed_penalty = best_candidate.speed_penalty;
+                s.best_candidate_roi = best_candidate.roi;
             }
-            s.bf16_speed_penalty = hotness * nvfp4_selector_type_speed_penalty(GGML_TYPE_BF16);
-            s.bf16_roi = nvfp4_selector_type_candidate_roi(
+            s.bf16_speed_penalty = hotness * selector_type_speed_penalty(GGML_TYPE_BF16);
+            s.bf16_roi = selector_type_candidate_roi(
                 s.proxy_score,
                 s.bf16_delta_bytes,
                 s.bf16_speed_penalty,
-                nvfp4_selector_type_quality_gain(GGML_TYPE_BF16),
+                selector_type_quality_gain(GGML_TYPE_BF16),
                 rescue_speed_weight);
             sens.push_back(std::move(s));
         }
@@ -9841,11 +10169,11 @@ static bool nvfp4_selector_choose_policy(
         for (int i = 0; i < sensitivity_preview_n; ++i) {
             const auto & s = sens[(size_t) i];
             fprintf(stderr,
-                "selector sensitivity rank=%d tensor=%s role=%s cls=%s bucket=%d layer=%d nvfp4_error=%.6f rmse=%.6f abs=%.6f max=%.6f\n",
+                "selector sensitivity rank=%d tensor=%s role=%s cls=%s bucket=%d layer=%d baseline_error=%.6f rmse=%.6f abs=%.6f max=%.6f\n",
                 i + 1,
                 s.name.c_str(),
                 s.role.c_str(),
-                nvfp4_selector_tensor_class_name(s.cls),
+                selector_tensor_class_name(s.cls),
                 s.bucket,
                 s.layer,
                 s.proxy_score,
@@ -9868,7 +10196,7 @@ static bool nvfp4_selector_choose_policy(
                     std::chrono::steady_clock::now() - candidate_scan_start).count();
                 const double remaining_s =
                     elapsed_s * (double) (candidate_scan_n - clamped_done) / (double) clamped_done;
-                eta_hint = "~" + nvfp4_selector_format_duration(remaining_s) + " tensor_candidate_scan";
+                eta_hint = "~" + selector_format_duration(remaining_s) + " tensor_candidate_scan";
             }
             char detail[512];
             snprintf(detail, sizeof(detail),
@@ -9885,15 +10213,15 @@ static bool nvfp4_selector_choose_policy(
         for (int i = 0; i < candidate_scan_n; ++i) {
             auto & s = sens[(size_t) i];
             auto & b = all_bindings[s.binding_index];
-            const nvfp4_selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
+            const selector_policy * tensor_base_policy = tensor_plan_policy_for_binding(b);
             if (selector_trace) {
                 fprintf(stderr,
-                    "selector candidate scan [%d/%d] tensor=%s role=%s cls=%s bucket=%d layer=%d nvfp4_error=%.6f\n",
+                    "selector candidate scan [%d/%d] tensor=%s role=%s cls=%s bucket=%d layer=%d baseline_error=%.6f\n",
                     i + 1,
                     candidate_scan_n,
                     s.name.c_str(),
                     s.role.c_str(),
-                    nvfp4_selector_tensor_class_name(s.cls),
+                    selector_tensor_class_name(s.cls),
                     s.bucket,
                     s.layer,
                     s.proxy_score);
@@ -9903,7 +10231,31 @@ static bool nvfp4_selector_choose_policy(
             int64_t alt_sample_blocks = 0;
             double base_score = std::numeric_limits<double>::infinity();
             double best_score = std::numeric_limits<double>::infinity();
-            if (!nvfp4_selector_find_tensor_rescue_cfg(
+            const int64_t rescue_nb_total =
+                (b.source->ne[0] * b.source->ne[1]) / SELECTOR_WEIGHT_SAMPLE_BLOCK_SIZE;
+            const int64_t rescue_sample_blocks =
+                selector_rescue_sample_blocks(rescue_nb_total, b.cls);
+            const int64_t rescue_refine_blocks =
+                selector_rescue_refine_blocks(rescue_nb_total, b.cls, rescue_sample_blocks);
+            const int64_t rescue_guard_blocks =
+                selector_rescue_guard_blocks(rescue_nb_total, b.cls, rescue_refine_blocks);
+            const nlohmann::ordered_json tensor_rescue_key = make_tensor_rescue_key(
+                b,
+                tensor_base_policy->cfg,
+                rescue_sample_blocks,
+                rescue_refine_blocks,
+                rescue_guard_blocks);
+            selector_tensor_rescue_cache_entry cached_rescue;
+            bool rescue_ok = false;
+            if (tensor_rescue_cache.find(tensor_rescue_key, s.name, cached_rescue)) {
+                alt_cfg = cached_rescue.cfg;
+                alt_policy_name = cached_rescue.policy;
+                alt_sample_blocks = cached_rescue.sample_blocks;
+                base_score = cached_rescue.base_score;
+                best_score = cached_rescue.best_score;
+                rescue_ok = true;
+            } else {
+                rescue_ok = selector_find_tensor_rescue_cfg(
                     b,
                     tensor_base_policy->cfg,
                     nthread,
@@ -9911,27 +10263,38 @@ static bool nvfp4_selector_choose_policy(
                     alt_policy_name,
                     alt_sample_blocks,
                     base_score,
-                    best_score)) {
+                    best_score);
+                if (rescue_ok) {
+                    selector_tensor_rescue_cache_entry rescue_entry;
+                    rescue_entry.policy = alt_policy_name;
+                    rescue_entry.cfg = alt_cfg;
+                    rescue_entry.sample_blocks = alt_sample_blocks;
+                    rescue_entry.base_score = base_score;
+                    rescue_entry.best_score = best_score;
+                    tensor_rescue_cache.append(tensor_rescue_key, s.name, rescue_entry);
+                }
+            }
+            if (!rescue_ok) {
                 continue;
             }
 
-            s.alt_nvfp4_proxy_score = best_score;
-            s.alt_nvfp4_gain = std::max(0.0, base_score - best_score);
-            s.alt_nvfp4_gain_rel = s.alt_nvfp4_gain / std::max(1e-9, base_score);
-            if ((s.alt_nvfp4_gain >= rescue_nvfp4_min_gain || s.alt_nvfp4_gain_rel >= rescue_nvfp4_min_rel_gain) &&
-                !nvfp4_selector_cfg_equal(alt_cfg, tensor_base_policy->cfg)) {
-                s.has_alt_nvfp4_cfg = true;
-                s.alt_nvfp4_cfg = alt_cfg;
-                s.alt_nvfp4_sample_blocks = alt_sample_blocks;
-                s.alt_nvfp4_policy_name = alt_policy_name;
+            s.alt_nvfp4_encoder_proxy_score = best_score;
+            s.alt_nvfp4_encoder_gain = std::max(0.0, base_score - best_score);
+            s.alt_nvfp4_encoder_gain_rel = s.alt_nvfp4_encoder_gain / std::max(1e-9, base_score);
+            if ((s.alt_nvfp4_encoder_gain >= rescue_nvfp4_min_gain || s.alt_nvfp4_encoder_gain_rel >= rescue_nvfp4_min_rel_gain) &&
+                !selector_cfg_equal(alt_cfg, tensor_base_policy->cfg)) {
+                s.has_alt_nvfp4_encoder_cfg = true;
+                s.alt_nvfp4_encoder_cfg = alt_cfg;
+                s.alt_nvfp4_encoder_sample_blocks = alt_sample_blocks;
+                s.alt_nvfp4_encoder_policy_name = alt_policy_name;
                 if (selector_trace) {
                     fprintf(stderr,
                         "selector candidate alt tensor=%s policy=%s gain=%.6f rel=%.4f sample_blocks=%" PRId64 "\n",
                         s.name.c_str(),
-                        s.alt_nvfp4_policy_name.c_str(),
-                    s.alt_nvfp4_gain,
-                    s.alt_nvfp4_gain_rel,
-                    s.alt_nvfp4_sample_blocks);
+                        s.alt_nvfp4_encoder_policy_name.c_str(),
+                    s.alt_nvfp4_encoder_gain,
+                    s.alt_nvfp4_encoder_gain_rel,
+                    s.alt_nvfp4_encoder_sample_blocks);
                 }
             }
             update_candidate_scan_eta(i + 1, i + 1 == candidate_scan_n);
@@ -9947,14 +10310,14 @@ static bool nvfp4_selector_choose_policy(
                 s.suggested_speed_penalty = best_candidate.speed_penalty;
                 s.suggested_type_gain = best_candidate.type_gain;
             }
-            if (s.has_alt_nvfp4_cfg) {
-                const bool expert_nvfp4_first = nvfp4_selector_expert_class(s.cls);
+            if (s.has_alt_nvfp4_encoder_cfg) {
+                const bool expert_nvfp4_first = selector_expert_class(s.cls);
                 const double nvfp4_priority =
-                    s.alt_nvfp4_gain +
+                    s.alt_nvfp4_encoder_gain +
                     (expert_nvfp4_first ? SELECTOR_TYPE_CANDIDATE_EXPERT_NVFP4_BONUS : SELECTOR_TYPE_CANDIDATE_NVFP4_BONUS) * s.proxy_score;
                 const bool encoder_refine_is_clear_win =
-                    (s.alt_nvfp4_gain >= rescue_nvfp4_prefer_gain ||
-                     s.alt_nvfp4_gain_rel >= rescue_nvfp4_prefer_rel_gain) &&
+                    (s.alt_nvfp4_encoder_gain >= rescue_nvfp4_prefer_gain ||
+                     s.alt_nvfp4_encoder_gain_rel >= rescue_nvfp4_prefer_rel_gain) &&
                     nvfp4_priority > std::max(0.0, s.suggested_priority) * 1.25;
                 if (s.suggested_priority <= 0.0 || encoder_refine_is_clear_win) {
                     s.suggested_type = GGML_TYPE_NVFP4;
@@ -10013,15 +10376,15 @@ static bool nvfp4_selector_choose_policy(
 	        const double candidate_proxy_p75 = proxy_quantile(proxy_scores, 0.75);
         const double candidate_proxy_floor = std::max(candidate_min_error, candidate_proxy_p50 * candidate_outlier_ratio);
         for (auto & s : sens) {
-            const double role_gate = candidate_proxy_floor * nvfp4_selector_tensor_role_gate_mul(s.name, s.cls);
+            const double role_gate = candidate_proxy_floor * selector_tensor_role_gate_mul(s.name, s.cls);
             s.suggested_gate_floor = std::max(candidate_min_error, role_gate);
             s.suggested_error_ratio =
                 s.suggested_gate_floor > 0.0 ? s.proxy_score / s.suggested_gate_floor : 0.0;
-            if (nvfp4_selector_type_is_k_rsf_capable(s.suggested_type)) {
+            if (selector_type_is_k_rsf_capable(s.suggested_type)) {
                 s.has_suggested_k_rsf_mode = true;
                 s.suggested_k_rsf_mode =
                     s.suggested_error_ratio >= 1.25 ||
-                    nvfp4_selector_tensor_role_importance(s.name, s.cls) >= 1.08 ? 2 : 1;
+                    selector_tensor_role_importance(s.name, s.cls) >= 1.08 ? 2 : 1;
             }
         }
         fprintf(stderr,
@@ -10034,7 +10397,7 @@ static bool nvfp4_selector_choose_policy(
 	            candidate_min_error,
 	            candidate_apply_top);
 
-	        auto format_candidate_list = [](const nvfp4_selector_tensor_sensitivity & s) {
+	        auto format_candidate_list = [](const selector_tensor_sensitivity & s) {
 	            std::ostringstream out;
 	            for (size_t i = 0; i < s.type_candidates.size(); ++i) {
 	                const auto & cand = s.type_candidates[i];
@@ -10054,14 +10417,14 @@ static bool nvfp4_selector_choose_policy(
             if (!report) {
                 fprintf(stderr, "%s: failed to open selector candidate report file %s\n", __func__, candidate_report_file.c_str());
             } else {
-                report << "rank,name,role,class,bucket,layer,nvfp4_error,proxy_rmse,proxy_abs_mean,proxy_max_abs,target_nbytes,alt_nvfp4_policy,alt_nvfp4_score,alt_nvfp4_gain,alt_nvfp4_gain_rel,alt_nvfp4_sample_blocks,alt_nvfp4_choose46,alt_nvfp4_refit,alt_nvfp4_compand,alt_nvfp4_cap6,alt_nvfp4_cap4,candidate_scores,suggested_type,suggested_nbytes,suggested_delta_bytes,suggested_speed_penalty,suggested_type_gain,suggested_priority,gate_floor,error_ratio\n";
+                report << "rank,name,role,class,bucket,layer,baseline_error,proxy_rmse,proxy_abs_mean,proxy_max_abs,target_nbytes,alt_nvfp4_encoder_policy,alt_nvfp4_encoder_score,alt_nvfp4_encoder_gain,alt_nvfp4_encoder_gain_rel,alt_nvfp4_encoder_sample_blocks,alt_nvfp4_encoder_choose46,alt_nvfp4_encoder_refit,alt_nvfp4_encoder_compand,alt_nvfp4_encoder_cap6,alt_nvfp4_encoder_cap4,candidate_scores,suggested_type,suggested_nbytes,suggested_delta_bytes,suggested_speed_penalty,suggested_type_gain,suggested_priority,gate_floor,error_ratio\n";
                 for (size_t i = 0; i < sens.size(); ++i) {
                     const auto & s = sens[i];
                     report
                         << (i + 1) << ','
                         << '"' << s.name << '"' << ','
                         << s.role << ','
-                        << nvfp4_selector_tensor_class_name(s.cls) << ','
+                        << selector_tensor_class_name(s.cls) << ','
                         << s.bucket << ','
                         << s.layer << ','
                         << s.proxy_score << ','
@@ -10069,16 +10432,16 @@ static bool nvfp4_selector_choose_policy(
                         << s.proxy_abs_mean << ','
                         << s.proxy_max_abs << ','
                         << s.target_nbytes << ','
-                        << '"' << s.alt_nvfp4_policy_name << '"' << ','
-                        << s.alt_nvfp4_proxy_score << ','
-                        << s.alt_nvfp4_gain << ','
-                        << s.alt_nvfp4_gain_rel << ','
-                        << s.alt_nvfp4_sample_blocks << ','
-                        << nvfp4_choose46_mode_name(s.alt_nvfp4_cfg.choose46_mode) << ','
-                        << s.alt_nvfp4_cfg.refit_iters << ','
-                        << s.alt_nvfp4_cfg.use_compand_sat << ','
-                        << s.alt_nvfp4_cfg.cap_m6 << ','
-                        << s.alt_nvfp4_cfg.cap_m4 << ','
+                        << '"' << s.alt_nvfp4_encoder_policy_name << '"' << ','
+                        << s.alt_nvfp4_encoder_proxy_score << ','
+                        << s.alt_nvfp4_encoder_gain << ','
+                        << s.alt_nvfp4_encoder_gain_rel << ','
+                        << s.alt_nvfp4_encoder_sample_blocks << ','
+                        << nvfp4_choose46_mode_name(s.alt_nvfp4_encoder_cfg.choose46_mode) << ','
+                        << s.alt_nvfp4_encoder_cfg.refit_iters << ','
+                        << s.alt_nvfp4_encoder_cfg.use_compand_sat << ','
+                        << s.alt_nvfp4_encoder_cfg.cap_m6 << ','
+                        << s.alt_nvfp4_encoder_cfg.cap_m4 << ','
                         << '"' << format_candidate_list(s) << '"' << ','
                         << format_selector_suggested_type(s) << ','
                         << s.suggested_nbytes << ','
@@ -10097,10 +10460,10 @@ static bool nvfp4_selector_choose_policy(
         for (int i = 0; i < candidate_report_top && i < (int) sens.size(); ++i) {
             const auto & s = sens[(size_t) i];
             fprintf(stderr,
-                "selector candidate rank=%d tensor=%s role=%s cls=%s bucket=%d layer=%d nvfp4_error=%.6f rmse=%.6f abs=%.6f max=%.6f alt_nvfp4_gain=%.6f alt_nvfp4_rel=%.4f gate=%.6f ratio=%.3f speed_penalty=%.6f delta_bytes=%zu suggest=%s priority=%.6f\n",
-                i + 1, s.name.c_str(), s.role.c_str(), nvfp4_selector_tensor_class_name(s.cls), s.bucket, s.layer,
+                "selector candidate rank=%d tensor=%s role=%s cls=%s bucket=%d layer=%d baseline_error=%.6f rmse=%.6f abs=%.6f max=%.6f alt_nvfp4_encoder_gain=%.6f alt_nvfp4_encoder_rel=%.4f gate=%.6f ratio=%.3f speed_penalty=%.6f delta_bytes=%zu suggest=%s priority=%.6f\n",
+                i + 1, s.name.c_str(), s.role.c_str(), selector_tensor_class_name(s.cls), s.bucket, s.layer,
                 s.proxy_score, s.proxy_rmse, s.proxy_abs_mean, s.proxy_max_abs,
-                s.alt_nvfp4_gain, s.alt_nvfp4_gain_rel,
+                s.alt_nvfp4_encoder_gain, s.alt_nvfp4_encoder_gain_rel,
                 s.suggested_gate_floor, s.suggested_error_ratio,
                 s.suggested_speed_penalty, s.suggested_delta_bytes,
                 format_selector_suggested_type(s).c_str(),
@@ -10129,14 +10492,14 @@ static bool nvfp4_selector_choose_policy(
 	                if (candidate_class_limit > 0 && class_used[(int) s.cls] >= candidate_class_limit) {
 	                    continue;
 	                }
-                if (s.suggested_type == GGML_TYPE_NVFP4 && s.has_alt_nvfp4_cfg) {
+                if (s.suggested_type == GGML_TYPE_NVFP4 && s.has_alt_nvfp4_encoder_cfg) {
                     tensor_type_option opt;
-                    opt.name = nvfp4_selector_regex_escape(s.name);
+                    opt.name = selector_regex_escape(s.name);
                     opt.type = GGML_TYPE_NVFP4;
                     opt.has_nvfp4_cfg = true;
-                    opt.nvfp4_cfg = s.alt_nvfp4_cfg;
-                    opt.nvfp4_sample_blocks = s.alt_nvfp4_sample_blocks;
-                    opt.nvfp4_policy_name = s.alt_nvfp4_policy_name;
+                    opt.nvfp4_cfg = s.alt_nvfp4_encoder_cfg;
+                    opt.nvfp4_sample_blocks = s.alt_nvfp4_encoder_sample_blocks;
+                    opt.nvfp4_policy_name = s.alt_nvfp4_encoder_policy_name;
                     out_tensor_overrides->push_back(std::move(opt));
                     class_used[(int) s.cls]++;
                     ++applied;
@@ -10144,8 +10507,8 @@ static bool nvfp4_selector_choose_policy(
                         "selector candidate apply tensor=%s type=%s policy=%s sample_blocks=%" PRId64 "\n",
                         s.name.c_str(),
                         ggml_type_name(s.suggested_type),
-                        s.alt_nvfp4_policy_name.c_str(),
-                        s.alt_nvfp4_sample_blocks);
+                        s.alt_nvfp4_encoder_policy_name.c_str(),
+                        s.alt_nvfp4_encoder_sample_blocks);
                     continue;
                 }
                 if (s.suggested_type == GGML_TYPE_NVFP4) {
@@ -10165,7 +10528,7 @@ static bool nvfp4_selector_choose_policy(
                     continue;
                 }
                 tensor_type_option opt;
-                opt.name = nvfp4_selector_regex_escape(s.name);
+                opt.name = selector_regex_escape(s.name);
                 opt.type = s.suggested_type;
                 if (s.has_suggested_k_rsf_mode && s.suggested_k_rsf_mode > 0) {
                     opt.has_k_rsf_mode = true;
@@ -10214,7 +10577,7 @@ static bool nvfp4_selector_choose_policy(
         }
     }
 
-    const bool selector_only_control = quantize_control_i64("LLAMA_NVFP4_SELECTOR_ONLY", 0) != 0;
+    const bool selector_only_control = selector_control_i64("ONLY", 0) != 0;
     const int mxfp6_e2m3_scale_top_default = selector_only_control
         ? 0
         : (candidate_apply_top > 0 ? candidate_apply_top : (mxfp6_bindings.empty() ? 0 : 96));
@@ -10233,17 +10596,17 @@ static bool nvfp4_selector_choose_policy(
         mx6_sens.reserve(mxfp6_bindings.size());
         const bool scan_all_mxfp6 = mxfp6_e2m3_scale_top >= (int) mxfp6_bindings.size();
         if (scan_all_mxfp6) {
-            auto class_priority = [](nvfp4_selector_tensor_class cls) {
+            auto class_priority = [](selector_tensor_class cls) {
                 switch (cls) {
-                    case nvfp4_selector_tensor_class::ATTN_QKV:       return 90.0;
-                    case nvfp4_selector_tensor_class::ATTN_OUT:       return 88.0;
-                    case nvfp4_selector_tensor_class::ROUTER:         return 76.0;
-                    case nvfp4_selector_tensor_class::SSM:            return 72.0;
-                    case nvfp4_selector_tensor_class::DENSE_MLP:      return 64.0;
-                    case nvfp4_selector_tensor_class::EXPERT_DOWN:    return 62.0;
-                    case nvfp4_selector_tensor_class::EXPERT_UP_GATE: return 60.0;
-                    case nvfp4_selector_tensor_class::EMBEDDING_OUTPUT:return 40.0;
-                    case nvfp4_selector_tensor_class::OTHER:          return 32.0;
+                    case selector_tensor_class::ATTN_QKV:       return 90.0;
+                    case selector_tensor_class::ATTN_OUT:       return 88.0;
+                    case selector_tensor_class::ROUTER:         return 76.0;
+                    case selector_tensor_class::SSM:            return 72.0;
+                    case selector_tensor_class::DENSE_MLP:      return 64.0;
+                    case selector_tensor_class::EXPERT_DOWN:    return 62.0;
+                    case selector_tensor_class::EXPERT_UP_GATE: return 60.0;
+                    case selector_tensor_class::EMBEDDING_OUTPUT:return 40.0;
+                    case selector_tensor_class::OTHER:          return 32.0;
                 }
                 return 32.0;
             };
@@ -10276,8 +10639,8 @@ static bool nvfp4_selector_choose_policy(
                 }
                 mxfp6_e2m3_scale_sens s;
                 s.binding_index = i;
-                const nvfp4_selector_proxy_metrics proxy_metrics =
-                    nvfp4_selector_proxy_score(sq, ab, mx, n);
+                const selector_proxy_metrics proxy_metrics =
+                    selector_proxy_score(sq, ab, mx, n);
                 if (!proxy_metrics.ok) {
                     continue;
                 }
@@ -10304,8 +10667,8 @@ static bool nvfp4_selector_choose_policy(
             size_t binding_index = 0;
             std::vector<uint8_t> target_bytes;
             std::vector<uint8_t> scale_bytes;
-            nvfp4_selector_device_snapshot target_device;
-            nvfp4_selector_device_snapshot scale_device;
+            selector_device_snapshot target_device;
+            selector_device_snapshot scale_device;
         };
         struct mxfp6_e2m3_scale_pending {
             size_t binding_index = 0;
@@ -10313,22 +10676,22 @@ static bool nvfp4_selector_choose_policy(
             double base_score = 0.0;
             double independent_score = 0.0;
             double replay_score = std::numeric_limits<double>::infinity();
-            nvfp4_selector_derived_metrics base_metrics;
-            nvfp4_selector_derived_metrics independent_metrics;
-            nvfp4_selector_derived_metrics replay_metrics;
+            selector_derived_metrics base_metrics;
+            selector_derived_metrics independent_metrics;
+            selector_derived_metrics replay_metrics;
             bool active = true;
             int replay_count = 0;
         };
 
         std::vector<mxfp6_e2m3_scale_accept> accepted_scales;
         std::vector<mxfp6_e2m3_scale_pending> pending_scales;
-        nvfp4_selector_derived_metrics current_scale_metrics = baseline_eval;
+        selector_derived_metrics current_scale_metrics = baseline_eval;
         int64_t mx6_runtime_direct_patches = 0;
         int64_t mx6_runtime_fallback_patches = 0;
         int64_t mx6_host_materializations = 0;
         int64_t mx6_accepted_snapshot_captures = 0;
         int64_t mx6_accepted_snapshot_failures = 0;
-        nvfp4_selector_restore_counters mx6_accepted_restore_counters;
+        selector_restore_counters mx6_accepted_restore_counters;
         const int pool_per_tensor = (int) std::max<int64_t>(1, MXFP6_SELECTOR_SCALE_POOL_PER_TENSOR);
         const int pool_top = (int) std::max<int64_t>(1, MXFP6_SELECTOR_SCALE_POOL_TOP);
         const int pool_rescore_top = (int) std::max<int64_t>(1, MXFP6_SELECTOR_SCALE_POOL_RESCORE_TOP);
@@ -10354,12 +10717,12 @@ static bool nvfp4_selector_choose_policy(
             }
             return true;
         };
-        auto copy_mxfp6_scale_tensor = [&](nvfp4_selector_binding & b) -> bool {
+        auto copy_mxfp6_scale_tensor = [&](selector_binding & b) -> bool {
             return b.target_scale == nullptr ||
                 quantize_tensor_copy_in(b.target_scale, b.working_scale_bytes.data(), b.target_scale_nbytes);
         };
         auto quantize_mxfp6_runtime_patch = [&](
-                nvfp4_selector_binding & b,
+                selector_binding & b,
                 float mul,
                 bool materialize_host_bytes,
                 double & sq,
@@ -10408,18 +10771,18 @@ static bool nvfp4_selector_choose_policy(
         for (int si = 0; si < scan_n; ++si) {
             auto & b = mxfp6_bindings[mx6_sens[(size_t) si].binding_index];
             std::vector<mxfp6_e2m3_scale_pending> tensor_pending;
-            nvfp4_selector_derived_metrics base_metrics = baseline_eval;
+            selector_derived_metrics base_metrics = baseline_eval;
             if (!base_metrics.ok) {
                 restore_all();
-                nvfp4_selector_kld_metrics base_km;
-                if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, base_km, true)) {
+                selector_kld_metrics base_km;
+                if (!selector_eval_kld_subset(lctx, kld_budget, params.n_batch, base_km, true)) {
                     restore_all();
                     return false;
                 }
-                base_metrics = nvfp4_selector_derive_metrics(base_km);
+                base_metrics = selector_derive_metrics(base_km);
             }
-            const nvfp4_selector_metric_score base_metric_score =
-                nvfp4_selector_score_metrics(base_metrics, &base_metrics, rank_cfg, nvfp4_selector_metric_mode::MXFP6_SCALE);
+            const selector_metric_score base_metric_score =
+                selector_score_metrics(base_metrics, &base_metrics, rank_cfg, selector_metric_mode::MXFP6_SCALE);
             double base_score = base_metric_score.score;
 
             fprintf(stderr,
@@ -10444,14 +10807,14 @@ static bool nvfp4_selector_choose_policy(
                     return false;
                 }
 
-                nvfp4_selector_kld_metrics km;
-                if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
+                selector_kld_metrics km;
+                if (!selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
                     restore_all();
                     return false;
                 }
-                const nvfp4_selector_derived_metrics dm = nvfp4_selector_derive_metrics(km);
-                const nvfp4_selector_metric_score metric_score =
-                    nvfp4_selector_score_metrics(dm, &base_metrics, rank_cfg, nvfp4_selector_metric_mode::MXFP6_SCALE);
+                const selector_derived_metrics dm = selector_derive_metrics(km);
+                const selector_metric_score metric_score =
+                    selector_score_metrics(dm, &base_metrics, rank_cfg, selector_metric_mode::MXFP6_SCALE);
                 const double score = metric_score.score;
                 const bool pass = metric_score.pass;
                 fprintf(stderr,
@@ -10520,12 +10883,12 @@ static bool nvfp4_selector_choose_policy(
                 return a.binding_index < b.binding_index;
             });
 
-            const nvfp4_selector_metric_score base_metric_score =
-                nvfp4_selector_score_metrics(current_scale_metrics, &current_scale_metrics, rank_cfg, nvfp4_selector_metric_mode::MXFP6_SCALE);
+            const selector_metric_score base_metric_score =
+                selector_score_metrics(current_scale_metrics, &current_scale_metrics, rank_cfg, selector_metric_mode::MXFP6_SCALE);
             const double base_score = base_metric_score.score;
             int best_index = -1;
             double best_score = base_score;
-            nvfp4_selector_derived_metrics best_metrics;
+            selector_derived_metrics best_metrics;
             std::vector<uint8_t> best_target_bytes;
             std::vector<uint8_t> best_scale_bytes;
             int rescored = 0;
@@ -10554,14 +10917,14 @@ static bool nvfp4_selector_choose_policy(
                     continue;
                 }
 
-                nvfp4_selector_kld_metrics km;
-                if (!nvfp4_selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
+                selector_kld_metrics km;
+                if (!selector_eval_kld_subset(lctx, kld_budget, params.n_batch, km, true)) {
                     restore_all();
                     return false;
                 }
-                const nvfp4_selector_derived_metrics dm = nvfp4_selector_derive_metrics(km);
-                const nvfp4_selector_metric_score metric_score =
-                    nvfp4_selector_score_metrics(dm, &current_scale_metrics, rank_cfg, nvfp4_selector_metric_mode::MXFP6_SCALE);
+                const selector_derived_metrics dm = selector_derive_metrics(km);
+                const selector_metric_score metric_score =
+                    selector_score_metrics(dm, &current_scale_metrics, rank_cfg, selector_metric_mode::MXFP6_SCALE);
                 const double score = metric_score.score;
                 const bool pass = metric_score.pass;
                 ++pending.replay_count;
@@ -10625,7 +10988,7 @@ static bool nvfp4_selector_choose_policy(
             }
 
             tensor_type_option opt;
-            opt.name = nvfp4_selector_regex_escape(b.name);
+            opt.name = selector_regex_escape(b.name);
             opt.type = GGML_TYPE_MXFP6_E2M3;
             opt.has_mxfp6_scale_mul = true;
             opt.mxfp6_e2m3_scale_mul = accepted_pending.scale_mul;
@@ -10741,6 +11104,21 @@ static bool parse_mixed_format_policy(const char * value, int32_t & out) {
     return false;
 }
 
+static std::string canonical_quantize_cli_option(const char * raw) {
+    if (raw == nullptr) {
+        return {};
+    }
+    std::string arg(raw);
+    static const std::string selector_prefix = "--selector-";
+    if (arg.rfind(selector_prefix, 0) == 0) {
+        if (arg == "--selector-rescue-encoder-top") {
+            return "--nvfp4-selector-rescue-nvfp4-top";
+        }
+        return "--nvfp4-selector-" + arg.substr(selector_prefix.size());
+    }
+    return arg;
+}
+
 int llama_quantize(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     if (argc < 3) {
@@ -10760,7 +11138,7 @@ int llama_quantize(int argc, char ** argv) {
     std::vector<std::pair<std::string, std::string>> selector_controls;
     std::string assignment_jsonl;
     int32_t selector_eval_batch_override = 0;
-    int32_t cli_nvfp4_autotune_threads = 0;
+    int32_t cli_nvfp4_encoder_threads = 0;
     int32_t selector_kld_threads_override = 0;
     quantize_work_mode cli_work_mode = quantize_work_mode::UNSET;
     bool selector_skip_remaining = false;
@@ -10780,6 +11158,9 @@ int llama_quantize(int argc, char ** argv) {
     std::string cli_nvfp4_policy_name;
     const auto add_selector_controls = [&](const char * key, const char * value) {
         selector_controls.emplace_back(key, value);
+    };
+    const auto add_selector_control = [&](const char * suffix, const char * value) {
+        selector_controls.emplace_back(selector_legacy_control_key(suffix), value);
     };
     auto append_selector_skip_policy = [&](const char * value) {
         if (value == nullptr || value[0] == '\0') {
@@ -10828,9 +11209,11 @@ int llama_quantize(int argc, char ** argv) {
     };
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
-        if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
+        const std::string canonical_arg = canonical_quantize_cli_option(argv[arg_idx]);
+        const char * arg_name = canonical_arg.c_str();
+        if (strcmp(arg_name, "--leave-output-tensor") == 0) {
             params.quantize_output_tensor = false;
-        } else if (strcmp(argv[arg_idx], "--output-tensor-type") == 0) {
+        } else if (strcmp(arg_name, "--output-tensor-type") == 0) {
             if (arg_idx < argc-1) {
                 params.output_tensor_type = parse_ggml_type(argv[++arg_idx]);
                 if (params.output_tensor_type == GGML_TYPE_COUNT) {
@@ -10839,7 +11222,7 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--token-embedding-type") == 0) {
+        } else if (strcmp(arg_name, "--token-embedding-type") == 0) {
             if (arg_idx < argc-1) {
                 params.token_embedding_type = parse_ggml_type(argv[++arg_idx]);
                 if (params.token_embedding_type == GGML_TYPE_COUNT) {
@@ -10848,7 +11231,7 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mtp-tensor-type") == 0) {
+        } else if (strcmp(arg_name, "--mtp-tensor-type") == 0) {
             if (arg_idx < argc-1) {
                 params.mtp_tensor_type = parse_ggml_type(argv[++arg_idx]);
                 if (params.mtp_tensor_type == GGML_TYPE_COUNT) {
@@ -10857,11 +11240,11 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--tensor-type") == 0) {
+        } else if (strcmp(arg_name, "--tensor-type") == 0) {
             if (arg_idx == argc-1 || !parse_tensor_type(argv[++arg_idx], tensor_type_opts)) {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-cfg") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-cfg") == 0) {
             if (arg_idx < argc-1) {
                 tensor_type_option opt;
                 if (!parse_tensor_type_nvfp4_cfg(argv[++arg_idx], opt)) {
@@ -10873,7 +11256,7 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-preset") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-preset") == 0) {
             if (arg_idx < argc-1) {
                 if (!parse_nvfp4_preset(argv[++arg_idx], cli_nvfp4_cfg, &cli_nvfp4_policy_name)) {
                     usage(argv[0]);
@@ -10882,17 +11265,17 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-correction-denom") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-correction-denom") == 0) {
             if (arg_idx < argc-1) {
                 const char * value = argv[++arg_idx];
                 if (!parse_nvfp4_scale_denom(value, params.nvfp4_correction_denom)) {
                     usage(argv[0]);
                 }
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CORRECTION_DENOM", value);
+                add_selector_control("CORRECTION_DENOM", value);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-input-scale-policy") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-input-scale-policy") == 0) {
             if (arg_idx < argc-1) {
                 if (!parse_nvfp4_input_scale_policy(argv[++arg_idx], params.nvfp4_input_scale_policy)) {
                     usage(argv[0]);
@@ -10900,19 +11283,19 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-encoder-max-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-encoder-max-blocks") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_controls("LLAMA_NVFP4_ENCODER_MAX_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-encoder-threads") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-encoder-threads") == 0) {
             if (arg_idx < argc-1) {
-                cli_nvfp4_autotune_threads = std::max<int32_t>(1, (int32_t) std::strtol(argv[++arg_idx], nullptr, 10));
+                cli_nvfp4_encoder_threads = std::max<int32_t>(1, (int32_t) std::strtol(argv[++arg_idx], nullptr, 10));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mode") == 0) {
+        } else if (strcmp(arg_name, "--mode") == 0) {
             if (arg_idx < argc-1) {
                 quantize_work_mode mode = quantize_work_mode::UNSET;
                 if (!parse_quantize_work_mode(argv[++arg_idx], mode)) {
@@ -10922,53 +11305,53 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rsf-mode") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rsf-mode") == 0) {
             if (arg_idx < argc-1) {
                 int rsf_mode = NVFP4_CUDA_RSF_MODE_TENSOR;
                 const char * value = argv[++arg_idx];
                 if (!nvfp4_parse_rsf_mode(value, rsf_mode)) {
                     usage(argv[0]);
                 }
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RSF_MODE", nvfp4_rsf_mode_name(rsf_mode));
+                add_selector_control("RSF_MODE", nvfp4_rsf_mode_name(rsf_mode));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rsf-depth") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rsf-depth") == 0) {
             if (arg_idx < argc-1) {
                 int rsf_depth = NVFP4_CUDA_RSF_DEPTH_DEEPER;
                 const char * value = argv[++arg_idx];
                 if (!nvfp4_parse_rsf_depth(value, rsf_depth)) {
                     usage(argv[0]);
                 }
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RSF_DEPTH", nvfp4_rsf_depth_name(rsf_depth));
+                add_selector_control("RSF_DEPTH", nvfp4_rsf_depth_name(rsf_depth));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rsf-report") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rsf-report") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RSF_REPORT_FILE", argv[++arg_idx]);
+                add_selector_control("RSF_REPORT_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--tensor-type-file") == 0) {
+        } else if (strcmp(arg_name, "--tensor-type-file") == 0) {
             if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_type_opts)) {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--prune-layers") == 0) {
+        } else if (strcmp(arg_name, "--prune-layers") == 0) {
             if (arg_idx == argc-1 || !parse_layer_prune(argv[++arg_idx], prune_layers)) {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--override-kv") == 0) {
+        } else if (strcmp(arg_name, "--override-kv") == 0) {
             if (arg_idx == argc-1 || !string_parse_kv_override(argv[++arg_idx], kv_overrides)) {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--patch-base") == 0) {
+        } else if (strcmp(arg_name, "--patch-base") == 0) {
             if (arg_idx < argc-1) {
                 patch_base_model = argv[++arg_idx];
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-tensor-scale") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-tensor-scale") == 0) {
             if (arg_idx < argc-1) {
                 if (!parse_on_off_value(argv[++arg_idx], params.mxfp6_tensor_scale)) {
                     usage(argv[0]);
@@ -10976,49 +11359,49 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-min-savings") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-min-savings") == 0) {
             if (arg_idx < argc-1) {
                 params.mxfp6_min_savings_bytes = std::max<int64_t>(0, std::stoll(argv[++arg_idx]));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-input-scale-denom") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-input-scale-denom") == 0) {
             if (arg_idx < argc-1) {
                 params.mxfp6_input_scale_denom = std::max(0.0f, std::strtof(argv[++arg_idx], nullptr));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-input-scale-quantile") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-input-scale-quantile") == 0) {
             if (arg_idx < argc-1) {
                 params.mxfp6_input_scale_quantile = std::clamp(std::strtof(argv[++arg_idx], nullptr), 0.0f, 1.0f);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-tensor-scale-sample-blocks") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-tensor-scale-sample-blocks") == 0) {
             if (arg_idx < argc-1) {
                 params.mxfp6_tensor_scale_sample_blocks = std::max<int64_t>(0, std::stoll(argv[++arg_idx]));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-tensor-scale-steps") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-tensor-scale-steps") == 0) {
             if (arg_idx < argc-1) {
                 params.mxfp6_tensor_scale_steps = (int32_t) std::max<int64_t>(0, std::stoll(argv[++arg_idx]));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-selector-scale-top") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-selector-scale-top") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_controls("LLAMA_MXFP6_SELECTOR_SCALE_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mxfp6_e2m3-selector-scale-candidates") == 0) {
+        } else if (strcmp(arg_name, "--mxfp6_e2m3-selector-scale-candidates") == 0) {
             if (arg_idx < argc-1) {
                 add_selector_controls("LLAMA_MXFP6_SELECTOR_SCALE_CANDIDATES", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-format-policy") == 0) {
+        } else if (strcmp(arg_name, "--mixed-format-policy") == 0) {
             if (arg_idx < argc-1) {
                 if (!parse_mixed_format_policy(argv[++arg_idx], params.nv4mx6_policy)) {
                     usage(argv[0]);
@@ -11026,471 +11409,471 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-mx6-penalty") == 0) {
+        } else if (strcmp(arg_name, "--mixed-mx6-penalty") == 0) {
             if (arg_idx < argc-1) {
                 params.nv4mx6_mx6_penalty = std::max(0.0f, std::strtof(argv[++arg_idx], nullptr));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-bf16-mx6-threshold") == 0) {
+        } else if (strcmp(arg_name, "--mixed-bf16-mx6-threshold") == 0) {
             if (arg_idx < argc-1) {
                 params.nv4mx6_bf16_mx6_max_sse_ratio = std::max(0.0f, std::strtof(argv[++arg_idx], nullptr));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-sample-blocks") == 0) {
+        } else if (strcmp(arg_name, "--mixed-sample-blocks") == 0) {
             if (arg_idx < argc-1) {
                 params.mixed_format_sample_blocks = std::max<int64_t>(0, std::stoll(argv[++arg_idx]));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-sample-cap") == 0) {
+        } else if (strcmp(arg_name, "--mixed-sample-cap") == 0) {
             if (arg_idx < argc-1) {
                 params.mixed_format_sample_cap = std::max<int64_t>(0, std::stoll(argv[++arg_idx]));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-imatrix-weight-blend") == 0) {
+        } else if (strcmp(arg_name, "--mixed-imatrix-weight-blend") == 0) {
             if (arg_idx < argc-1) {
                 params.mixed_format_imatrix_blend = std::strtof(argv[++arg_idx], nullptr);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-imatrix-weight-power") == 0) {
+        } else if (strcmp(arg_name, "--mixed-imatrix-weight-power") == 0) {
             if (arg_idx < argc-1) {
                 params.mixed_format_imatrix_power = std::strtof(argv[++arg_idx], nullptr);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-imatrix-weight-min") == 0) {
+        } else if (strcmp(arg_name, "--mixed-imatrix-weight-min") == 0) {
             if (arg_idx < argc-1) {
                 params.mixed_format_imatrix_min = std::strtof(argv[++arg_idx], nullptr);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--mixed-imatrix-weight-max") == 0) {
+        } else if (strcmp(arg_name, "--mixed-imatrix-weight-max") == 0) {
             if (arg_idx < argc-1) {
                 params.mixed_format_imatrix_max = std::strtof(argv[++arg_idx], nullptr);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-kld") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-kld") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_KLD_FILE", argv[++arg_idx]);
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_ENABLE_EVAL", "1");
+                add_selector_control("KLD_FILE", argv[++arg_idx]);
+                add_selector_control("ENABLE_EVAL", "1");
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-ledger") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-ledger") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_LEDGER_FILE", argv[++arg_idx]);
+                add_selector_control("LEDGER_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-checkpoint-model") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-checkpoint-model") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CHECKPOINT_MODEL", argv[++arg_idx]);
+                add_selector_control("CHECKPOINT_MODEL", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-cache-dir") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-cache-dir") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CACHE_DIR", argv[++arg_idx]);
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", "1");
+                add_selector_control("CACHE_DIR", argv[++arg_idx]);
+                add_selector_control("KEEP_CHECKPOINT", "1");
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-keep-checkpoint") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-require-runtime-cache") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_REQUIRE_RUNTIME_CACHE", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-skip-file") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-keep-checkpoint") == 0) {
+            add_selector_control("KEEP_CHECKPOINT", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-require-runtime-cache") == 0) {
+            add_selector_control("REQUIRE_RUNTIME_CACHE", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-skip-file") == 0) {
             if (arg_idx < argc-1) {
                 selector_skip_file = argv[++arg_idx];
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-skip-remaining") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-skip-remaining") == 0) {
             selector_skip_remaining = true;
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-stagea-sample-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-stagea-sample-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", argv[++arg_idx]);
+                add_selector_control("STAGEA_SAMPLE_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-stagea-max-policies") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-stagea-max-policies") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", argv[++arg_idx]);
+                add_selector_control("STAGEA_MAX_POLICIES", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-awq-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-awq-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_AWQ_TOP", argv[++arg_idx]);
+                add_selector_control("AWQ_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-skip-policy") == 0) {
-            if (arg_idx < argc-1) {
-                append_selector_skip_policy(argv[++arg_idx]);
-            } else {
-                usage(argv[0]);
-            }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-skip-policies") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-skip-policy") == 0) {
             if (arg_idx < argc-1) {
                 append_selector_skip_policy(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-include-policy") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-skip-policies") == 0) {
+            if (arg_idx < argc-1) {
+                append_selector_skip_policy(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(arg_name, "--nvfp4-selector-include-policy") == 0) {
             if (arg_idx < argc-1) {
                 append_selector_include_policy(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-include-policies") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-include-policies") == 0) {
             if (arg_idx < argc-1) {
                 append_selector_include_policy(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-tensor-policy-map") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-no-tensor-policy-map") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_TENSOR_POLICY_MAP", "0");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-refine-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-tensor-policy-map") == 0) {
+            add_selector_control("TENSOR_POLICY_MAP", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-no-tensor-policy-map") == 0) {
+            add_selector_control("TENSOR_POLICY_MAP", "0");
+        } else if (strcmp(arg_name, "--nvfp4-selector-refine-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_REFINE_TOP", argv[++arg_idx]);
+                add_selector_control("REFINE_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-refine-budget") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-refine-budget") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", argv[++arg_idx]);
+                add_selector_control("REFINE_BUDGET", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-survey-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-survey-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", argv[++arg_idx]);
+                add_selector_control("SURVEY_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-survey-sample-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-survey-sample-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", argv[++arg_idx]);
+                add_selector_control("SURVEY_SAMPLE_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-max-tensors") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-max-tensors") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_MAX_TENSORS", argv[++arg_idx]);
+                add_selector_control("MAX_TENSORS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-trace") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-trace") == 0) {
             add_selector_controls("LLAMA_NVFP4_TRACE", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-policy-threads") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-policy-threads") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_POLICY_THREADS", argv[++arg_idx]);
+                add_selector_control("POLICY_THREADS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-stageb-patch-eval") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEB_PATCH_EVAL", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-stageb-direct-verify") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEB_DIRECT_VERIFY", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-no-stageb-direct-verify") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_STAGEB_DIRECT_VERIFY", "0");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-threads") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-stageb-patch-eval") == 0) {
+            add_selector_control("STAGEB_PATCH_EVAL", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-stageb-direct-verify") == 0) {
+            add_selector_control("STAGEB_DIRECT_VERIFY", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-no-stageb-direct-verify") == 0) {
+            add_selector_control("STAGEB_DIRECT_VERIFY", "0");
+        } else if (strcmp(arg_name, "--nvfp4-selector-threads") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_THREADS", argv[++arg_idx]);
+                add_selector_control("THREADS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-kld-threads") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-kld-threads") == 0) {
             if (arg_idx < argc-1) {
                 selector_kld_threads_override = std::max<int32_t>(1, (int32_t) std::strtol(argv[++arg_idx], nullptr, 10));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-auto-rescue") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-auto-rescue") == 0) {
             add_selector_controls("LLAMA_NVFP4_AUTO_RESCUE", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-only") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_ONLY", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-eval-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-only") == 0) {
+            add_selector_control("ONLY", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-eval-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_EVAL_TOP", argv[++arg_idx]);
+                add_selector_control("EVAL_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-n-seq") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-n-seq") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_N_SEQ", argv[++arg_idx]);
+                add_selector_control("N_SEQ", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-eval-batch") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-eval-batch") == 0) {
             if (arg_idx < argc-1) {
                 selector_eval_batch_override = std::max<int32_t>(1, (int32_t) std::strtol(argv[++arg_idx], nullptr, 10));
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-n-gpu-layers") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-n-gpu-layers") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_N_GPU_LAYERS", argv[++arg_idx]);
+                add_selector_control("N_GPU_LAYERS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-sensitivity-report") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-sensitivity-report") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_SENSITIVITY_REPORT_FILE", argv[++arg_idx]);
+                add_selector_control("SENSITIVITY_REPORT_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-sensitivity-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-sensitivity-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_SENSITIVITY_TOP", argv[++arg_idx]);
+                add_selector_control("SENSITIVITY_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-sensitivity-layer") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-sensitivity-layer") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_SENSITIVITY_LAYER", argv[++arg_idx]);
+                add_selector_control("SENSITIVITY_LAYER", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-sensitivity-tensor") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-sensitivity-tensor") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_SENSITIVITY_TENSOR", argv[++arg_idx]);
+                add_selector_control("SENSITIVITY_TENSOR", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-sensitivity-sample-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-sensitivity-sample-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_SENSITIVITY_SAMPLE_BLOCKS", argv[++arg_idx]);
+                add_selector_control("SENSITIVITY_SAMPLE_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-type") == 0) {
-            if (arg_idx < argc-1) {
-                append_selector_candidate_type(argv[++arg_idx]);
-            } else {
-                usage(argv[0]);
-            }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-types") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-type") == 0) {
             if (arg_idx < argc-1) {
                 append_selector_candidate_type(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-types") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_TOP", argv[++arg_idx]);
+                append_selector_candidate_type(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-fraction") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_FRACTION", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-budget-mb") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-fraction") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_BUDGET_MB", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_FRACTION", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-class-limit") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-budget-mb") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_CLASS_LIMIT", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_BUDGET_MB", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-report-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-class-limit") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_TOP", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_CLASS_LIMIT", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-sample-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-report-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_SAMPLE_BLOCKS", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_REPORT_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-report") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-sample-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_FILE", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_SAMPLE_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-candidate-tensor-types") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-report") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_TENSOR_TYPES_FILE", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_REPORT_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-candidate-tensor-types") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_TOP", argv[++arg_idx]);
+                add_selector_control("CANDIDATE_TENSOR_TYPES_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-report-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_REPORT_TOP", argv[++arg_idx]);
+                add_selector_control("RESCUE_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-budget-mb") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-report-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_BUDGET_MB", argv[++arg_idx]);
+                add_selector_control("RESCUE_REPORT_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-bf16-budget-mb") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-budget-mb") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_BF16_BUDGET_MB", argv[++arg_idx]);
+                add_selector_control("RESCUE_BUDGET_MB", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-class-limit") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-bf16-budget-mb") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_CLASS_LIMIT", argv[++arg_idx]);
+                add_selector_control("RESCUE_BF16_BUDGET_MB", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-nvfp4-top") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-class-limit") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_TOP", argv[++arg_idx]);
+                add_selector_control("RESCUE_CLASS_LIMIT", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-sample-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-nvfp4-top") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_SENS_SAMPLE_BLOCKS", argv[++arg_idx]);
+                add_selector_control("RESCUE_NVFP4_TOP", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-coarse-max-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-sample-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_MAX_BLOCKS", argv[++arg_idx]);
+                add_selector_control("RESCUE_SENS_SAMPLE_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-refine-max-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-coarse-max-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_MAX_BLOCKS", argv[++arg_idx]);
+                add_selector_control("RESCUE_NVFP4_MAX_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-guard-max-blocks") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-refine-max-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_MAX_BLOCKS", argv[++arg_idx]);
+                add_selector_control("RESCUE_NVFP4_REFINE_MAX_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-report") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-guard-max-blocks") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_REPORT_FILE", argv[++arg_idx]);
+                add_selector_control("RESCUE_NVFP4_GUARD_MAX_BLOCKS", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rescue-tensor-types") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-report") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RESCUE_TENSOR_TYPES_FILE", argv[++arg_idx]);
+                add_selector_control("RESCUE_REPORT_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-kld-penalty") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rescue-tensor-types") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", argv[++arg_idx]);
+                add_selector_control("RESCUE_TENSOR_TYPES_FILE", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-p99-penalty") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-kld-penalty") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", argv[++arg_idx]);
+                add_selector_control("RANK_KLD_PENALTY", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-p999-penalty") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-p99-penalty") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", argv[++arg_idx]);
+                add_selector_control("RANK_P99_PENALTY", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-max-kld-penalty") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-p999-penalty") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", argv[++arg_idx]);
+                add_selector_control("RANK_P999_PENALTY", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-kld-threshold") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-max-kld-penalty") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_KLD_THRESHOLD", argv[++arg_idx]);
+                add_selector_control("RANK_MAX_KLD_PENALTY", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-kld-hard-gate") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_KLD_HARD_GATE", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-p99-threshold") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-kld-threshold") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_P99_THRESHOLD", argv[++arg_idx]);
+                add_selector_control("RANK_KLD_THRESHOLD", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-p99-hard-gate") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_P99_HARD_GATE", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-p999-threshold") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-kld-hard-gate") == 0) {
+            add_selector_control("RANK_KLD_HARD_GATE", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-p99-threshold") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_P999_THRESHOLD", argv[++arg_idx]);
+                add_selector_control("RANK_P99_THRESHOLD", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-p999-hard-gate") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_P999_HARD_GATE", "1");
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-max-kld-threshold") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-p99-hard-gate") == 0) {
+            add_selector_control("RANK_P99_HARD_GATE", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-p999-threshold") == 0) {
             if (arg_idx < argc-1) {
-                add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_THRESHOLD", argv[++arg_idx]);
+                add_selector_control("RANK_P999_THRESHOLD", argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--nvfp4-selector-rank-max-kld-hard-gate") == 0) {
-            add_selector_controls("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_HARD_GATE", "1");
-        } else if (strcmp(argv[arg_idx], "--assignment-jsonl") == 0) {
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-p999-hard-gate") == 0) {
+            add_selector_control("RANK_P999_HARD_GATE", "1");
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-max-kld-threshold") == 0) {
+            if (arg_idx < argc-1) {
+                add_selector_control("RANK_MAX_KLD_THRESHOLD", argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(arg_name, "--nvfp4-selector-rank-max-kld-hard-gate") == 0) {
+            add_selector_control("RANK_MAX_KLD_HARD_GATE", "1");
+        } else if (strcmp(arg_name, "--assignment-jsonl") == 0) {
             if (arg_idx < argc-1) {
                 assignment_jsonl = argv[++arg_idx];
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
+        } else if (strcmp(arg_name, "--dry-run") == 0) {
             params.dry_run = true;
-        } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
+        } else if (strcmp(arg_name, "--allow-requantize") == 0) {
             params.allow_requantize = true;
-        } else if (strcmp(argv[arg_idx], "--pure") == 0) {
+        } else if (strcmp(arg_name, "--pure") == 0) {
             params.pure = true;
-        } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
+        } else if (strcmp(arg_name, "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--include-weights") == 0) {
+        } else if (strcmp(arg_name, "--include-weights") == 0) {
             if (arg_idx < argc-1) {
                 included_weights.emplace_back(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--exclude-weights") == 0) {
+        } else if (strcmp(arg_name, "--exclude-weights") == 0) {
             if (arg_idx < argc-1) {
                 excluded_weights.emplace_back(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
-        } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
+        } else if (strcmp(arg_name, "--keep-split") == 0) {
             params.keep_split = true;
         } else {
             usage(argv[0]);
@@ -11510,12 +11893,22 @@ int llama_quantize(int argc, char ** argv) {
             return entry.first == key;
         });
     };
+    auto selector_control_args_has = [&](const char * suffix) {
+        const std::string key = selector_legacy_control_key(suffix);
+        return selector_controls_has(key.c_str());
+    };
     auto add_selector_controls_default = [&](const char * key, const char * value) {
         if (!selector_controls_has(key)) {
             selector_controls.emplace_back(key, value);
         }
     };
-    const bool selector_kld_requested_cli = selector_controls_has("LLAMA_NVFP4_SELECTOR_KLD_FILE");
+    auto add_selector_control_default = [&](const char * suffix, const char * value) {
+        const std::string key = selector_legacy_control_key(suffix);
+        if (!selector_controls_has(key.c_str())) {
+            selector_controls.emplace_back(key, value);
+        }
+    };
+    const bool selector_kld_requested_cli = selector_control_args_has("KLD_FILE");
     if (selector_kld_requested_cli && cli_work_mode == quantize_work_mode::UNSET) {
         fprintf(stderr, "llama_quantize: saved-logit selector runs require --mode fast|normal|deep\n");
         return 1;
@@ -11529,90 +11922,90 @@ int llama_quantize(int argc, char ** argv) {
         switch (mode) {
             case quantize_work_mode::FAST:
                 add_selector_controls_default("LLAMA_SELECTOR_TENSOR_POLICY_PROXY_ABS_GAIN", "0.0005");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RSF_DEPTH", "deeper");
+                add_selector_control_default("RSF_DEPTH", "deeper");
                 add_selector_controls_default("LLAMA_NVFP4_ENCODER_MAX_BLOCKS", "8192");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "2048");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_AWQ_TOP", "4");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_TOP", "12");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", "96");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "48");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", "2048");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "4");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", "4.0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", "1.5");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", "0.75");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", "0.10");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_TOP", "17");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_NVFP4_TOP", "6");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_SAMPLE_BLOCKS", "2048");
+                add_selector_control_default("STAGEA_SAMPLE_BLOCKS", "2048");
+                add_selector_control_default("STAGEA_MAX_POLICIES", "0");
+                add_selector_control_default("AWQ_TOP", "4");
+                add_selector_control_default("REFINE_TOP", "12");
+                add_selector_control_default("REFINE_BUDGET", "96");
+                add_selector_control_default("SURVEY_TOP", "48");
+                add_selector_control_default("SURVEY_SAMPLE_BLOCKS", "2048");
+                add_selector_control_default("EVAL_TOP", "4");
+                add_selector_control_default("RANK_KLD_PENALTY", "4.0");
+                add_selector_control_default("RANK_P99_PENALTY", "1.5");
+                add_selector_control_default("RANK_P999_PENALTY", "0.75");
+                add_selector_control_default("RANK_MAX_KLD_PENALTY", "0.10");
+                add_selector_control_default("CANDIDATE_TOP", "17");
+                add_selector_control_default("CANDIDATE_NVFP4_TOP", "6");
+                add_selector_control_default("CANDIDATE_SAMPLE_BLOCKS", "2048");
                 add_selector_controls_default("LLAMA_SELECTOR_TYPE_CANDIDATE_OUTLIER_RATIO", "1.35");
                 add_selector_controls_default("LLAMA_SELECTOR_TYPE_CANDIDATE_MIN_ERROR", "0.030");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_MAX_BLOCKS", "8192");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_MAX_BLOCKS", "8192");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_MAX_BLOCKS", "16384");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_POLICY_BUDGET", "8");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_TOP", "1");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_TOP", "1");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_TOP", "17");
+                add_selector_control_default("RESCUE_NVFP4_MAX_BLOCKS", "8192");
+                add_selector_control_default("RESCUE_NVFP4_REFINE_MAX_BLOCKS", "8192");
+                add_selector_control_default("RESCUE_NVFP4_GUARD_MAX_BLOCKS", "16384");
+                add_selector_control_default("RESCUE_NVFP4_POLICY_BUDGET", "8");
+                add_selector_control_default("RESCUE_NVFP4_REFINE_TOP", "1");
+                add_selector_control_default("RESCUE_NVFP4_GUARD_TOP", "1");
+                add_selector_control_default("CANDIDATE_REPORT_TOP", "17");
                 break;
             case quantize_work_mode::NORMAL:
                 add_selector_controls_default("LLAMA_SELECTOR_TENSOR_POLICY_PROXY_ABS_GAIN", "0.0002");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RSF_DEPTH", "deeper");
+                add_selector_control_default("RSF_DEPTH", "deeper");
                 add_selector_controls_default("LLAMA_NVFP4_ENCODER_MAX_BLOCKS", "32768");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "8192");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_AWQ_TOP", "4");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_TOP", "24");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", "192");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "64");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", "8192");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "8");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", "4.0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", "3.0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", "1.5");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", "0.35");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_TOP", "40");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_NVFP4_TOP", "12");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_SAMPLE_BLOCKS", "4096");
+                add_selector_control_default("STAGEA_SAMPLE_BLOCKS", "8192");
+                add_selector_control_default("STAGEA_MAX_POLICIES", "0");
+                add_selector_control_default("AWQ_TOP", "4");
+                add_selector_control_default("REFINE_TOP", "24");
+                add_selector_control_default("REFINE_BUDGET", "192");
+                add_selector_control_default("SURVEY_TOP", "64");
+                add_selector_control_default("SURVEY_SAMPLE_BLOCKS", "8192");
+                add_selector_control_default("EVAL_TOP", "8");
+                add_selector_control_default("RANK_KLD_PENALTY", "4.0");
+                add_selector_control_default("RANK_P99_PENALTY", "3.0");
+                add_selector_control_default("RANK_P999_PENALTY", "1.5");
+                add_selector_control_default("RANK_MAX_KLD_PENALTY", "0.35");
+                add_selector_control_default("CANDIDATE_TOP", "40");
+                add_selector_control_default("CANDIDATE_NVFP4_TOP", "12");
+                add_selector_control_default("CANDIDATE_SAMPLE_BLOCKS", "4096");
                 add_selector_controls_default("LLAMA_SELECTOR_TYPE_CANDIDATE_OUTLIER_RATIO", "1.15");
                 add_selector_controls_default("LLAMA_SELECTOR_TYPE_CANDIDATE_MIN_ERROR", "0.020");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_MAX_BLOCKS", "16384");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_MAX_BLOCKS", "32768");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_MAX_BLOCKS", "32768");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_POLICY_BUDGET", "12");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_TOP", "2");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_TOP", "1");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_TOP", "40");
+                add_selector_control_default("RESCUE_NVFP4_MAX_BLOCKS", "16384");
+                add_selector_control_default("RESCUE_NVFP4_REFINE_MAX_BLOCKS", "32768");
+                add_selector_control_default("RESCUE_NVFP4_GUARD_MAX_BLOCKS", "32768");
+                add_selector_control_default("RESCUE_NVFP4_POLICY_BUDGET", "12");
+                add_selector_control_default("RESCUE_NVFP4_REFINE_TOP", "2");
+                add_selector_control_default("RESCUE_NVFP4_GUARD_TOP", "1");
+                add_selector_control_default("CANDIDATE_REPORT_TOP", "40");
                 break;
             case quantize_work_mode::DEEP:
                 add_selector_controls_default("LLAMA_SELECTOR_TENSOR_POLICY_PROXY_ABS_GAIN", "0.0001");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RSF_DEPTH", "exhaustive");
+                add_selector_control_default("RSF_DEPTH", "exhaustive");
                 add_selector_controls_default("LLAMA_NVFP4_ENCODER_MAX_BLOCKS", "65536");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_SAMPLE_BLOCKS", "16384");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_AWQ_TOP", "4");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_TOP", "24");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_REFINE_BUDGET", "192");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "64");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_SURVEY_SAMPLE_BLOCKS", "16384");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "16");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", "4.0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", "3.0");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", "1.5");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", "0.35");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_TOP", "96");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_NVFP4_TOP", "24");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_SAMPLE_BLOCKS", "8192");
+                add_selector_control_default("STAGEA_SAMPLE_BLOCKS", "16384");
+                add_selector_control_default("STAGEA_MAX_POLICIES", "0");
+                add_selector_control_default("AWQ_TOP", "4");
+                add_selector_control_default("REFINE_TOP", "24");
+                add_selector_control_default("REFINE_BUDGET", "192");
+                add_selector_control_default("SURVEY_TOP", "64");
+                add_selector_control_default("SURVEY_SAMPLE_BLOCKS", "16384");
+                add_selector_control_default("EVAL_TOP", "16");
+                add_selector_control_default("RANK_KLD_PENALTY", "4.0");
+                add_selector_control_default("RANK_P99_PENALTY", "3.0");
+                add_selector_control_default("RANK_P999_PENALTY", "1.5");
+                add_selector_control_default("RANK_MAX_KLD_PENALTY", "0.35");
+                add_selector_control_default("CANDIDATE_TOP", "88");
+                add_selector_control_default("CANDIDATE_NVFP4_TOP", "22");
+                add_selector_control_default("CANDIDATE_SAMPLE_BLOCKS", "8192");
                 add_selector_controls_default("LLAMA_SELECTOR_TYPE_CANDIDATE_OUTLIER_RATIO", "1.03");
                 add_selector_controls_default("LLAMA_SELECTOR_TYPE_CANDIDATE_MIN_ERROR", "0.010");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_MAX_BLOCKS", "32768");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_MAX_BLOCKS", "32768");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_MAX_BLOCKS", "65536");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_POLICY_BUDGET", "12");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_REFINE_TOP", "2");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_RESCUE_NVFP4_GUARD_TOP", "1");
-                add_selector_controls_default("LLAMA_NVFP4_SELECTOR_CANDIDATE_REPORT_TOP", "64");
+                add_selector_control_default("RESCUE_NVFP4_MAX_BLOCKS", "32768");
+                add_selector_control_default("RESCUE_NVFP4_REFINE_MAX_BLOCKS", "32768");
+                add_selector_control_default("RESCUE_NVFP4_GUARD_MAX_BLOCKS", "65536");
+                add_selector_control_default("RESCUE_NVFP4_POLICY_BUDGET", "12");
+                add_selector_control_default("RESCUE_NVFP4_REFINE_TOP", "2");
+                add_selector_control_default("RESCUE_NVFP4_GUARD_TOP", "1");
+                add_selector_control_default("CANDIDATE_REPORT_TOP", "64");
                 break;
             case quantize_work_mode::UNSET:
                 break;
@@ -11621,15 +12014,15 @@ int llama_quantize(int argc, char ** argv) {
     };
     add_work_mode_defaults(cli_work_mode);
     if (!selector_candidate_types_cli.empty()) {
-        add_selector_controls("LLAMA_NVFP4_SELECTOR_CANDIDATE_TYPES", selector_candidate_types_cli.c_str());
+        add_selector_control("CANDIDATE_TYPES", selector_candidate_types_cli.c_str());
     }
     if (!selector_include_policies_cli.empty()) {
-        add_selector_controls("LLAMA_NVFP4_SELECTOR_INCLUDE_POLICIES", selector_include_policies_cli.c_str());
+        add_selector_control("INCLUDE_POLICIES", selector_include_policies_cli.c_str());
     }
     if (!selector_skip_policies_cli.empty()) {
-        add_selector_controls("LLAMA_NVFP4_SELECTOR_SKIP_POLICIES", selector_skip_policies_cli.c_str());
+        add_selector_control("SKIP_POLICIES", selector_skip_policies_cli.c_str());
     }
-    nvfp4_selector_set_skip_state(selector_skip_file, selector_skip_remaining);
+    selector_set_skip_state(selector_skip_file, selector_skip_remaining);
     std::vector<std::string> imatrix_datasets;
     std::unordered_map<std::string, std::vector<float>> imatrix_data;
     std::vector<llama_model_imatrix_data> imatrix_entries;
@@ -11763,18 +12156,20 @@ int llama_quantize(int argc, char ** argv) {
             params.nv4mx6_policy = LLAMA_NV4MX6_POLICY_AUTO;
         }
     }
-    if (selector_controls_has("LLAMA_NVFP4_SELECTOR_KLD_FILE") &&
+    if (selector_control_args_has("KLD_FILE") &&
             params.ftype == LLAMA_FTYPE_MOSTLY_NVFP4 &&
-            !selector_controls_has("LLAMA_NVFP4_SELECTOR_CANDIDATE_TYPES")) {
-        add_selector_controls_default(
-            "LLAMA_NVFP4_SELECTOR_CANDIDATE_TYPES",
+            !selector_control_args_has("CANDIDATE_TYPES")) {
+        add_selector_control_default(
+            "CANDIDATE_TYPES",
             ftype_mixed_nvfp4_mxfp6 ? "MXFP6_E2M3,Q5_0,Q4_K,Q5_K,Q6_K,Q8_0" : "Q5_0,Q4_K,Q5_K,Q6_K,Q8_0");
     }
     if (ftype_str == "Q2_K_RSF" ||
             ftype_str == "Q3_K_RSF" || ftype_str == "Q3_K_M_RSF" ||
-            ftype_str == "Q4_K_RSF" || ftype_str == "Q4_K_RSF_AWQ" || ftype_str == "Q4_K_RSF_SQ") {
-        params.q4_k_rsf = true;
-        params.q4_k_rsf_mode =
+            ftype_str == "Q4_K_RSF" || ftype_str == "Q4_K_RSF_AWQ" || ftype_str == "Q4_K_RSF_SQ" ||
+            ftype_str == "Q5_K_RSF" || ftype_str == "Q5_K_M_RSF" ||
+            ftype_str == "Q6_K_RSF") {
+        params.k_quant_rsf = true;
+        params.k_quant_rsf_mode =
             ftype_str == "Q4_K_RSF_AWQ" ? 2 :
             ftype_str == "Q4_K_RSF_SQ"  ? 3 : 1;
     }
@@ -11809,18 +12204,18 @@ int llama_quantize(int argc, char ** argv) {
     }
 
     const bool has_selector_kld =
-        selector_controls_has("LLAMA_NVFP4_SELECTOR_KLD_FILE");
+        selector_control_args_has("KLD_FILE");
     if (params.ftype == LLAMA_FTYPE_MOSTLY_MXFP6_E2M3 && has_selector_kld) {
         // Pure MXFP6 has no NVFP4 policy to choose. Keep the measured-eval selector
         // alive, but spend the KLD budget on MXFP6 tensor-scale refinement.
-        if (!selector_controls_has("LLAMA_NVFP4_SELECTOR_EVAL_TOP")) {
-            selector_controls.emplace_back("LLAMA_NVFP4_SELECTOR_EVAL_TOP", "1");
+        if (!selector_control_args_has("EVAL_TOP")) {
+            selector_controls.emplace_back(selector_legacy_control_key("EVAL_TOP"), "1");
         }
-        if (!selector_controls_has("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES")) {
-            selector_controls.emplace_back("LLAMA_NVFP4_SELECTOR_STAGEA_MAX_POLICIES", "1");
+        if (!selector_control_args_has("STAGEA_MAX_POLICIES")) {
+            selector_controls.emplace_back(selector_legacy_control_key("STAGEA_MAX_POLICIES"), "1");
         }
-        if (!selector_controls_has("LLAMA_NVFP4_SELECTOR_SURVEY_TOP")) {
-            selector_controls.emplace_back("LLAMA_NVFP4_SELECTOR_SURVEY_TOP", "1");
+        if (!selector_control_args_has("SURVEY_TOP")) {
+            selector_controls.emplace_back(selector_legacy_control_key("SURVEY_TOP"), "1");
         }
     }
 
@@ -11833,13 +12228,13 @@ int llama_quantize(int argc, char ** argv) {
     params.nvfp4_encoder_max_blocks =
         std::max<int64_t>(0, quantize_control_i64("LLAMA_NVFP4_ENCODER_MAX_BLOCKS", params.nvfp4_encoder_max_blocks));
     if (cli_nvfp4_cfg_valid) {
-        const int rsf_mode = nvfp4_selector_effective_rsf_mode(&cli_nvfp4_cfg);
-        const int rsf_depth = nvfp4_selector_effective_rsf_depth(&cli_nvfp4_cfg);
-        cli_nvfp4_cfg = nvfp4_selector_cfg_as_rsf(cli_nvfp4_cfg, rsf_mode, rsf_depth);
-        cli_nvfp4_policy_name = nvfp4_selector_rsf_base_policy_name(cli_nvfp4_policy_name.empty() ? "cli" : cli_nvfp4_policy_name);
+        const int rsf_mode = selector_effective_rsf_mode(&cli_nvfp4_cfg);
+        const int rsf_depth = selector_effective_rsf_depth(&cli_nvfp4_cfg);
+        cli_nvfp4_cfg = selector_cfg_as_rsf(cli_nvfp4_cfg, rsf_mode, rsf_depth);
+        cli_nvfp4_policy_name = selector_rsf_base_policy_name(cli_nvfp4_policy_name.empty() ? "cli" : cli_nvfp4_policy_name);
     }
-    nvfp4_set_autotune_threads(cli_nvfp4_autotune_threads);
-    nvfp4_selector_set_kld_threads_override(selector_kld_threads_override);
+    nvfp4_set_autotune_threads(cli_nvfp4_encoder_threads);
+    selector_set_kld_threads_override(selector_kld_threads_override);
 
     if (!params.dry_run) {
         if (std::error_code ec; std::filesystem::equivalent(fname_inp, fname_out, ec)) {
@@ -11848,13 +12243,13 @@ int llama_quantize(int argc, char ** argv) {
         }
     }
 
-    if (selector_controls_has("LLAMA_NVFP4_SELECTOR_KLD_FILE") &&
+    if (selector_control_args_has("KLD_FILE") &&
             params.ftype == LLAMA_FTYPE_MOSTLY_NVFP4 &&
             !params.dry_run &&
             !params.keep_split &&
             !params.only_copy) {
         std::vector<tensor_type_option> stage1_priors =
-            nvfp4_selector_stage1_type_priors(fname_inp, imatrix_data, cli_work_mode, tensor_type_opts);
+            selector_stage1_type_priors(fname_inp, imatrix_data, cli_work_mode, tensor_type_opts);
         if (!stage1_priors.empty()) {
             tensor_type_opts.insert(tensor_type_opts.end(), stage1_priors.begin(), stage1_priors.end());
             params.tensor_types = &tensor_type_opts;
@@ -11862,10 +12257,10 @@ int llama_quantize(int argc, char ** argv) {
     }
 
     const std::vector<tensor_type_option> tensor_type_opts_cli = tensor_type_opts;
-    const std::string selector_kld_path = quantize_control_string("LLAMA_NVFP4_SELECTOR_KLD_FILE");
-    const bool selector_bootstrap = quantize_control_has("LLAMA_NVFP4_SELECTOR_BOOTSTRAP");
+    const std::string selector_kld_path = selector_control_string("KLD_FILE");
+    const bool selector_bootstrap = selector_control_has("BOOTSTRAP");
     const bool selector_auto_rescue_running = quantize_control_has("LLAMA_NVFP4_AUTO_RESCUE_RUNNING");
-    const bool selector_only = quantize_control_i64("LLAMA_NVFP4_SELECTOR_ONLY", 0) != 0;
+    const bool selector_only = selector_control_i64("ONLY", 0) != 0;
     bool selector_cfg_valid = false;
     nvfp4_cuda_runtime_cfg selector_cfg = {
         NVFP4_CUDA_CHOOSE46_ADAPTIVE,
@@ -11879,8 +12274,8 @@ int llama_quantize(int argc, char ** argv) {
     std::string selector_checkpoint_path;
     bool selector_checkpoint_created = false;
     bool selector_inputs_ready = false;
-    nvfp4_selector_kld_subset selector_kld;
-    std::unique_ptr<nvfp4_selector_kld_subset> selector_kld_holdout;
+    selector_kld_subset selector_kld;
+    std::unique_ptr<selector_kld_subset> selector_kld_holdout;
     selector_rank_config selector_rank_cfg;
     bool selector_applied_exact_overrides = false;
     size_t selector_applied_exact_override_count = 0;
@@ -11928,7 +12323,7 @@ int llama_quantize(int argc, char ** argv) {
         const int selector_nthread = params.nthread > 0 ?
             params.nthread :
             std::max(1, (int) std::thread::hardware_concurrency());
-        return nvfp4_selector_choose_policy(
+        return selector_choose_policy(
             fname_inp,
             seed_path,
             imatrix_data,
@@ -11940,7 +12335,7 @@ int llama_quantize(int argc, char ** argv) {
             cli_nvfp4_policy_name,
             params.nvfp4_input_scale_policy,
             selector_eval_batch_override,
-            cli_nvfp4_autotune_threads,
+            cli_nvfp4_encoder_threads,
             out_cfg,
             out_policy_name,
             out_kept_seed,
@@ -11948,19 +12343,19 @@ int llama_quantize(int argc, char ** argv) {
 	    };
 
     if (selector_enabled) {
-        selector_rank_cfg.kld_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_KLD_THRESHOLD", -1.0);
-        selector_rank_cfg.p99_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P99_THRESHOLD", -1.0);
-        selector_rank_cfg.p999_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P999_THRESHOLD", -1.0);
-        selector_rank_cfg.max_kld_threshold = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_THRESHOLD", -1.0);
-        selector_rank_cfg.kld_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_KLD_PENALTY", 4.0);
-        selector_rank_cfg.p99_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P99_PENALTY", 1.5);
-        selector_rank_cfg.p999_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_P999_PENALTY", 0.75);
-        selector_rank_cfg.max_kld_penalty = quantize_control_f64("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_PENALTY", 0.10);
+        selector_rank_cfg.kld_threshold = selector_control_f64("RANK_KLD_THRESHOLD", -1.0);
+        selector_rank_cfg.p99_threshold = selector_control_f64("RANK_P99_THRESHOLD", -1.0);
+        selector_rank_cfg.p999_threshold = selector_control_f64("RANK_P999_THRESHOLD", -1.0);
+        selector_rank_cfg.max_kld_threshold = selector_control_f64("RANK_MAX_KLD_THRESHOLD", -1.0);
+        selector_rank_cfg.kld_penalty = selector_control_f64("RANK_KLD_PENALTY", 4.0);
+        selector_rank_cfg.p99_penalty = selector_control_f64("RANK_P99_PENALTY", 1.5);
+        selector_rank_cfg.p999_penalty = selector_control_f64("RANK_P999_PENALTY", 0.75);
+        selector_rank_cfg.max_kld_penalty = selector_control_f64("RANK_MAX_KLD_PENALTY", 0.10);
         selector_rank_cfg.holdout_weight = SELECTOR_HOLDOUT_WEIGHT;
-        selector_rank_cfg.kld_hard_gate = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RANK_KLD_HARD_GATE", 0) != 0;
-        selector_rank_cfg.p99_hard_gate = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RANK_P99_HARD_GATE", 0) != 0;
-        selector_rank_cfg.p999_hard_gate = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RANK_P999_HARD_GATE", 0) != 0;
-        selector_rank_cfg.max_kld_hard_gate = quantize_control_i64("LLAMA_NVFP4_SELECTOR_RANK_MAX_KLD_HARD_GATE", 0) != 0;
+        selector_rank_cfg.kld_hard_gate = selector_control_i64("RANK_KLD_HARD_GATE", 0) != 0;
+        selector_rank_cfg.p99_hard_gate = selector_control_i64("RANK_P99_HARD_GATE", 0) != 0;
+        selector_rank_cfg.p999_hard_gate = selector_control_i64("RANK_P999_HARD_GATE", 0) != 0;
+        selector_rank_cfg.max_kld_hard_gate = selector_control_i64("RANK_MAX_KLD_HARD_GATE", 0) != 0;
         selector_rank_cfg.ppl_sigma = SELECTOR_PPL_SIGMA;
         selector_rank_cfg.kld_sigma = SELECTOR_KLD_SIGMA;
         selector_rank_cfg.rms_dp_sigma = SELECTOR_RMS_DP_SIGMA;
@@ -12013,13 +12408,13 @@ int llama_quantize(int argc, char ** argv) {
                 selector_rank_cfg.p999_threshold,
                 selector_rank_cfg.max_kld_threshold);
         }
-        if (!nvfp4_selector_load_kld_subset(selector_kld_path.c_str(), selector_kld)) {
+        if (!selector_load_kld_subset(selector_kld_path.c_str(), selector_kld)) {
             fprintf(stderr, "%s: selector disabled because full KLD base could not be loaded from %s\n", __func__, selector_kld_path.c_str());
         } else {
             selector_inputs_ready = true;
-            std::string selector_checkpoint_override = quantize_control_string("LLAMA_NVFP4_SELECTOR_CHECKPOINT_MODEL");
-            const bool selector_keep_checkpoint = quantize_control_i64("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", 0) != 0;
-            const std::string selector_cache_dir = quantize_control_string("LLAMA_NVFP4_SELECTOR_CACHE_DIR");
+            std::string selector_checkpoint_override = selector_control_string("CHECKPOINT_MODEL");
+            const bool selector_keep_checkpoint = selector_control_i64("KEEP_CHECKPOINT", 0) != 0;
+            const std::string selector_cache_dir = selector_control_string("CACHE_DIR");
             if (!selector_checkpoint_override.empty()) {
                 selector_checkpoint_path = selector_checkpoint_override;
                 fprintf(stderr, "%s: selector using existing candidate search checkpoint %s\n", __func__, selector_checkpoint_path.c_str());
@@ -12054,30 +12449,87 @@ int llama_quantize(int argc, char ** argv) {
                     selector_checkpoint_path = fname_out + ".bwq-checkpoint.gguf";
                 }
 
+                const std::string selector_checkpoint_partial_path = selector_checkpoint_path + ".partial";
                 bool reuse_cached_checkpoint = false;
                 if (selector_keep_checkpoint && !selector_checkpoint_path.empty()) {
                     std::error_code ec;
-                    reuse_cached_checkpoint =
-                        std::filesystem::exists(selector_checkpoint_path, ec) &&
-                        !ec &&
-                        std::filesystem::file_size(selector_checkpoint_path, ec) > 0 &&
-                        !ec;
+                    const bool cached_exists = std::filesystem::exists(selector_checkpoint_path, ec) && !ec;
+                    const uintmax_t cached_size = cached_exists ? std::filesystem::file_size(selector_checkpoint_path, ec) : 0;
+                    const bool cached_complete = cached_exists && !ec && cached_size > 0 &&
+                        agq_file_has_gguf_magic(selector_checkpoint_path);
+                    reuse_cached_checkpoint = cached_complete;
                     if (reuse_cached_checkpoint) {
                         fprintf(stderr, "%s: selector reusing cached candidate search checkpoint %s\n",
                             __func__, selector_checkpoint_path.c_str());
+                    } else if (cached_exists) {
+                        fprintf(stderr, "%s: selector ignoring incomplete candidate search checkpoint %s\n",
+                            __func__, selector_checkpoint_path.c_str());
+                        const std::string direct_resume_path = selector_checkpoint_path + ".resume";
+                        std::error_code resume_ec;
+                        const bool has_direct_resume =
+                            std::filesystem::exists(direct_resume_path, resume_ec) && !resume_ec;
+                        if (has_direct_resume) {
+                            std::filesystem::remove(selector_checkpoint_partial_path, ec);
+                            std::filesystem::remove(selector_checkpoint_partial_path + ".resume", ec);
+                            ec.clear();
+                            std::filesystem::rename(selector_checkpoint_path, selector_checkpoint_partial_path, ec);
+                            if (!ec) {
+                                std::filesystem::rename(direct_resume_path, selector_checkpoint_partial_path + ".resume", ec);
+                            }
+                            if (ec) {
+                                fprintf(stderr, "%s: failed to migrate incomplete checkpoint for resume: %s\n",
+                                    __func__, ec.message().c_str());
+                                std::filesystem::remove(selector_checkpoint_path, ec);
+                                std::filesystem::remove(direct_resume_path, ec);
+                            } else {
+                                fprintf(stderr, "%s: selector migrated incomplete checkpoint to resumable partial %s\n",
+                                    __func__, selector_checkpoint_partial_path.c_str());
+                            }
+                        } else {
+                            std::filesystem::remove(selector_checkpoint_path, ec);
+                        }
+                        std::filesystem::remove(selector_checkpoint_path + ".stageb-results.jsonl", ec);
+                        std::filesystem::remove(selector_checkpoint_path + ".rsf-report.txt", ec);
                     }
                 }
 
                 if (!reuse_cached_checkpoint) {
-                    selector_checkpoint_created = true;
-                    fprintf(stderr, "%s: candidate search checkpoint quantization -> %s\n", __func__, selector_checkpoint_path.c_str());
-                    {
-                        scoped_quantize_control bootstrap("LLAMA_NVFP4_SELECTOR_BOOTSTRAP", "1");
-                        nvfp4_clear_runtime_cfg();
-                        if (llama_model_quantize(fname_inp.c_str(), selector_checkpoint_path.c_str(), &params)) {
+                    std::error_code partial_ec;
+                    const bool has_partial_resume =
+                        std::filesystem::exists(selector_checkpoint_partial_path + ".resume", partial_ec) && !partial_ec;
+                    if (has_partial_resume) {
+                        fprintf(stderr, "%s: candidate search checkpoint will resume partial output %s\n",
+                            __func__, selector_checkpoint_partial_path.c_str());
+                    }
+	                    fprintf(stderr, "%s: candidate search checkpoint quantization -> %s\n", __func__, selector_checkpoint_path.c_str());
+	                    {
+	                        const std::string bootstrap_key = selector_generic_control_key("BOOTSTRAP");
+	                        scoped_quantize_control bootstrap(bootstrap_key.c_str(), "1");
+	                        scoped_quantize_control resumable_output("LLAMA_QUANTIZE_RESUME_OUTPUT", "1");
+	                        nvfp4_clear_runtime_cfg();
+                        if (llama_model_quantize(fname_inp.c_str(), selector_checkpoint_partial_path.c_str(), &params)) {
                             fprintf(stderr, "%s: candidate search checkpoint build failed, continuing without selector\n", __func__);
                             selector_checkpoint_path.clear();
                             selector_checkpoint_created = false;
+                        } else if (!agq_file_has_gguf_magic(selector_checkpoint_partial_path)) {
+                            fprintf(stderr, "%s: candidate search checkpoint build produced an incomplete GGUF, continuing without selector\n", __func__);
+                            std::error_code ec;
+                            std::filesystem::remove(selector_checkpoint_partial_path, ec);
+                            std::filesystem::remove(selector_checkpoint_partial_path + ".resume", ec);
+                            selector_checkpoint_path.clear();
+                            selector_checkpoint_created = false;
+                        } else {
+                            std::error_code ec;
+                            std::filesystem::rename(selector_checkpoint_partial_path, selector_checkpoint_path, ec);
+                            if (ec) {
+                                fprintf(stderr, "%s: failed to publish candidate search checkpoint %s: %s\n",
+                                    __func__, selector_checkpoint_path.c_str(), ec.message().c_str());
+                                std::filesystem::remove(selector_checkpoint_partial_path, ec);
+                                selector_checkpoint_path.clear();
+                                selector_checkpoint_created = false;
+                            } else {
+                                selector_checkpoint_created = true;
+                            }
                         }
                     }
                 }
@@ -12116,7 +12568,7 @@ int llama_quantize(int argc, char ** argv) {
                                 __func__,
                                 patch_base_model.c_str());
                             if (selector_checkpoint_created && !selector_checkpoint_path.empty() &&
-                                    quantize_control_i64("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", 0) == 0) {
+                                    selector_control_i64("KEEP_CHECKPOINT", 0) == 0) {
                                 std::error_code remove_ec;
                                 std::filesystem::remove(selector_checkpoint_path, remove_ec);
                             }
@@ -12135,10 +12587,10 @@ int llama_quantize(int argc, char ** argv) {
                     }
 	            } else if (!selector_checkpoint_path.empty()) {
                 fprintf(stderr, "%s: selector failed, continuing with the built-in CUDA policy search\n", __func__);
-                if (quantize_control_i64("LLAMA_NVFP4_SELECTOR_REQUIRE_RUNTIME_CACHE", 0) != 0) {
+                if (selector_control_i64("REQUIRE_RUNTIME_CACHE", 0) != 0) {
                     fprintf(stderr, "%s: selector runtime cache is required; aborting quantization\n", __func__);
                     if (selector_checkpoint_created && !selector_checkpoint_path.empty() &&
-                            quantize_control_i64("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", 0) == 0) {
+                            selector_control_i64("KEEP_CHECKPOINT", 0) == 0) {
                         std::error_code ec;
                         std::filesystem::remove(selector_checkpoint_path, ec);
                     }
@@ -12158,7 +12610,7 @@ int llama_quantize(int argc, char ** argv) {
         if (!selector_cfg_valid) {
             fprintf(stderr, "%s: selector-only requested but no selector policy was chosen\n", __func__);
             if (selector_checkpoint_created && !selector_checkpoint_path.empty() &&
-                    quantize_control_i64("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", 0) == 0) {
+                    selector_control_i64("KEEP_CHECKPOINT", 0) == 0) {
                 std::error_code ec;
                 std::filesystem::remove(selector_checkpoint_path, ec);
             }
@@ -12166,7 +12618,7 @@ int llama_quantize(int argc, char ** argv) {
             return 1;
         }
         if (selector_checkpoint_created && !selector_checkpoint_path.empty() &&
-                quantize_control_i64("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", 0) == 0) {
+                selector_control_i64("KEEP_CHECKPOINT", 0) == 0) {
             std::error_code ec;
             std::filesystem::remove(selector_checkpoint_path, ec);
         }
@@ -12197,12 +12649,15 @@ int llama_quantize(int argc, char ** argv) {
     {
         const int64_t t_start_us = llama_time_us();
 
-        if (llama_model_quantize(fname_inp.c_str(), fname_out.c_str(), &params)) {
-            if (selector_cfg_valid) {
-                nvfp4_clear_runtime_cfg();
+        {
+            scoped_quantize_control resumable_output("LLAMA_QUANTIZE_RESUME_OUTPUT", "1");
+            if (llama_model_quantize(fname_inp.c_str(), fname_out.c_str(), &params)) {
+                if (selector_cfg_valid) {
+                    nvfp4_clear_runtime_cfg();
+                }
+                fprintf(stderr, "%s: failed to quantize model from '%s'\n", __func__, fname_inp.c_str());
+                return 1;
             }
-            fprintf(stderr, "%s: failed to quantize model from '%s'\n", __func__, fname_inp.c_str());
-            return 1;
         }
 
         t_quantize_us = llama_time_us() - t_start_us;
@@ -12248,6 +12703,7 @@ int llama_quantize(int argc, char ** argv) {
                 bool rescue_ok = false;
                 {
                     scoped_quantize_control rescue_running("LLAMA_NVFP4_AUTO_RESCUE_RUNNING", "1");
+                    scoped_quantize_control resumable_output("LLAMA_QUANTIZE_RESUME_OUTPUT", "1");
                     nvfp4_clear_runtime_cfg();
                     rescue_ok = llama_model_quantize(fname_inp.c_str(), rescue_out.c_str(), &rescue_params) == 0;
                 }
@@ -12292,7 +12748,7 @@ int llama_quantize(int argc, char ** argv) {
         nvfp4_clear_runtime_cfg();
     }
     if (selector_checkpoint_created && !selector_checkpoint_path.empty() &&
-            quantize_control_i64("LLAMA_NVFP4_SELECTOR_KEEP_CHECKPOINT", 0) == 0) {
+            selector_control_i64("KEEP_CHECKPOINT", 0) == 0) {
         std::error_code ec;
         std::filesystem::remove(selector_checkpoint_path, ec);
     } else if (selector_checkpoint_created && !selector_checkpoint_path.empty()) {

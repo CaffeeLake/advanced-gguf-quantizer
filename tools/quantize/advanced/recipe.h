@@ -214,7 +214,7 @@ struct Recipe {
         std::string budget_mb;
         std::string bf16_budget_mb;
         std::string class_limit;
-        std::string nvfp4_top;
+        std::string encoder_top;
         std::string sample_blocks;
         std::string coarse_max_blocks;
         std::string refine_max_blocks;

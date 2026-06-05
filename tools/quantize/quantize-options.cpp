@@ -131,7 +131,10 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q5_K",     LLAMA_FTYPE_MOSTLY_Q5_K_M,   "alias for Q5_K_M",                  },
     { "Q5_K_S",   LLAMA_FTYPE_MOSTLY_Q5_K_S,   " 5.21G, +0.1049 ppl @ Llama-3-8B",  },
     { "Q5_K_M",   LLAMA_FTYPE_MOSTLY_Q5_K_M,   " 5.33G, +0.0569 ppl @ Llama-3-8B",  },
+    { "Q5_K_RSF", LLAMA_FTYPE_MOSTLY_Q5_K_M,   " Q5_K_M with refined scale fit",    },
+    { "Q5_K_M_RSF", LLAMA_FTYPE_MOSTLY_Q5_K_M, " Q5_K_M with refined scale fit",    },
     { "Q6_K",     LLAMA_FTYPE_MOSTLY_Q6_K,     " 6.14G, +0.0217 ppl @ Llama-3-8B",  },
+    { "Q6_K_RSF", LLAMA_FTYPE_MOSTLY_Q6_K,     " Q6_K with refined scale fit",      },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
@@ -177,7 +180,7 @@ bool ftype_is_mixed_nvfp4_mxfp6(const std::string & ftype_str) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--mtp-tensor-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--patch-base]\n");
-    printf("       [--mode fast|normal|deep] [--nvfp4-selector-kld] [--nvfp4-selector-auto-rescue] [--dry-run]\n");
+    printf("       [--mode fast|normal|deep] [--selector-kld] [--selector-auto-rescue] [--dry-run]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -232,12 +235,12 @@ bool ftype_is_mixed_nvfp4_mxfp6(const std::string & ftype_str) {
     printf("                                      set CUDA NVFP4 encoder sample cap and worker count.\n");
     printf("  --mode fast|normal|deep\n");
     printf("                                      choose quantizer work mode; required for saved-logit selector runs.\n");
-    printf("  --nvfp4-selector-rsf-mode tensor|slice|expert|group / --nvfp4-selector-rsf-depth normal|deep|deeper|exhaustive\n");
+    printf("  --selector-rsf-mode tensor|slice|expert|group / --selector-rsf-depth normal|deep|deeper|exhaustive\n");
     printf("                                      set refined scale fit (RSF) granularity/search depth.\n");
-    printf("  --nvfp4-selector-rsf-report file.txt\n");
+    printf("  --selector-rsf-report file.txt\n");
     printf("                                      write the RSF policy summary, tensor rows, and scale-multiplier histograms.\n");
-    printf("  --nvfp4-selector-tensor-policy-map / --nvfp4-selector-no-tensor-policy-map\n");
-    printf("                                      allow first-pass per-tensor NVFP4 policy planning; enabled by default.\n");
+    printf("  --selector-tensor-policy-map / --selector-no-tensor-policy-map\n");
+    printf("                                      allow first-pass per-tensor policy planning; enabled by default.\n");
     printf("  --mxfp6_e2m3-tensor-scale on|off\n");
     printf("                                      write MXFP6_E2M3 tensor correction scales. default: on.\n");
     printf("                                      WARNING: MXFP6_E2M3 is experimental and unsupported by NVIDIA/llama.cpp.\n");
@@ -265,103 +268,103 @@ bool ftype_is_mixed_nvfp4_mxfp6(const std::string & ftype_str) {
     printf("  --mixed-imatrix-weight-blend value / --mixed-imatrix-weight-power value\n");
     printf("  --mixed-imatrix-weight-min value / --mixed-imatrix-weight-max value\n");
     printf("                                      shape imatrix weights for mixed-format proxy scoring.\n");
-    printf("  --nvfp4-selector-kld file.kld\n");
-    printf("                                      use saved BF16 logits as the NVFP4 policy/rescue selector oracle.\n");
+    printf("  --selector-kld file.kld\n");
+    printf("                                      use saved BF16 logits as the policy/rescue selector oracle.\n");
     printf("                                      enables true KLD/PPL ranking for the selected KLD subset.\n");
-    printf("  --nvfp4-selector-ledger file.jsonl\n");
+    printf("  --selector-ledger file.jsonl\n");
     printf("                                      append raw selector evidence rows to a JSONL ledger.\n");
-    printf("  --nvfp4-selector-checkpoint-model model.gguf\n");
+    printf("  --selector-checkpoint-model model.gguf\n");
     printf("                                      existing quantized checkpoint used by candidate search instead of creating one.\n");
-    printf("  --nvfp4-selector-cache-dir dir / --nvfp4-selector-keep-checkpoint\n");
+    printf("  --selector-cache-dir dir / --selector-keep-checkpoint\n");
     printf("                                      cache auto-created candidate-search checkpoints for future runs.\n");
-    printf("  --nvfp4-selector-require-runtime-cache\n");
+    printf("  --selector-require-runtime-cache\n");
     printf("                                      fail instead of falling back when Stage-B resident tensor patching is unavailable.\n");
-    printf("  --nvfp4-selector-skip-file file\n");
+    printf("  --selector-skip-file file\n");
     printf("                                      if file appears during selector tuning, use the best available policy.\n");
-    printf("  --nvfp4-selector-skip-remaining\n");
+    printf("  --selector-skip-remaining\n");
     printf("                                      skip optional selector tuning now and use the best available policy.\n");
-    printf("  --nvfp4-selector-stagea-sample-blocks N\n");
-    printf("                                      NVFP4 blocks sampled per tensor during coarse selector policy ranking.\n");
-    printf("  --nvfp4-selector-stagea-max-policies N\n");
+    printf("  --selector-stagea-sample-blocks N\n");
+    printf("                                      weight blocks sampled per tensor during coarse selector policy ranking.\n");
+    printf("  --selector-stagea-max-policies N\n");
     printf("                                      limit coarse selector policies before refinement; 0 keeps all.\n");
-    printf("  --nvfp4-selector-awq-top N\n");
+    printf("  --selector-awq-top N\n");
     printf("                                      keep up to N asym/AWQ-tail policies when the coarse policy limit is active.\n");
-    printf("  --nvfp4-selector-skip-policy name / --nvfp4-selector-skip-policies a,b\n");
+    printf("  --selector-skip-policy name / --selector-skip-policies a,b\n");
     printf("                                      skip named policies during survey and measured eval.\n");
-    printf("  --nvfp4-selector-include-policy name / --nvfp4-selector-include-policies a,b\n");
+    printf("  --selector-include-policy name / --selector-include-policies a,b\n");
     printf("                                      evaluate only named policies; seed_keep remains allowed internally.\n");
-    printf("  --nvfp4-selector-refine-top N / --nvfp4-selector-refine-budget N\n");
+    printf("  --selector-refine-top N / --selector-refine-budget N\n");
     printf("                                      selector refinement breadth and exact tensor override budget.\n");
-    printf("  --nvfp4-selector-survey-top N / --nvfp4-selector-survey-sample-blocks N\n");
+    printf("  --selector-survey-top N / --selector-survey-sample-blocks N\n");
     printf("                                      selector survey breadth/sample depth before KLD ranking.\n");
-    printf("  --nvfp4-selector-max-tensors N / --nvfp4-selector-trace\n");
+    printf("  --selector-max-tensors N / --selector-trace\n");
     printf("                                      limit selector stress tensors and enable verbose selector tensor tracing.\n");
-    printf("  --nvfp4-selector-policy-threads N / --nvfp4-selector-threads N\n");
+    printf("  --selector-policy-threads N / --selector-threads N\n");
     printf("                                      selector policy/tensor worker counts; final quantization still uses nthreads.\n");
-    printf("  --nvfp4-selector-stageb-patch-eval\n");
+    printf("  --selector-stageb-patch-eval\n");
     printf("                                      also collect tensor reconstruction stats while materializing Stage-B policies.\n");
-    printf("  --nvfp4-selector-stageb-direct-verify / --nvfp4-selector-no-stageb-direct-verify\n");
+    printf("  --selector-stageb-direct-verify / --selector-no-stageb-direct-verify\n");
     printf("                                      force-enable or disable Stage-B direct-patch readback verification.\n");
-    printf("  --nvfp4-selector-kld-threads N\n");
+    printf("  --selector-kld-threads N\n");
     printf("                                      host worker count for full-vocab KLD/PPL metric reduction during selector full PPL/KLD eval.\n");
-    printf("  --nvfp4-selector-auto-rescue\n");
+    printf("  --selector-auto-rescue\n");
     printf("                                      after the selected pass, patch high-risk exact tensors using the rescue settings.\n");
-    printf("  --nvfp4-selector-only\n");
+    printf("  --selector-only\n");
     printf("                                      run selector analysis and exit without writing a final model.\n");
-    printf("  --nvfp4-selector-candidate-type T / --nvfp4-selector-candidate-types A,B\n");
-    printf("                                      main-path tensor type candidates for high-error NVFP4 tensors.\n");
+    printf("  --selector-candidate-type T / --selector-candidate-types A,B\n");
+    printf("                                      main-path tensor type candidates for high-error tensors.\n");
     printf("                                      defaults with saved-logit KLD selector: Q5_0,Q4_K,Q5_K,Q6_K,Q8_0; mixed adds MXFP6_E2M3 first.\n");
-    printf("  --nvfp4-selector-candidate-fraction F / --nvfp4-selector-candidate-top N\n");
-    printf("                                      cap type candidates to the worst NVFP4-error tensor fraction or exact count.\n");
-    printf("  --nvfp4-selector-candidate-budget-mb N / --nvfp4-selector-candidate-class-limit N\n");
+    printf("  --selector-candidate-fraction F / --selector-candidate-top N\n");
+    printf("                                      cap type candidates to the worst baseline-error tensor fraction or exact count.\n");
+    printf("  --selector-candidate-budget-mb N / --selector-candidate-class-limit N\n");
     printf("                                      cap extra size and per-class use for main-path type candidates.\n");
-    printf("  --nvfp4-selector-candidate-report file.csv / --nvfp4-selector-candidate-tensor-types file.txt\n");
+    printf("  --selector-candidate-report file.csv / --selector-candidate-tensor-types file.txt\n");
     printf("                                      write main-path candidate ranking and final exact tensor-type map.\n");
-    printf("  --nvfp4-selector-eval-top N\n");
+    printf("  --selector-eval-top N\n");
     printf("                                      number of policies used for full-base KLD/PPL evaluation. default: 16.\n");
-    printf("  --nvfp4-selector-n-seq N\n");
+    printf("  --selector-n-seq N\n");
     printf("                                      override selector KLD sequence count. default: auto from free CUDA memory.\n");
-    printf("  --nvfp4-selector-eval-batch N\n");
+    printf("  --selector-eval-batch N\n");
     printf("                                      token batch size used during selector KLD eval; values below ctx exercise multi-batch KLD.\n");
-    printf("  --nvfp4-selector-n-gpu-layers N\n");
+    printf("  --selector-n-gpu-layers N\n");
     printf("                                      GPU layers used during selector KLD full PPL/KLD evaluation.\n");
-    printf("  --nvfp4-selector-sensitivity-report file.jsonl\n");
+    printf("  --selector-sensitivity-report file.jsonl\n");
     printf("                                      write exact one-tensor KLD/PPL what-if deltas after selecting a policy.\n");
-    printf("  --nvfp4-selector-sensitivity-top N / --nvfp4-selector-sensitivity-layer N\n");
+    printf("  --selector-sensitivity-top N / --selector-sensitivity-layer N\n");
     printf("                                      limit exact what-if sensitivity probes by count or layer.\n");
-    printf("  --nvfp4-selector-sensitivity-tensor text\n");
+    printf("  --selector-sensitivity-tensor text\n");
     printf("                                      only probe tensors whose name contains text.\n");
-    printf("  --nvfp4-selector-rescue-top N\n");
+    printf("  --selector-rescue-top N\n");
     printf("                                      maximum exact tensor rescue overrides to apply.\n");
-    printf("  --nvfp4-selector-rescue-nvfp4-top N / --nvfp4-selector-rescue-report-top N\n");
-    printf("                                      tensors scanned/reported for per-tensor NVFP4 policy rescue.\n");
-    printf("  --nvfp4-selector-rescue-sample-blocks N\n");
-    printf("                                      NVFP4 blocks sampled per tensor for rescue sensitivity ranking.\n");
-    printf("  --nvfp4-selector-rescue-coarse-max-blocks N\n");
-    printf("  --nvfp4-selector-rescue-refine-max-blocks N\n");
-    printf("  --nvfp4-selector-rescue-guard-max-blocks N\n");
-    printf("                                      cap sampled blocks for per-tensor NVFP4 rescue policy search.\n");
-    printf("  --nvfp4-selector-rescue-budget-mb N\n");
+    printf("  --selector-rescue-encoder-top N / --selector-rescue-report-top N\n");
+    printf("                                      tensors scanned/reported for per-tensor policy rescue.\n");
+    printf("  --selector-rescue-sample-blocks N\n");
+    printf("                                      weight blocks sampled per tensor for rescue sensitivity ranking.\n");
+    printf("  --selector-rescue-coarse-max-blocks N\n");
+    printf("  --selector-rescue-refine-max-blocks N\n");
+    printf("  --selector-rescue-guard-max-blocks N\n");
+    printf("                                      cap sampled blocks for per-tensor rescue policy search.\n");
+    printf("  --selector-rescue-budget-mb N\n");
     printf("                                      total extra-size budget for non-BF16 rescue overrides.\n");
-    printf("  --nvfp4-selector-rescue-bf16-budget-mb N\n");
+    printf("  --selector-rescue-bf16-budget-mb N\n");
     printf("                                      extra-size budget for BF16 rescue overrides.\n");
-    printf("  --nvfp4-selector-rescue-class-limit N\n");
+    printf("  --selector-rescue-class-limit N\n");
     printf("                                      maximum rescues per tensor class; 0 disables the class limit.\n");
-    printf("  --nvfp4-selector-rescue-report file.csv\n");
+    printf("  --selector-rescue-report file.csv\n");
     printf("                                      write selector rescue ranking/report CSV.\n");
-    printf("  --nvfp4-selector-rescue-tensor-types file.txt\n");
+    printf("  --selector-rescue-tensor-types file.txt\n");
     printf("                                      write exact tensor-type overrides selected by rescue.\n");
-    printf("  --nvfp4-selector-kld-penalty value / --nvfp4-selector-p99-penalty value\n");
+    printf("  --selector-kld-penalty value / --selector-p99-penalty value\n");
     printf("                                      increase selector pressure on mean KLD / p99 KLD.\n");
-    printf("  --nvfp4-selector-p999-penalty value / --nvfp4-selector-max-kld-penalty value\n");
+    printf("  --selector-p999-penalty value / --selector-max-kld-penalty value\n");
     printf("                                      increase selector pressure on tail KLD outliers.\n");
-    printf("  --nvfp4-selector-rank-kld-threshold value / --nvfp4-selector-rank-p99-threshold value\n");
+    printf("  --selector-rank-kld-threshold value / --selector-rank-p99-threshold value\n");
     printf("                                      apply thresholded selector pressure on mean/p99 KLD.\n");
-    printf("  --nvfp4-selector-rank-p999-threshold value / --nvfp4-selector-rank-max-kld-threshold value\n");
+    printf("  --selector-rank-p999-threshold value / --selector-rank-max-kld-threshold value\n");
     printf("                                      apply thresholded selector pressure on p999/max KLD.\n");
-    printf("  --nvfp4-selector-rank-kld-hard-gate / --nvfp4-selector-rank-p99-hard-gate\n");
+    printf("  --selector-rank-kld-hard-gate / --selector-rank-p99-hard-gate\n");
     printf("                                      reject selector candidates above the corresponding mean/p99 threshold.\n");
-    printf("  --nvfp4-selector-rank-p999-hard-gate / --nvfp4-selector-rank-max-kld-hard-gate\n");
+    printf("  --selector-rank-p999-hard-gate / --selector-rank-max-kld-hard-gate\n");
     printf("                                      reject selector candidates above the corresponding p999/max KLD threshold.\n");
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
@@ -508,7 +511,7 @@ bool parse_tensor_type_nvfp4_cfg(const std::string & spec, tensor_type_option & 
             } else if (striequals(value.c_str(), "group")) {
                 out.nvfp4_cfg.reserved_i32 |= NVFP4_CUDA_RSF_MODE_GROUP << NVFP4_CUDA_RSF_MODE_SHIFT;
             } else {
-                fprintf(stderr, "%s: invalid NVFP4 RSF mode '%s'\n", __func__, value.c_str());
+                fprintf(stderr, "%s: invalid RSF mode '%s'\n", __func__, value.c_str());
                 return false;
             }
         } else if (striequals(key.c_str(), "rsf_depth")) {
@@ -523,7 +526,7 @@ bool parse_tensor_type_nvfp4_cfg(const std::string & spec, tensor_type_option & 
             } else if (striequals(value.c_str(), "exhaustive") || striequals(value.c_str(), "max")) {
                 out.nvfp4_cfg.reserved_i32 |= NVFP4_CUDA_RSF_DEPTH_EXHAUSTIVE << NVFP4_CUDA_RSF_DEPTH_SHIFT;
             } else {
-                fprintf(stderr, "%s: invalid NVFP4 RSF depth '%s'\n", __func__, value.c_str());
+                fprintf(stderr, "%s: invalid RSF depth '%s'\n", __func__, value.c_str());
                 return false;
             }
         } else if (striequals(key.c_str(), "sample") || striequals(key.c_str(), "sample_blocks")) {

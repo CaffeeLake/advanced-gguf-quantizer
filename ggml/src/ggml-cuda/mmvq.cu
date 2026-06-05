@@ -3295,6 +3295,10 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
     }
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const bool has_mmvq_fusion =
+        fusion_local.gate != nullptr || fusion_local.x_bias != nullptr || fusion_local.gate_bias != nullptr;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (src0->type != GGML_TYPE_NVFP4 &&
             src0->type != GGML_TYPE_MXFP6_E2M3 &&
@@ -3348,14 +3352,21 @@ void ggml_cuda_mul_mat_vec_q(
 
 	    const int64_t s11_src1 = src1->nb[1] / ts_src1;
 	    const int64_t s12_src1 = src1->nb[2] / ts_src1;
-		    const int64_t s13_src1 = src1->nb[3] / ts_src1;
-		    const void * src0_data = src0->data;
+	    const int64_t s13_src1 = src1->nb[3] / ts_src1;
+	    const void * src0_data = src0->data;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-            const bool use_native_nvfp4_acts = use_nvfp4 && ggml_cuda_nvfp4_mmvq_native_acts();
+            const bool nvfp4_mmvq_1col_shape =
+                !ids && !has_mmvq_fusion && ncols_dst == 1 && ne01 % 16 == 0;
+            const bool nvfp4_mmvq_cols_shape =
+                !ids && !has_mmvq_fusion && ncols_dst > 1 && ncols_dst <= 8 &&
+                ne01 % 16 == 0 && nchannels_dst == ne02 && ne3 == ne03;
+            const bool use_native_nvfp4_acts = use_nvfp4 && nvfp4_mmvq_1col_shape &&
+                ggml_cuda_nvfp4_mmvq_native_acts();
             const bool use_direct_nvfp4_fp8_acts_requested = use_nvfp4 && ggml_cuda_nvfp4_mmvq_direct_fp8_acts();
             const bool use_direct_nvfp4_fp8_fulln_only = use_direct_nvfp4_fp8_acts_requested &&
                 ggml_cuda_nvfp4_mmvq_direct_fp8_fulln_only();
             const bool use_direct_nvfp4_fp8_acts = use_direct_nvfp4_fp8_acts_requested &&
+                (nvfp4_mmvq_1col_shape || nvfp4_mmvq_cols_shape) &&
                 (!use_direct_nvfp4_fp8_fulln_only || ncols_dst > 1);
             // Full-K scalar FP8 is correct but slower than Q8 MMVQ; keep it out of the default path.
             const bool use_scalar_nvfp4_fp8_acts = false;

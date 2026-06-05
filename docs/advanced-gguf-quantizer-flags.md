@@ -165,7 +165,7 @@ Hard gates reject candidates that cross configured risk thresholds. Soft
 penalties let a candidate survive only when it earns the tail risk with better
 overall evidence.
 
-## Native NVFP4 Candidate Families
+## RSF And Candidate Families
 
 Refined scale fit (RSF) is part of the normal quantization path by default. Each
 tensor can refine its tensor scale while the local block/subblock fit remains
@@ -173,9 +173,9 @@ imatrix-weighted. RSF is a first-pass scale-fitting strategy, not a late
 repair-only path. Set the granularity, search depth, or report path directly:
 
 ```bash
-./build/bin/llama-quantize ... --nvfp4-selector-rsf-mode tensor \
-  --nvfp4-selector-rsf-depth deeper \
-  --nvfp4-selector-rsf-report runs/model/rsf-report.txt
+./build/bin/llama-quantize ... --selector-rsf-mode tensor \
+  --selector-rsf-depth deeper \
+  --selector-rsf-report runs/model/rsf-report.txt
 ```
 
 Recipe files can set the RSF granularity explicitly for diagnostics or
@@ -196,10 +196,10 @@ During measured Stage-B policy materialization, direct runtime patching skips
 the extra tensor reconstruction-stat pass by default because the policy rank is
 computed from saved-logit runtime metrics: PPL, mean and tail KLD, RMS
 probability delta, same-top rate, top-flip weight, teacher-top probability
-RMSE, and entropy RMSE. Use `--nvfp4-selector-stageb-patch-eval` when a
+RMSE, and entropy RMSE. Use `--selector-stageb-patch-eval` when a
 diagnostic run also needs patch-time tensor RMSE/abs/max aggregates in the log.
-Use `--nvfp4-selector-stageb-direct-verify` or
-`--nvfp4-selector-no-stageb-direct-verify` to override direct-patch readback
+Use `--selector-stageb-direct-verify` or
+`--selector-no-stageb-direct-verify` to override direct-patch readback
 verification for runtime-patch diagnostics.
 
 The default RSF selector budget is a compact KLD-guided real-artifact search:
@@ -212,33 +212,33 @@ Proxy-only survey passes may use a bounded RSF depth so that expensive
 exhaustive scale fitting is reserved for measured KLD/PPL candidate evaluation
 and final materialization.
 
-After the selected NVFP4 policy is materialized, the main selector can also
-consider speed-aware tensor type candidates for the worst NVFP4-error tensors.
+After the selected policy is materialized, the main selector can also
+consider speed-aware tensor type candidates for the worst baseline-error tensors.
 This is not a separate repair pass: it is part of the final exact tensor map.
 With a saved-logit KLD selector, the default cap is mode-dependent and based on
-outlier error rather than an arbitrary fixed fraction. NVFP4/RSF tensor-local
-repairs are tried first; only tensors where NVFP4 still has high error are
+outlier error rather than an arbitrary fixed fraction. Format-local RSF repairs
+are tried first; only tensors where the baseline format still has high error are
 allowed to move to stronger tensor types.
 
 ```bash
-./build/bin/llama-quantize ... --nvfp4-selector-candidate-types Q5_0,Q4_K,Q5_K,Q6_K,Q8_0
+./build/bin/llama-quantize ... --selector-candidate-types Q5_0,Q4_K,Q5_K,Q6_K,Q8_0
 ```
 
 Mixed NVFP4/MXFP6 runs prepend `MXFP6_E2M3` to that candidate list by default,
 so MXFP6 can win the tensor before Q4_K when it is available. Candidate ranking
-uses tensor-local NVFP4 error with static size and speed penalties; it does not
-run benchmarks during quantization. Use `--nvfp4-selector-candidate-fraction F`
-or `--nvfp4-selector-candidate-top N` to make the cap stricter or broader.
+uses tensor-local baseline error with static size and speed penalties; it does not
+run benchmarks during quantization. Use `--selector-candidate-fraction F`
+or `--selector-candidate-top N` to make the cap stricter or broader.
 
-For targeted diagnostics, `--nvfp4-selector-include-policy name` and
-`--nvfp4-selector-include-policies a,b` limit selector work to exact policy
+For targeted diagnostics, `--selector-include-policy name` and
+`--selector-include-policies a,b` limit selector work to exact policy
 names while still allowing the internal `seed_keep` checkpoint policy.
 
-Fresh NVFP4 selector runs build a per-tensor policy plan before final
+Fresh selector runs build a per-tensor policy plan before final
 materialization. Tensor-local proxy evidence chooses policy changes across the
 full tensor set, then the loaded runtime scores the whole plan against the KLD
 base before writing the final GGUF. This is enabled by default for measured
-selector runs; use `--nvfp4-selector-no-tensor-policy-map` only for diagnostics
+selector runs; use `--selector-no-tensor-policy-map` only for diagnostics
 or whole-policy comparison runs.
 
 The tensor-policy proxy gate is tied to work mode: `fast` uses a 0.0005
@@ -254,7 +254,7 @@ The recipe surface can keep a selector evidence ledger:
 ledger = "runs/model/selector-ledger.jsonl"
 ```
 
-`selector.ledger` passes through to `--nvfp4-selector-ledger` when set and
+`selector.ledger` passes through to `--selector-ledger` when set and
 appends raw selector evidence rows to JSONL. When exact stage-B KLD rows in the
 ledger match the current cache key, the selector can reuse them as a read-through
 cache before remeasuring a policy. Leave it empty for normal runs.

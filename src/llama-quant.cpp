@@ -12,11 +12,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <chrono>
 #include <cstring>
 #include <cinttypes>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <atomic>
 #include <fstream>
@@ -228,10 +230,13 @@ enum class tensor_category {
     OTHER
 };
 
-static void zeros(std::ofstream & file, size_t n) {
-    char zero = 0;
-    for (size_t i = 0; i < n; ++i) {
-        file.write(&zero, 1);
+static void zeros(std::ostream & file, size_t n) {
+    static constexpr size_t zero_chunk_size = 64 * 1024;
+    static const std::array<char, zero_chunk_size> zeroes{};
+    while (n > 0) {
+        const size_t chunk = std::min(n, zeroes.size());
+        file.write(zeroes.data(), chunk);
+        n -= chunk;
     }
 }
 
@@ -1826,7 +1831,7 @@ static size_t llama_tensor_quantize_impl(
         tensor_scale > 0.0f &&
         std::fabs(tensor_scale - 1.0f) > 1e-12f;
     const float inv_tensor_scale = normalize_native_tensor_scale_cpu ? (1.0f / tensor_scale) : 1.0f;
-    int qk_rsf_mode = params != nullptr && params->q4_k_rsf ? std::max<int>(1, params->q4_k_rsf_mode) : 0;
+    int qk_rsf_mode = params != nullptr && params->k_quant_rsf ? std::max<int>(1, params->k_quant_rsf_mode) : 0;
     if (k_rsf_mode_override > 0) {
         qk_rsf_mode = std::max<int32_t>(1, std::min<int32_t>(3, k_rsf_mode_override));
     }
@@ -3101,6 +3106,178 @@ static std::string llama_quant_json_escape(const std::string & value) {
     return out;
 }
 
+static bool llama_quantize_env_flag(const char * name) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    if (std::strcmp(value, "0") == 0 ||
+            llama_nvfp4_ascii_iequals(value, "false") ||
+            llama_nvfp4_ascii_iequals(value, "no") ||
+            llama_nvfp4_ascii_iequals(value, "off")) {
+        return false;
+    }
+    return true;
+}
+
+static uint64_t llama_quantize_parse_u64(const std::string & value, uint64_t fallback) {
+    if (value.empty()) {
+        return fallback;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const uint64_t parsed = std::strtoull(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str() || (end != nullptr && *end != '\0')) {
+        return fallback;
+    }
+    return parsed;
+}
+
+static size_t llama_tensor_payload_nbytes_for_type(const ggml_tensor * tensor, ggml_type target_type) {
+    ggml_tensor tmp = *tensor;
+    const size_t  type_size = ggml_type_size(target_type);
+    const int64_t blck_size = ggml_blck_size(target_type);
+
+    tmp.type = target_type;
+    GGML_ASSERT(tmp.ne[0] % blck_size == 0 && "tensor row size not divisible by block size of new type");
+
+    tmp.nb[0] = type_size;
+    tmp.nb[1] = tmp.nb[0] * (tmp.ne[0] / blck_size);
+    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+        tmp.nb[i] = tmp.nb[i - 1] * tmp.ne[i - 1];
+    }
+    return ggml_nbytes(&tmp);
+}
+
+struct llama_quantize_resume_state {
+    bool enabled = false;
+    bool active = false;
+    std::string path;
+    size_t next_tensor = 0;
+    uint64_t file_size = 0;
+    size_t total_size_org = 0;
+    size_t total_size_new = 0;
+};
+
+static void llama_quantize_resume_remove(const llama_quantize_resume_state & resume) {
+    if (!resume.enabled || resume.path.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::remove(resume.path, ec);
+    std::filesystem::remove(resume.path + ".tmp", ec);
+}
+
+static bool llama_quantize_resume_load(
+        const std::string & state_path,
+        const std::string & fname_inp,
+        const std::string & fname_out,
+        llama_ftype ftype,
+        size_t n_tensors,
+        size_t meta_size,
+        llama_quantize_resume_state & resume) {
+    std::ifstream in(state_path);
+    if (!in) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> kv;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        kv.emplace(line.substr(0, eq), line.substr(eq + 1));
+    }
+
+    const uint64_t saved_meta_size = llama_quantize_parse_u64(kv["meta_size"], UINT64_MAX);
+    if (kv["schema"] != "advanced-gguf-quantize-resume-v1" ||
+            kv["input"] != fname_inp ||
+            kv["output"] != fname_out ||
+            llama_quantize_parse_u64(kv["ftype"], UINT64_MAX) != (uint64_t) ftype ||
+            llama_quantize_parse_u64(kv["n_tensors"], UINT64_MAX) != (uint64_t) n_tensors ||
+            (saved_meta_size != 0 && saved_meta_size != (uint64_t) meta_size)) {
+        return false;
+    }
+
+    const uint64_t next_tensor = llama_quantize_parse_u64(kv["next_tensor"], UINT64_MAX);
+    const uint64_t file_size = llama_quantize_parse_u64(kv["file_size"], 0);
+    if (next_tensor == UINT64_MAX || next_tensor > n_tensors || file_size < meta_size) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(fname_out, ec) || ec) {
+        return false;
+    }
+    const uint64_t actual_size = (uint64_t) std::filesystem::file_size(fname_out, ec);
+    if (ec || actual_size < file_size) {
+        return false;
+    }
+    if (actual_size > file_size) {
+        std::filesystem::resize_file(fname_out, file_size, ec);
+        if (ec) {
+            return false;
+        }
+    }
+
+    resume.path = state_path;
+    resume.next_tensor = (size_t) next_tensor;
+    resume.file_size = file_size;
+    resume.total_size_org = (size_t) llama_quantize_parse_u64(kv["total_size_org"], 0);
+    resume.total_size_new = (size_t) llama_quantize_parse_u64(kv["total_size_new"], 0);
+    resume.active = resume.next_tensor > 0;
+    return resume.active;
+}
+
+static void llama_quantize_resume_save(
+        const llama_quantize_resume_state & resume,
+        const std::string & fname_inp,
+        const std::string & fname_out,
+        llama_ftype ftype,
+        size_t n_tensors,
+        size_t meta_size,
+        size_t next_tensor,
+        uint64_t file_size,
+        size_t total_size_org,
+        size_t total_size_new) {
+    if (!resume.enabled || resume.path.empty()) {
+        return;
+    }
+
+    const std::string tmp_path = resume.path + ".tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::trunc);
+        if (!out) {
+            LLAMA_LOG_WARN("%s: failed to open resume sidecar %s\n", __func__, tmp_path.c_str());
+            return;
+        }
+        out << "schema=advanced-gguf-quantize-resume-v1\n"
+            << "input=" << fname_inp << "\n"
+            << "output=" << fname_out << "\n"
+            << "ftype=" << (int) ftype << "\n"
+            << "n_tensors=" << n_tensors << "\n"
+            << "meta_size=" << meta_size << "\n"
+            << "next_tensor=" << next_tensor << "\n"
+            << "file_size=" << file_size << "\n"
+            << "total_size_org=" << total_size_org << "\n"
+            << "total_size_new=" << total_size_new << "\n";
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, resume.path, ec);
+    if (ec) {
+        std::filesystem::remove(resume.path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp_path, resume.path, ec);
+        if (ec) {
+            LLAMA_LOG_WARN("%s: failed to publish resume sidecar %s: %s\n",
+                    __func__, resume.path.c_str(), ec.message().c_str());
+        }
+    }
+}
+
 //
 // main quantization driver
 //
@@ -3741,8 +3918,77 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    llama_quantize_resume_state resume;
+    resume.enabled = !params->dry_run && llama_quantize_env_flag("LLAMA_QUANTIZE_RESUME_OUTPUT");
+    if (resume.enabled && params->keep_split) {
+        LLAMA_LOG_WARN("%s: resumable output is disabled for split GGUF writes\n", __func__);
+        resume.enabled = false;
+    }
+    if (resume.enabled) {
+        resume.path = fname_out + ".resume";
+    }
+
+    size_t writer_total_bytes = 0;
+    if (!params->dry_run) {
+        for (const auto & ctx : ctx_outs) {
+            if (ctx) {
+                writer_total_bytes += gguf_get_meta_size(ctx.get());
+            }
+        }
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            writer_total_bytes += GGML_PAD(llama_tensor_payload_nbytes_for_type(tensors[i]->tensor, metadata[i].target_type), align);
+            const auto aux_it = nvfp4_aux_tensors.find(metadata[i].name);
+            if (aux_it != nvfp4_aux_tensors.end()) {
+                const size_t scale_size = aux_it->second.scale_values.size() * sizeof(float);
+                const size_t input_scale_size = aux_it->second.input_scale_values.size() * sizeof(float);
+                writer_total_bytes += GGML_PAD(scale_size, align);
+                if (input_scale_size > 0) {
+                    writer_total_bytes += GGML_PAD(input_scale_size, align);
+                }
+            }
+        }
+    }
+    size_t writer_bytes_done = 0;
+    int writer_last_pct = -1;
+    auto writer_last_log = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+    auto writer_bar = [](double progress) {
+        static constexpr int width = 28;
+        std::string bar((size_t) width, '-');
+        const int filled = std::max(0, std::min(width, (int) std::floor(progress * width)));
+        for (int i = 0; i < filled; ++i) {
+            bar[(size_t) i] = '=';
+        }
+        if (filled < width) {
+            bar[(size_t) filled] = '>';
+        }
+        return bar;
+    };
+    auto writer_progress = [&](const char * detail, bool force = false) {
+        if (params->dry_run || writer_total_bytes == 0) {
+            return;
+        }
+        const double progress = std::min(1.0, (double) writer_bytes_done / (double) writer_total_bytes);
+        const int pct = std::max(0, std::min(100, (int) std::floor(progress * 100.0 + 0.5)));
+        const auto now = std::chrono::steady_clock::now();
+        const bool pct_step = writer_last_pct < 0 || pct >= writer_last_pct + 5 || pct == 100;
+        if (!force && !pct_step && now - writer_last_log < std::chrono::seconds(30)) {
+            return;
+        }
+        writer_last_pct = pct;
+        writer_last_log = now;
+        LLAMA_LOG_INFO(
+                "%s: Writing GGUF to disk... %3d%% [%s] %.2f/%.2f GiB%s%s\n",
+                __func__,
+                pct,
+                writer_bar(progress).c_str(),
+                (double) writer_bytes_done / (1024.0 * 1024.0 * 1024.0),
+                (double) writer_total_bytes / (1024.0 * 1024.0 * 1024.0),
+                detail != nullptr && detail[0] != '\0' ? " " : "",
+                detail != nullptr ? detail : "");
+    };
+
     int cur_split = -1;
-    std::ofstream fout;
+    std::fstream fout;
     std::vector<size_t> meta_placeholder_size(n_split, 0);
     auto close_ofstream = [&]() {
         // Write metadata and close file handler
@@ -3770,12 +4016,29 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             fname = std::string(split_path.data());
         }
 
-        fout = std::ofstream(fname, std::ios::binary);
-        fout.exceptions(std::ofstream::failbit); // fail fast on write errors
         const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split].get());
         meta_placeholder_size[cur_split] = meta_size;
-        // placeholder for the meta data
-        ::zeros(fout, meta_size);
+
+        if (resume.enabled && cur_split == 0) {
+            llama_quantize_resume_load(
+                    resume.path, fname_inp, fname, ftype, tensors.size(), meta_size, resume);
+        }
+
+        if (resume.active && cur_split == 0) {
+            LLAMA_LOG_INFO("%s: resuming output %s from tensor %zu/%zu at byte %" PRIu64 "\n",
+                    __func__, fname.c_str(), resume.next_tensor, tensors.size(), resume.file_size);
+            fout = std::fstream(fname, std::ios::binary | std::ios::in | std::ios::out);
+            fout.exceptions(std::fstream::failbit | std::fstream::badbit); // fail fast on write errors
+            fout.seekp((std::streamoff) resume.file_size);
+            writer_bytes_done = std::max(writer_bytes_done, (size_t) resume.file_size);
+        } else {
+            fout = std::fstream(fname, std::ios::binary | std::ios::out | std::ios::trunc);
+            fout.exceptions(std::fstream::failbit | std::fstream::badbit); // fail fast on write errors
+            // placeholder for the meta data
+            ::zeros(fout, meta_size);
+            writer_bytes_done += meta_size;
+        }
+        writer_progress("opened output", true);
     };
 
     // no output file for --dry-run
@@ -3800,7 +4063,60 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         const size_t tensor_size = ggml_nbytes(tensor);
 
-                if (!params->dry_run) {
+        const ggml_type cur_type = tensor->type;
+        const ggml_type new_type = tm.target_type;
+
+        // If we've decided to quantize to the same type the tensor is already
+        // in then there's nothing to do.
+        bool quantize = cur_type != new_type;
+
+        void * new_data;
+        size_t new_size;
+        size_t auxiliary_size = 0;
+        auto nvfp4_aux_it = nvfp4_aux_tensors.find(name);
+        nvfp4_aux_tensor_info * nvfp4_aux_info = nvfp4_aux_it != nvfp4_aux_tensors.end() ? &nvfp4_aux_it->second : nullptr;
+        if (nvfp4_aux_info != nullptr) {
+            auxiliary_size =
+                nvfp4_aux_info->scale_values.size() * sizeof(float) +
+                nvfp4_aux_info->input_scale_values.size() * sizeof(float);
+        }
+
+        if (!params->dry_run && resume.active && i < resume.next_tensor) {
+            const size_t new_size = llama_tensor_payload_nbytes_for_type(tensor, new_type);
+
+            LLAMA_LOG_INFO("[%4d/%4d] %-36s - [%s], type = %6s, resumed as %6s, size = %8.2f MiB -> %8.2f MiB\n",
+                   ++idx, ml.n_tensors,
+                   ggml_get_name(tensor),
+                   llama_format_tensor_shape(tensor).c_str(),
+                   ggml_type_name(tensor->type),
+                   ggml_type_name(new_type),
+                   tensor_size/1024.0/1024.0,
+                   (new_size + auxiliary_size)/1024.0/1024.0);
+
+            total_size_org += tensor_size;
+            total_size_new += new_size + auxiliary_size;
+
+            gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
+            GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);
+            gguf_set_tensor_data(ctx_outs[cur_split].get(), metadata[i].name.c_str(), nullptr);
+
+            if (nvfp4_aux_info != nullptr) {
+                const size_t scale_size = nvfp4_aux_info->scale_values.size() * sizeof(float);
+                const size_t input_scale_size = nvfp4_aux_info->input_scale_values.size() * sizeof(float);
+
+                GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), nvfp4_aux_info->scale_name.c_str())) == scale_size);
+                gguf_set_tensor_data(ctx_outs[cur_split].get(), nvfp4_aux_info->scale_name.c_str(), nullptr);
+
+                if (input_scale_size > 0) {
+                    GGML_ASSERT(!nvfp4_aux_info->input_scale_name.empty());
+                    GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), nvfp4_aux_info->input_scale_name.c_str())) == input_scale_size);
+                    gguf_set_tensor_data(ctx_outs[cur_split].get(), nvfp4_aux_info->input_scale_name.c_str(), nullptr);
+                }
+            }
+            continue;
+        }
+
+        if (!params->dry_run) {
             if (!tm.copy_from_patch && !ml.use_mmap) {
                 if (read_data.size() < tensor_size) {
                     read_data.resize(tensor_size);
@@ -3817,24 +4133,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                ggml_get_name(tensor),
                llama_format_tensor_shape(tensor).c_str(),
                ggml_type_name(tensor->type));
-
-        const ggml_type cur_type = tensor->type;
-        const ggml_type new_type = tm.target_type;
-
-        // If we've decided to quantize to the same type the tensor is already
-        // in then there's nothing to do.
-        bool quantize = cur_type != new_type;
-
-        void * new_data;
-        size_t new_size;
-        size_t auxiliary_size = 0;
-        auto nvfp4_aux_it = nvfp4_aux_tensors.find(name);
-        nvfp4_aux_tensor_info * nvfp4_aux_info = nvfp4_aux_it != nvfp4_aux_tensors.end() ? &nvfp4_aux_it->second : nullptr;
-	        if (nvfp4_aux_info != nullptr) {
-	            auxiliary_size =
-	                nvfp4_aux_info->scale_values.size() * sizeof(float) +
-	                nvfp4_aux_info->input_scale_values.size() * sizeof(float);
-	        }
 
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
@@ -4193,6 +4491,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // write tensor data + padding
             fout.write((const char *) new_data, new_size);
             zeros(fout, GGML_PAD(new_size, align) - new_size);
+            writer_bytes_done += GGML_PAD(new_size, align);
             if (nvfp4_aux_info != nullptr) {
                 const size_t scale_size = nvfp4_aux_info->scale_values.size() * sizeof(float);
                 const size_t input_scale_size = nvfp4_aux_info->input_scale_values.size() * sizeof(float);
@@ -4201,6 +4500,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 gguf_set_tensor_data(ctx_outs[cur_split].get(), nvfp4_aux_info->scale_name.c_str(), nvfp4_aux_info->scale_values.data());
                 fout.write((const char *) nvfp4_aux_info->scale_values.data(), scale_size);
                 zeros(fout, GGML_PAD(scale_size, align) - scale_size);
+                writer_bytes_done += GGML_PAD(scale_size, align);
 
                 if (input_scale_size > 0) {
                     GGML_ASSERT(!nvfp4_aux_info->input_scale_name.empty());
@@ -4208,13 +4508,28 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     gguf_set_tensor_data(ctx_outs[cur_split].get(), nvfp4_aux_info->input_scale_name.c_str(), nvfp4_aux_info->input_scale_values.data());
                     fout.write((const char *) nvfp4_aux_info->input_scale_values.data(), input_scale_size);
                     zeros(fout, GGML_PAD(input_scale_size, align) - input_scale_size);
+                    writer_bytes_done += GGML_PAD(input_scale_size, align);
                 }
-	            }
+		    }
+            writer_progress(name.c_str());
+
+            if (resume.enabled && !params->keep_split) {
+                const std::streampos pos = fout.tellp();
+                if (pos >= std::streampos(0)) {
+                    llama_quantize_resume_save(
+                            resume, fname_inp, fname_out, ftype, tensors.size(),
+                            meta_placeholder_size[cur_split], i + 1, (uint64_t) pos,
+                            total_size_org, total_size_new);
+                }
+            }
         } // no --dry-run
     } // main loop
 
     if (!params->dry_run) {
         close_ofstream();
+        writer_bytes_done = writer_total_bytes;
+        writer_progress("complete", true);
+        llama_quantize_resume_remove(resume);
     }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
@@ -4274,8 +4589,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.mixed_format_imatrix_power  =*/ -1.0f,
         /*.mixed_format_imatrix_min    =*/ -1.0f,
         /*.mixed_format_imatrix_max    =*/ -1.0f,
-        /*.q4_k_rsf                    =*/ true,
-        /*.q4_k_rsf_mode               =*/ 1,
+        /*.k_quant_rsf                 =*/ true,
+        /*.k_quant_rsf_mode            =*/ 1,
     };
 
     return result;

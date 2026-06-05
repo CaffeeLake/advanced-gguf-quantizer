@@ -16,7 +16,7 @@
 #include <unistd.h>
 #endif
 
-nvfp4_selector_kld_subset::mmap_file::~mmap_file() {
+selector_kld_subset::mmap_file::~mmap_file() {
 #if defined(__unix__) || defined(__APPLE__)
     if (data != nullptr && size > 0) {
         munmap(const_cast<uint8_t *>(data), size);
@@ -27,11 +27,11 @@ nvfp4_selector_kld_subset::mmap_file::~mmap_file() {
 #endif
 }
 
-const uint16_t * nvfp4_selector_kld_log_probs_data(const nvfp4_selector_kld_subset & kld) {
+const uint16_t * selector_kld_log_probs_data(const selector_kld_subset & kld) {
     return kld.log_probs_u16_mapped != nullptr ? kld.log_probs_u16_mapped : kld.log_probs_u16.data();
 }
 
-static std::shared_ptr<nvfp4_selector_kld_subset::mmap_file> nvfp4_selector_try_mmap_kld_file(const std::string & path) {
+static std::shared_ptr<selector_kld_subset::mmap_file> selector_try_mmap_kld_file(const std::string & path) {
 #if defined(__unix__) || defined(__APPLE__)
     std::error_code ec;
     const uintmax_t file_size_u = std::filesystem::file_size(path, ec);
@@ -57,7 +57,7 @@ static std::shared_ptr<nvfp4_selector_kld_subset::mmap_file> nvfp4_selector_try_
         return nullptr;
     }
 
-    auto out = std::make_shared<nvfp4_selector_kld_subset::mmap_file>();
+    auto out = std::make_shared<selector_kld_subset::mmap_file>();
     out->fd = fd;
     out->size = file_size;
     out->data = (const uint8_t *) mapped;
@@ -68,7 +68,7 @@ static std::shared_ptr<nvfp4_selector_kld_subset::mmap_file> nvfp4_selector_try_
 #endif
 }
 
-bool nvfp4_selector_load_kld_subset(const std::string & path, nvfp4_selector_kld_subset & out) {
+bool selector_load_kld_subset(const std::string & path, selector_kld_subset & out) {
     out.source_path = path;
     std::error_code file_ec;
     out.source_size = std::filesystem::file_size(path, file_ec);
@@ -120,7 +120,7 @@ bool nvfp4_selector_load_kld_subset(const std::string & path, nvfp4_selector_kld
     in.seekg(header_sz + tokens_all_sz, std::ios::beg);
     const std::streamoff logp_offset = header_sz + tokens_all_sz;
     const std::streamoff logp_bytes = (std::streamoff) out.n_chunk * chunk_logp_sz;
-    out.log_probs_mapping = nvfp4_selector_try_mmap_kld_file(path);
+    out.log_probs_mapping = selector_try_mmap_kld_file(path);
     if (out.log_probs_mapping != nullptr &&
             logp_offset >= 0 &&
             logp_bytes >= 0 &&
@@ -148,12 +148,12 @@ bool nvfp4_selector_load_kld_subset(const std::string & path, nvfp4_selector_kld
     return true;
 }
 
-void nvfp4_selector_eval_one_token(
+void selector_eval_one_token(
     int n_vocab,
     const float * logits,
     const uint16_t * base_logp_u16,
     llama_token tok,
-    nvfp4_selector_kld_metrics & m) {
+    selector_kld_metrics & m) {
     float max_l = logits[0];
     int i_max = 0;
 
@@ -240,7 +240,7 @@ void nvfp4_selector_eval_one_token(
     m.count++;
 }
 
-void nvfp4_selector_merge_kld_metrics(nvfp4_selector_kld_metrics & dst, nvfp4_selector_kld_metrics && src) {
+void selector_merge_kld_metrics(selector_kld_metrics & dst, selector_kld_metrics && src) {
     dst.sum_nll += src.sum_nll;
     dst.sum_nll2 += src.sum_nll2;
     dst.sum_nll_base += src.sum_nll_base;
@@ -263,8 +263,8 @@ void nvfp4_selector_merge_kld_metrics(nvfp4_selector_kld_metrics & dst, nvfp4_se
     }
 }
 
-void nvfp4_selector_merge_cuda_kld_metrics(
-        nvfp4_selector_kld_metrics & dst,
+void selector_merge_cuda_kld_metrics(
+        selector_kld_metrics & dst,
         const nvfp4_cuda_kld_result & src,
         std::vector<double> && kld_values) {
     dst.sum_nll += src.sum_nll;
@@ -289,7 +289,7 @@ void nvfp4_selector_merge_cuda_kld_metrics(
     }
 }
 
-std::pair<double, double> nvfp4_selector_mean_and_uncertainty(double sum, double sum2, int64_t count) {
+std::pair<double, double> selector_mean_and_uncertainty(double sum, double sum2, int64_t count) {
     if (count < 1) {
         return { 0.0, 0.0 };
     }
@@ -299,7 +299,7 @@ std::pair<double, double> nvfp4_selector_mean_and_uncertainty(double sum, double
     return { mean, unc };
 }
 
-static double nvfp4_selector_covariance(double suma, double sumb, double sumab, int64_t count) {
+static double selector_covariance(double suma, double sumb, double sumab, int64_t count) {
     if (count < 10) {
         return 0.0;
     }
@@ -308,7 +308,7 @@ static double nvfp4_selector_covariance(double suma, double sumb, double sumab, 
     return cov;
 }
 
-static double nvfp4_selector_percentile_sorted(const std::vector<double> & values, double fraction) {
+static double selector_percentile_sorted(const std::vector<double> & values, double fraction) {
     if (values.empty()) {
         return 0.0;
     }
@@ -324,7 +324,7 @@ static double nvfp4_selector_percentile_sorted(const std::vector<double> & value
     return (1.0 - p) * values[ip] + p * values[std::min(ip + 1, values.size() - 1)];
 }
 
-static double nvfp4_selector_tail_mean_sorted(const std::vector<double> & values, double fraction) {
+static double selector_tail_mean_sorted(const std::vector<double> & values, double fraction) {
     if (values.empty()) {
         return 0.0;
     }
@@ -337,15 +337,15 @@ static double nvfp4_selector_tail_mean_sorted(const std::vector<double> & values
     return sum / (double) (values.size() - begin);
 }
 
-nvfp4_selector_derived_metrics nvfp4_selector_derive_metrics(const nvfp4_selector_kld_metrics & km) {
-    nvfp4_selector_derived_metrics d;
+selector_derived_metrics selector_derive_metrics(const selector_kld_metrics & km) {
+    selector_derived_metrics d;
     if (km.count <= 0) {
         return d;
     }
     d.ok = true;
-    const auto log_ppl = nvfp4_selector_mean_and_uncertainty(km.sum_nll, km.sum_nll2, km.count);
-    const auto log_ppl_base = nvfp4_selector_mean_and_uncertainty(km.sum_nll_base, km.sum_nll_base2, km.count);
-    const double log_ppl_cov = nvfp4_selector_covariance(km.sum_nll, km.sum_nll_base, km.sum_nll_nll_base, km.count);
+    const auto log_ppl = selector_mean_and_uncertainty(km.sum_nll, km.sum_nll2, km.count);
+    const auto log_ppl_base = selector_mean_and_uncertainty(km.sum_nll_base, km.sum_nll_base2, km.count);
+    const double log_ppl_cov = selector_covariance(km.sum_nll, km.sum_nll_base, km.sum_nll_nll_base, km.count);
     d.ppl_q = exp(log_ppl.first);
     d.ppl_base = exp(log_ppl_base.first);
     d.ln_ratio = log_ppl.first - log_ppl_base.first;
@@ -353,16 +353,16 @@ nvfp4_selector_derived_metrics nvfp4_selector_derive_metrics(const nvfp4_selecto
         log_ppl.second * log_ppl.second +
         log_ppl_base.second * log_ppl_base.second -
         2.0 * log_ppl_cov));
-    const auto kld = nvfp4_selector_mean_and_uncertainty(km.sum_kld, km.sum_kld2, km.count);
+    const auto kld = selector_mean_and_uncertainty(km.sum_kld, km.sum_kld2, km.count);
     d.mean_kld = kld.first;
     d.mean_kld_unc = kld.second;
     if (!km.kld_values.empty()) {
         std::vector<double> sorted_kld = km.kld_values;
         std::sort(sorted_kld.begin(), sorted_kld.end());
-        d.kld_p95 = nvfp4_selector_percentile_sorted(sorted_kld, 0.95);
-        d.kld_p99 = nvfp4_selector_percentile_sorted(sorted_kld, 0.99);
-        d.kld_p999 = nvfp4_selector_percentile_sorted(sorted_kld, 0.999);
-        d.kld_tail_mean = nvfp4_selector_tail_mean_sorted(sorted_kld, 0.99);
+        d.kld_p95 = selector_percentile_sorted(sorted_kld, 0.95);
+        d.kld_p99 = selector_percentile_sorted(sorted_kld, 0.99);
+        d.kld_p999 = selector_percentile_sorted(sorted_kld, 0.999);
+        d.kld_tail_mean = selector_tail_mean_sorted(sorted_kld, 0.99);
     } else {
         d.kld_p95 = km.max_kld;
         d.kld_p99 = km.max_kld;
@@ -370,7 +370,7 @@ nvfp4_selector_derived_metrics nvfp4_selector_derive_metrics(const nvfp4_selecto
         d.kld_tail_mean = km.max_kld;
     }
     d.max_kld = km.max_kld;
-    const auto p_diff_mse = nvfp4_selector_mean_and_uncertainty(km.sum_p_diff2, km.sum_p_diff4, km.count);
+    const auto p_diff_mse = selector_mean_and_uncertainty(km.sum_p_diff2, km.sum_p_diff4, km.count);
     d.rms_dp = std::sqrt(std::max(0.0, p_diff_mse.first));
     d.rms_dp_unc = d.rms_dp > 0.0 ? (0.5 / d.rms_dp) * p_diff_mse.second : 0.0;
     d.same_top = (double) km.same_top / km.count;

@@ -55,7 +55,7 @@ runtime tensors and then ranks the policy from saved-logit runtime metrics
 rather than recomputing tensor reconstruction stats during the patch itself.
 This avoids an extra reconstruction kernel and device-to-host reduction per
 patched tensor. Diagnostic runs can restore the patch-time tensor RMSE/abs/max
-aggregation with `--nvfp4-selector-stageb-patch-eval`.
+aggregation with `--selector-stageb-patch-eval`.
 
 ## Memory-Bounded Mode
 

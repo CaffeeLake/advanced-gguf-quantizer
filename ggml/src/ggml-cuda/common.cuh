@@ -1743,6 +1743,9 @@ static inline const ggml_tensor * ggml_cuda_mul_mat_weight_scale(const ggml_tens
     if (scale != nullptr && scale->buffer != nullptr && ggml_backend_buffer_is_host(scale->buffer)) {
         return nullptr;
     }
+    if (scale != nullptr && (!scale->data || !scale->buffer)) {
+        return nullptr;
+    }
 #if defined(BLACKWELL_MMA_AVAILABLE)
     if (scale != nullptr && ggml_is_scalar(scale) && (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP6_E2M3)) {
         return nullptr;
@@ -1761,6 +1764,9 @@ static inline const ggml_tensor * ggml_cuda_mul_mat_input_scale(const ggml_tenso
         return nullptr;
     }
     if (scale != nullptr && scale->buffer != nullptr && ggml_backend_buffer_is_host(scale->buffer)) {
+        return nullptr;
+    }
+    if (scale != nullptr && (!scale->data || !scale->buffer)) {
         return nullptr;
     }
 #if defined(BLACKWELL_MMA_AVAILABLE)
