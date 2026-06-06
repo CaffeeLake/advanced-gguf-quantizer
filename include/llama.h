@@ -429,7 +429,7 @@ extern "C" {
         enum llama_ftype ftype;                                     // quantize to this llama_ftype
         enum ggml_type output_tensor_type;                          // output tensor type
         enum ggml_type token_embedding_type;                        // token embeddings tensor type
-        enum ggml_type mtp_tensor_type;                             // MTP/NextN tensor type, GGML_TYPE_COUNT defaults to Q8_0
+        enum ggml_type mtp_tensor_type;                             // MTP/NextN matrix tensor type, GGML_TYPE_COUNT uses caller/profile default
         bool allow_requantize;                                      // allow quantizing non-f32/f16 tensors
         bool quantize_output_tensor;                                // quantize output.weight
         bool only_copy;                                             // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored

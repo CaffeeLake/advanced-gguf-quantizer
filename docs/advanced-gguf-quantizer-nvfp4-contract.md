@@ -84,6 +84,8 @@ Pure NVFP4 defaults:
 - token embeddings remain `NVFP4`;
 - tied token embeddings follow the token embedding rule;
 - a separate `output.weight` may use a stronger type such as `Q6_K`.
+- MTP/NextN matrix weights use `NVFP4` when the recipe or profile selects
+  NVFP4 MTP.
 
 Mixed and repair recipes may override this, but the report should make the
 decision visible.
@@ -94,7 +96,10 @@ MTP and NextN metadata and tensors must be preserved unless a recipe explicitly
 states a different policy. The inspect report should show whether MTP/NextN was
 present in the source and present in the output. Use `--mtp-tensor-type` or
 `base.mtp_tensor_type` for deliberate MTP conversion; release MTP blocks should
-use source precision, `MXFP6_E2M3`, `Q8_0`, `BF16`, or `F16`, not `NVFP4`.
+use the recipe-selected type. `NVFP4` MTP matrix weights are valid for
+Blackwell NVFP4 artifacts and use the same weight scale, input scale, and RSF
+policy as other NVFP4 matrix weights. `MXFP6_E2M3`, `Q8_0`, `BF16`, and `F16`
+remain valid deliberate MTP choices.
 
 ## Validation
 

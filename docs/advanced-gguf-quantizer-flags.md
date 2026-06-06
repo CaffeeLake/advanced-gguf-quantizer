@@ -50,8 +50,9 @@ Core inputs:
   behavior.
 - `base.output_tensor_type`, `base.token_embedding_type`: optional explicit
   output/head and token embedding tensor types.
-- `base.mtp_tensor_type`: optional explicit MTP/NextN tensor type. Leave blank
-  to use `Q8_0` for MTP matrix weights and preserve MTP norm/vector tensors.
+- `base.mtp_tensor_type`: optional explicit MTP/NextN matrix tensor type.
+  NVFP4 profiles default this to `NVFP4`; MXFP6 profiles default it to
+  `MXFP6_E2M3`. Norm/vector MTP tensors are still preserved.
 - `target.precision_mode`: `nvfp4`, `mxfp6`, `nvfp4_mxfp6`, or
   `mxfp6-primary`.
 - `target.target_bpw`: final bits-per-weight goal for mixed allocation.
@@ -106,12 +107,13 @@ Direct `llama-quantize` saved-logit selector runs use
 
 ## Profiles
 
-- `nvfp4`: compact Blackwell NVFP4 model.
-- `mxfp6`: MXFP6_E2M3 model.
+- `nvfp4`: compact Blackwell NVFP4 model with NVFP4 MTP matrix weights.
+- `mxfp6`: MXFP6_E2M3 model with MXFP6_E2M3 MTP matrix weights.
 - `nvfp4_mxfp6`: NVFP4-first mixed model that promotes sensitive tensors to
-  MXFP6 or stronger fallback types.
+  MXFP6 or stronger fallback types while keeping MTP matrix weights NVFP4.
 - `mxfp6-primary`: MXFP6-first model that demotes selected tensors to NVFP4
-  when measured quality allows it.
+  when measured quality allows it, with MXFP6_E2M3 MTP matrix weights by
+  default.
 - `repair`: edit or repair an existing GGUF with targeted tensor policy.
 - `q8_0`: conservative baseline or calibration helper.
 
@@ -192,6 +194,9 @@ instead of carrying parallel non-RSF siblings through the selector. When a KLD
 base is available, the full-base exact KLD score validates the composed tensor
 plan. Adaptive four-over-six remains the default NVFP4 encoder path for these
 variants and the base policies they extend.
+When `base.mtp_tensor_type = "NVFP4"`, MTP/NextN matrix weights use the same
+NVFP4 encoder policy, auxiliary scale tensors, input-scale policy, and RSF
+configuration as the rest of the NVFP4 model.
 During measured Stage-B policy materialization, direct runtime patching skips
 the extra tensor reconstruction-stat pass by default because the policy rank is
 computed from saved-logit runtime metrics: PPL, mean and tail KLD, RMS

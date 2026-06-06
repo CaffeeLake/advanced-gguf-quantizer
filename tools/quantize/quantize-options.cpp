@@ -202,7 +202,7 @@ bool ftype_is_mixed_nvfp4_mxfp6(const std::string & ftype_str) {
     printf("  --token-embedding-type ggml_type\n");
     printf("                                      use this ggml_type for the token embeddings tensor\n");
     printf("  --mtp-tensor-type ggml_type\n");
-    printf("                                      use this ggml_type for MTP/NextN tensors; default is Q8_0 for matrix weights.\n");
+    printf("                                      use this ggml_type for MTP/NextN matrix tensors; blank follows the ftype/profile default.\n");
     printf("  --tensor-type tensor_name=ggml_type\n");
     printf("                                      quantize this tensor to this ggml_type\n");
     printf("                                      this is an advanced option to selectively quantize tensors. may be specified multiple times.\n");

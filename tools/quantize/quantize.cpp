@@ -3271,7 +3271,7 @@ static std::string selector_tensor_policy_unit_key(const std::string & name, con
 
 static std::string selector_rsf_hist_class(const std::string & name, selector_tensor_class cls) {
     if (name.find("mtp") != std::string::npos || name.find("nextn") != std::string::npos) {
-        return "MTP(keep as Q8/BF16/F32)";
+        return "MTP/NextN";
     }
     if (name.find(".attn_q.weight") != std::string::npos) {
         return "attn_q";
@@ -5660,8 +5660,8 @@ static bool selector_write_rsf_report(
         }
         out << '\n';
     }
-    if (hist_by_class.find("MTP(keep as Q8/BF16/F32)") == hist_by_class.end()) {
-        out << "  MTP(keep as Q8/BF16/F32): kept out of RSF\n";
+    if (hist_by_class.find("MTP/NextN") == hist_by_class.end()) {
+        out << "  MTP/NextN: uses explicit MTP tensor policy when quantized\n";
     }
 
     fprintf(stderr, "%s: wrote RSF report %s\n", __func__, report_path.c_str());
@@ -12192,6 +12192,9 @@ int llama_quantize(int argc, char ** argv) {
         if (params.output_tensor_type >= GGML_TYPE_COUNT) {
             params.output_tensor_type = GGML_TYPE_Q6_K;
         }
+        if (params.mtp_tensor_type >= GGML_TYPE_COUNT) {
+            params.mtp_tensor_type = GGML_TYPE_NVFP4;
+        }
     }
 
     if (params.ftype == LLAMA_FTYPE_MOSTLY_MXFP6_E2M3 || ftype_mixed_nvfp4_mxfp6) {
@@ -12200,6 +12203,9 @@ int llama_quantize(int argc, char ** argv) {
         }
         if (params.output_tensor_type >= GGML_TYPE_COUNT) {
             params.output_tensor_type = GGML_TYPE_MXFP6_E2M3;
+        }
+        if (params.mtp_tensor_type >= GGML_TYPE_COUNT) {
+            params.mtp_tensor_type = ftype_mixed_nvfp4_mxfp6 ? GGML_TYPE_NVFP4 : GGML_TYPE_MXFP6_E2M3;
         }
     }
 

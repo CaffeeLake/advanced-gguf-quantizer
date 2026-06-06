@@ -9,8 +9,8 @@ extra bits only where evidence justifies them.
 - Preserve MTP and NextN tensors by default, including the whole appended
   decoder block on Qwen-style MTP models.
 - Use `base.mtp_tensor_type` / `--mtp-tensor-type` when a recipe deliberately
-  converts MTP tensors. `MXFP6_E2M3`, `Q8_0`, `BF16`, and `F16` are valid
-  release choices; do not use `NVFP4` for MTP.
+  converts MTP matrix tensors. `NVFP4`, `MXFP6_E2M3`, `Q8_0`, `BF16`, and
+  `F16` are valid release choices.
 - Keep token embeddings as `NVFP4` in pure NVFP4 artifacts.
 - A separate `output.weight` may use `Q6_K`, `Q8_0`, `BF16`, or another stronger
   type when the recipe asks for it.
@@ -61,11 +61,13 @@ whether the extra bytes are worth it.
 Recommended defaults:
 
 - pure NVFP4: token embeddings `NVFP4`, separate output stronger than NVFP4 when
-  needed;
+  needed, MTP matrix weights `NVFP4` when MTP is present;
 - mixed NVFP4/MXFP6: keep embeddings and output controlled by explicit recipe
-  fields;
+  fields; MTP matrix weights default to `NVFP4` unless the recipe requests
+  `MXFP6_E2M3` or another fallback type;
 - MXFP6-primary: use MXFP6 for sensitive output/head tensors unless a budget
-  rule proves a lower type is acceptable;
+  rule proves a lower type is acceptable; MTP matrix weights default to
+  `MXFP6_E2M3`;
 - tied embeddings: follow the token embedding rule unless the architecture has a
   separate output tensor.
 

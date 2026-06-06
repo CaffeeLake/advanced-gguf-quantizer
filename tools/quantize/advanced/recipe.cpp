@@ -1221,17 +1221,19 @@ Recipe default_recipe(const std::string & profile) {
         clear_nvfp4_controls(r);
         r.base.output_tensor_type = "MXFP6_E2M3";
         r.base.token_embedding_type = "MXFP6_E2M3";
+        r.base.mtp_tensor_type = "MXFP6_E2M3";
         apply_deep_quality_defaults(r);
         r.mxfp6.tensor_scale = "on";
         r.stock_ftype.mostly_type = "MOSTLY_MXFP6_E2M3";
         r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
         r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
-        r.stock_ftype.rationale = "Explicit local MXFP6_E2M3 recipe; embeddings/output use MXFP6_E2M3.";
+        r.stock_ftype.rationale = "Explicit local MXFP6_E2M3 recipe; embeddings, output, and MTP matrix weights use MXFP6_E2M3.";
     } else if (profile == "nvfp4_mxfp6") {
         r.target.precision_mode = "NVFP4_MXFP6";
         r.base.ftype = "NVFP4_MXFP6";
         r.base.output_tensor_type = "MXFP6_E2M3";
         r.base.token_embedding_type = "MXFP6_E2M3";
+        r.base.mtp_tensor_type = "NVFP4";
         r.nvfp4.preset = "baseline";
         r.nvfp4.correction_denom = "2688";
         r.nvfp4.input_scale_policy = "imatrix-rms";
@@ -1252,12 +1254,13 @@ Recipe default_recipe(const std::string & profile) {
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "MXFP6_E2M3" };
         r.stock_ftype.output_tensor_candidates = { "MXFP6_E2M3" };
-        r.stock_ftype.rationale = "Local mixed NVFP4/MXFP6 recipe starts compact and promotes measured high-risk tensors to MXFP6_E2M3.";
+        r.stock_ftype.rationale = "Local mixed NVFP4/MXFP6 recipe starts compact, keeps MTP matrix weights NVFP4 with the active NVFP4 RSF policy, and promotes measured high-risk tensors to MXFP6_E2M3.";
     } else if (profile == "mxfp6-primary") {
         r.target.precision_mode = "NVFP4_MXFP6";
         r.base.ftype = "MXFP6";
         r.base.output_tensor_type = "MXFP6_E2M3";
         r.base.token_embedding_type = "MXFP6_E2M3";
+        r.base.mtp_tensor_type = "MXFP6_E2M3";
         r.nvfp4.preset = "baseline";
         r.nvfp4.correction_denom = "2688";
         r.nvfp4.input_scale_policy = "imatrix-rms";
@@ -1280,6 +1283,7 @@ Recipe default_recipe(const std::string & profile) {
         r.base.ftype = "NVFP4";
         r.base.output_tensor_type = "Q6_K";
         r.base.token_embedding_type = "NVFP4";
+        r.base.mtp_tensor_type = "NVFP4";
         r.quantizer.enabled = true;
         r.quantizer.mode = "normal";
         r.quantizer.objective = "kld-first";
@@ -1295,7 +1299,7 @@ Recipe default_recipe(const std::string & profile) {
         r.stock_ftype.mostly_type = "MOSTLY_NVFP4";
         r.stock_ftype.token_embedding_candidates = { "NVFP4" };
         r.stock_ftype.output_tensor_candidates = { "Q6_K" };
-        r.stock_ftype.rationale = "Default RSF selector search: compact KLD-guided real-artifact budget.";
+        r.stock_ftype.rationale = "Default RSF selector search: compact KLD-guided real-artifact budget with NVFP4 MTP matrix weights.";
     } else if (profile == "q8_0") {
         r.target.precision_mode = "Q8_0";
         r.base.ftype = "Q8_0";
