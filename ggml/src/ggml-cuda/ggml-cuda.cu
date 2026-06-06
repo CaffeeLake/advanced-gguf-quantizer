@@ -708,22 +708,14 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 }
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-static bool ggml_cuda_device_has_native_nvfp4(int device) {
-    return blackwell_mma_available(ggml_cuda_info().devices[device].cc);
-}
-
-static bool ggml_cuda_tensor_uses_native_nvfp4(const ggml_tensor * tensor, int device) {
+static bool ggml_cuda_use_nvfp4_layout(const ggml_tensor * tensor, int device) {
     return tensor->type == GGML_TYPE_NVFP4 && tensor->view_src == nullptr &&
-        ggml_cuda_device_has_native_nvfp4(device);
+        blackwell_mma_available(ggml_cuda_info().devices[device].cc);
 }
 
-static bool ggml_cuda_use_mxfp6_blackwell_layout(int device) {
-    return blackwell_mma_available(ggml_cuda_info().devices[device].cc);
-}
-
-static bool ggml_cuda_use_mxfp6_blackwell_layout(const ggml_tensor * tensor, int device) {
+static bool ggml_cuda_use_mxfp6_layout(const ggml_tensor * tensor, int device) {
     return tensor->type == GGML_TYPE_MXFP6_E2M3 && tensor->ne[0] % QK_MXFP6_E2M3 == 0 &&
-        ggml_cuda_use_mxfp6_blackwell_layout(device);
+        blackwell_mma_available(ggml_cuda_info().devices[device].cc);
 }
 
 static void ggml_cuda_nvfp4_ensure_repack_buf(void ** buf, size_t * buf_size, size_t size) {
@@ -881,7 +873,7 @@ static bool ggml_cuda_set_tensor_nvfp4(ggml_backend_cuda_buffer_context * ctx, g
 }
 
 static bool ggml_cuda_set_tensor_mxfp6(ggml_tensor * tensor, const void * data, size_t offset, size_t size, int device) {
-    if (!ggml_cuda_use_mxfp6_blackwell_layout(tensor, device)) {
+    if (!ggml_cuda_use_mxfp6_layout(tensor, device)) {
         return false;
     }
 
@@ -923,7 +915,7 @@ static bool ggml_cuda_get_tensor_nvfp4(const ggml_tensor * tensor, void * data, 
 }
 
 static bool ggml_cuda_get_tensor_mxfp6(const ggml_tensor * tensor, void * data, size_t offset, size_t size, int device) {
-    if (!ggml_cuda_use_mxfp6_blackwell_layout(tensor, device)) {
+    if (!ggml_cuda_use_mxfp6_layout(tensor, device)) {
         return false;
     }
 
@@ -945,7 +937,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (ggml_cuda_tensor_uses_native_nvfp4(tensor, ctx->device)) {
+    if (ggml_cuda_use_nvfp4_layout(tensor, ctx->device)) {
         GGML_ASSERT(ggml_cuda_set_tensor_nvfp4(ctx, tensor, data, offset, size));
         return;
     }
@@ -962,7 +954,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 
     ggml_cuda_set_device(ctx->device);
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (ggml_cuda_tensor_uses_native_nvfp4(tensor, ctx->device)) {
+    if (ggml_cuda_use_nvfp4_layout(tensor, ctx->device)) {
         GGML_ASSERT(ggml_cuda_get_tensor_nvfp4(tensor, data, offset, size));
         return;
     }
@@ -980,8 +972,9 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
 
     ggml_cuda_set_device(ctx->device);
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (ggml_cuda_tensor_uses_native_nvfp4(tensor, ctx->device) ||
-            ggml_cuda_use_mxfp6_blackwell_layout(tensor, ctx->device)) {
+    const bool uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(tensor, ctx->device);
+    const bool uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(tensor, ctx->device);
+    if (uses_nvfp4_layout || uses_mxfp6_layout) {
         for (size_t i = 0; i < n_copies; ++i) {
             ggml_backend_cuda_buffer_set_tensor(buffer, tensor, (const char *) data + i * stride_data, offset + i * stride_tensor, size);
         }
@@ -1000,8 +993,9 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 
     ggml_cuda_set_device(ctx->device);
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (ggml_cuda_tensor_uses_native_nvfp4(tensor, ctx->device) ||
-            ggml_cuda_use_mxfp6_blackwell_layout(tensor, ctx->device)) {
+    const bool uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(tensor, ctx->device);
+    const bool uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(tensor, ctx->device);
+    if (uses_nvfp4_layout || uses_mxfp6_layout) {
         for (size_t i = 0; i < n_copies; ++i) {
             ggml_backend_cuda_buffer_get_tensor(buffer, tensor, (char *) data + i * stride_data, offset + i * stride_tensor, size);
         }
@@ -1019,14 +1013,17 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
         size_t copy_size = ggml_nbytes(src);
 #if defined(BLACKWELL_MMA_AVAILABLE)
-        const bool src_native_nvfp4 = ggml_cuda_tensor_uses_native_nvfp4(src, src_ctx->device);
-        const bool dst_native_nvfp4 = ggml_cuda_tensor_uses_native_nvfp4(dst, dst_ctx->device);
-        if (src_native_nvfp4 != dst_native_nvfp4) {
+        const bool src_uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(src, src_ctx->device);
+        const bool dst_uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(dst, dst_ctx->device);
+        const bool src_uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(src, src_ctx->device);
+        const bool dst_uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(dst, dst_ctx->device);
+        if (src_uses_nvfp4_layout != dst_uses_nvfp4_layout ||
+                src_uses_mxfp6_layout != dst_uses_mxfp6_layout) {
             return false;
         }
-        if (src_native_nvfp4) {
+        if (src_uses_nvfp4_layout) {
             copy_size = ggml_cuda_nvfp4_tensor_alloc_size(src);
-        } else if (ggml_cuda_use_mxfp6_blackwell_layout(src, src_ctx->device)) {
+        } else if (src_uses_mxfp6_layout) {
             copy_size = ggml_cuda_mxfp6_e2m3_tensor_alloc_size(src);
         }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1114,10 +1111,10 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (ggml_cuda_tensor_uses_native_nvfp4(tensor, ctx->device)) {
+    if (ggml_cuda_use_nvfp4_layout(tensor, ctx->device)) {
         return ggml_cuda_nvfp4_tensor_alloc_size(tensor);
     }
-    if (ggml_cuda_use_mxfp6_blackwell_layout(tensor, ctx->device)) {
+    if (ggml_cuda_use_mxfp6_layout(tensor, ctx->device)) {
         return ggml_cuda_mxfp6_e2m3_tensor_alloc_size(tensor);
     }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1269,7 +1266,7 @@ struct ggml_backend_cuda_split_buffer_context {
 };
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-static bool ggml_cuda_split_buffer_uses_native_nvfp4(const ggml_backend_cuda_split_buffer_type_context * ctx) {
+static bool ggml_cuda_split_buffer_uses_nvfp4_layout(const ggml_backend_cuda_split_buffer_type_context * ctx) {
     const int device_count = ggml_backend_cuda_get_device_count();
     for (int id = 0; id < device_count; ++id) {
         const float split_low  = id == 0 ? 0.0f : ctx->tensor_split[id];
@@ -1277,7 +1274,7 @@ static bool ggml_cuda_split_buffer_uses_native_nvfp4(const ggml_backend_cuda_spl
         if (split_low >= split_high) {
             continue;
         }
-        if (!ggml_cuda_device_has_native_nvfp4(id)) {
+        if (!blackwell_mma_available(ggml_cuda_info().devices[id].cc)) {
             return false;
         }
     }
@@ -1307,9 +1304,9 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
 
     const int64_t ne0 = tensor->ne[0];
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool use_native_nvfp4 = tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_native_nvfp4(buft_ctx);
+    const bool use_nvfp4_layout = tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_nvfp4_layout(buft_ctx);
 #else
-    const bool use_native_nvfp4 = false;
+    const bool use_nvfp4_layout = false;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
     ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
@@ -1327,8 +1324,7 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
         size_t size = ggml_nbytes_split(tensor, nrows_split);
         size_t original_size = size;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-        const bool use_nvfp4_layout = use_native_nvfp4;
-        const bool use_mxfp6_layout = ggml_cuda_use_mxfp6_blackwell_layout(tensor, id);
+        const bool use_mxfp6_layout = ggml_cuda_use_mxfp6_layout(tensor, id);
         if (use_nvfp4_layout) {
             size = ggml_cuda_nvfp4_split_tensor_size(tensor, row_low, nrows_split);
             original_size = size;
@@ -1381,7 +1377,7 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
     ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *)tensor->extra;
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_native_nvfp4(buft_ctx)) {
+    if (tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_nvfp4_layout(buft_ctx)) {
         const size_t row_size = ggml_row_size(tensor->type, ne0);
         const char * host_rows = (const char *) data;
 
@@ -1417,7 +1413,7 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
     bool handled = false;
 
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
-        if (!ggml_cuda_use_mxfp6_blackwell_layout(tensor, id)) {
+        if (!ggml_cuda_use_mxfp6_layout(tensor, id)) {
             continue;
         }
 
@@ -1450,7 +1446,7 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
 
     if (handled) {
         for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
-            if (!ggml_cuda_use_mxfp6_blackwell_layout(tensor, id)) {
+            if (!ggml_cuda_use_mxfp6_layout(tensor, id)) {
                 continue;
             }
             ggml_cuda_set_device(id);
@@ -1501,7 +1497,7 @@ static void ggml_backend_cuda_split_buffer_get_tensor(ggml_backend_buffer_t buff
     ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *)tensor->extra;
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_native_nvfp4(buft_ctx)) {
+    if (tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_nvfp4_layout(buft_ctx)) {
         const size_t logical_size = ggml_nbytes(tensor);
         const size_t row_size = ggml_row_size(tensor->type, ne0);
         char * host_rows = (char *) malloc(logical_size);
@@ -1555,7 +1551,7 @@ static void ggml_backend_cuda_split_buffer_get_tensor(ggml_backend_buffer_t buff
         bool handled = false;
 
         for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
-            if (!ggml_cuda_use_mxfp6_blackwell_layout(tensor, id)) {
+            if (!ggml_cuda_use_mxfp6_layout(tensor, id)) {
                 continue;
             }
 
@@ -1678,9 +1674,9 @@ static size_t ggml_backend_cuda_split_buffer_type_get_alloc_size(ggml_backend_bu
 
     const int64_t ne0 = tensor->ne[0];
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool use_native_nvfp4 = tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_native_nvfp4(ctx);
+    const bool use_nvfp4_layout = tensor->type == GGML_TYPE_NVFP4 && ggml_cuda_split_buffer_uses_nvfp4_layout(ctx);
 #else
-    const bool use_native_nvfp4 = false;
+    const bool use_nvfp4_layout = false;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
@@ -1693,9 +1689,9 @@ static size_t ggml_backend_cuda_split_buffer_type_get_alloc_size(ggml_backend_bu
         }
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-        if (use_native_nvfp4) {
+        if (use_nvfp4_layout) {
             total_size += ggml_cuda_nvfp4_split_tensor_size(tensor, row_low, nrows_split);
-        } else if (ggml_cuda_use_mxfp6_blackwell_layout(tensor, id)) {
+        } else if (ggml_cuda_use_mxfp6_layout(tensor, id)) {
             const size_t packed_size = ggml_cuda_mxfp6_e2m3_tensor_alloc_size(ne0, nrows_split, /*nplanes=*/1);
             total_size += packed_size;
         } else {
@@ -1722,7 +1718,7 @@ static void ggml_backend_cuda_patch_nvfp4_tensor_header(ggml_tensor * tensor) {
 
     if (ggml_backend_buffer_is_cuda(tensor->buffer)) {
         ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) tensor->buffer->context;
-        if (!ggml_cuda_tensor_uses_native_nvfp4(tensor, ctx->device)) {
+        if (!ggml_cuda_use_nvfp4_layout(tensor, ctx->device)) {
             return;
         }
 
@@ -1738,7 +1734,7 @@ static void ggml_backend_cuda_patch_nvfp4_tensor_header(ggml_tensor * tensor) {
     if (ggml_backend_buft_is_cuda_split(buft)) {
         ggml_backend_cuda_split_buffer_type_context * buft_ctx =
             (ggml_backend_cuda_split_buffer_type_context *) buft->context;
-        if (!ggml_cuda_split_buffer_uses_native_nvfp4(buft_ctx)) {
+        if (!ggml_cuda_split_buffer_uses_nvfp4_layout(buft_ctx)) {
             return;
         }
 
@@ -3935,10 +3931,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool special_blackwell_layout =
-        ggml_cuda_tensor_uses_native_nvfp4(tensor, cuda_ctx->device) ||
-        ggml_cuda_use_mxfp6_blackwell_layout(tensor, cuda_ctx->device);
-    if (special_blackwell_layout) {
+    const bool uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(tensor, cuda_ctx->device);
+    const bool uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(tensor, cuda_ctx->device);
+    if (uses_nvfp4_layout || uses_mxfp6_layout) {
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         buf->iface.set_tensor(buf, tensor, data, offset, size);
         return;
@@ -3955,10 +3950,9 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool special_blackwell_layout =
-        ggml_cuda_tensor_uses_native_nvfp4(tensor, cuda_ctx->device) ||
-        ggml_cuda_use_mxfp6_blackwell_layout(tensor, cuda_ctx->device);
-    if (special_blackwell_layout) {
+    const bool uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(tensor, cuda_ctx->device);
+    const bool uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(tensor, cuda_ctx->device);
+    if (uses_nvfp4_layout || uses_mxfp6_layout) {
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         buf->iface.get_tensor(buf, tensor, data, offset, size);
         return;
@@ -4018,23 +4012,22 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
-    bool use_special_blackwell_layout = false;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool src_native_nvfp4 = ggml_cuda_tensor_uses_native_nvfp4(src, cuda_ctx_src->device);
-    const bool dst_native_nvfp4 = ggml_cuda_tensor_uses_native_nvfp4(dst, cuda_ctx_dst->device);
-    if (src_native_nvfp4 != dst_native_nvfp4) {
+    const bool src_uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(src, cuda_ctx_src->device);
+    const bool dst_uses_nvfp4_layout = ggml_cuda_use_nvfp4_layout(dst, cuda_ctx_dst->device);
+    const bool src_uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(src, cuda_ctx_src->device);
+    const bool dst_uses_mxfp6_layout = ggml_cuda_use_mxfp6_layout(dst, cuda_ctx_dst->device);
+    if (src_uses_nvfp4_layout != dst_uses_nvfp4_layout ||
+            src_uses_mxfp6_layout != dst_uses_mxfp6_layout) {
         return false;
     }
 
-    use_special_blackwell_layout = src_native_nvfp4 ||
-        ggml_cuda_use_mxfp6_blackwell_layout(src, cuda_ctx_src->device);
-#endif // defined(BLACKWELL_MMA_AVAILABLE)
-    if (use_special_blackwell_layout) {
+    const bool uses_nvfp4_layout = src_uses_nvfp4_layout;
+    const bool uses_mxfp6_layout = src_uses_mxfp6_layout;
+    if (uses_nvfp4_layout || uses_mxfp6_layout) {
         size_t copy_size = ggml_nbytes(src);
-#if defined(BLACKWELL_MMA_AVAILABLE)
-        copy_size = src_native_nvfp4 ?
+        copy_size = uses_nvfp4_layout ?
             ggml_cuda_nvfp4_tensor_alloc_size(src) : ggml_cuda_mxfp6_e2m3_tensor_alloc_size(src);
-#endif // defined(BLACKWELL_MMA_AVAILABLE)
         if (backend_src != backend_dst) {
             if (cuda_ctx_src->device == cuda_ctx_dst->device) {
                 CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, copy_size, cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
@@ -4058,6 +4051,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
         return true;
     }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
     if (backend_src != backend_dst) {
         // copy on src stream
