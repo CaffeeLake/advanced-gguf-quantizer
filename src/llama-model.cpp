@@ -826,6 +826,28 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
     return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
 }
 
+// Maps the GGUF `<arch>.hidden_activation` string to the FFN op type used by the
+// graph builders. Only gated activations that map cleanly to llm_ffn_op_type are
+// listed; unrecognized values fall back to GeGLU, which matches the historical
+// default for ModernBert-style architectures.
+static const std::map<std::string, llm_ffn_op_type> LLM_FFN_OP_TYPES_FROM_STRING = {
+    { "gelu",   LLM_FFN_GEGLU  },
+    { "geglu",  LLM_FFN_GEGLU  },
+    { "silu",   LLM_FFN_SWIGLU },
+    { "swish",  LLM_FFN_SWIGLU },
+    { "swiglu", LLM_FFN_SWIGLU },
+    { "relu",   LLM_FFN_RELU   },
+    { "reglu",  LLM_FFN_REGLU  },
+};
+
+llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op_type fallback) {
+    const auto it = LLM_FFN_OP_TYPES_FROM_STRING.find(name);
+    if (it != LLM_FFN_OP_TYPES_FROM_STRING.end()) {
+        return it->second;
+    }
+    return fallback;
+}
+
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
@@ -1055,13 +1077,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.n_head_arr.begin(),    hparams.n_head_arr.end(),    0);
     std::fill(hparams.n_head_kv_arr.begin(), hparams.n_head_kv_arr.end(), 0);
     std::fill(hparams.n_ff_arr.begin(),      hparams.n_ff_arr.end(),      0);
-    std::fill(
-        hparams.recurrent_layer_arr.begin(),
-        hparams.recurrent_layer_arr.end(),
-        llm_arch_is_recurrent(ml.get_arch()));
-
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
-    std::fill(hparams.swa_layers.begin(), hparams.swa_layers.end(), 0);
+    std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(),   0);
+    std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
     std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
@@ -1072,6 +1090,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer(), false);
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer(), false);
+
+    // Populate deepstack_mapping_arr - initialized to -1 (no deepstack)
+    std::fill(hparams.deepstack_mapping_arr.begin(), hparams.deepstack_mapping_arr.end(), -1);
 
     // n_head_kv is optional, default to n_head
     hparams.n_head_kv_arr = hparams.n_head_arr;
@@ -1451,7 +1472,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     };
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < n_layer_all; ++il) {
         auto & layer = layers[il];
         const bool use_cuda_native_scales = is_cuda_dev(pimpl->dev_layer[il].dev);
         attach_native_blackwell_scales(layer.wq,              layer.wq_s,              layer.wq_in_s,              use_cuda_native_scales);
