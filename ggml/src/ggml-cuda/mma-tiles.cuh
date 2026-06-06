@@ -167,6 +167,10 @@ static inline size_t ggml_cuda_nvfp4_plane_size(int64_t ne0, int64_t nrows) {
            (size_t) ggml_cuda_nvfp4_blocks_per_row(ne0) * sizeof(block_nvfp4_blackwell);
 }
 
+static inline size_t ggml_cuda_nvfp4_rows_size(int64_t ne0, int64_t ne1, int64_t nplanes) {
+    return (size_t) nplanes * (size_t) ne1 * ggml_row_size(GGML_TYPE_NVFP4, ne0);
+}
+
 static inline size_t ggml_cuda_nvfp4_tensor_size(int64_t ne0, int64_t ne1, int64_t nplanes) {
     return sizeof(block_nvfp4_blackwell_tensor) + (size_t) nplanes * ggml_cuda_nvfp4_plane_size(ne0, ne1);
 }

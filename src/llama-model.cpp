@@ -1636,6 +1636,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    using patch_nvfp4_tensor_header_t = void (*)(ggml_tensor *);
+    auto patch_nvfp4_tensor_header = [](ggml_tensor * weight) {
+        if (weight == nullptr || weight->type != GGML_TYPE_NVFP4 || weight->buffer == nullptr) {
+            return;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            return;
+        }
+
+        auto * patch_fn = (patch_nvfp4_tensor_header_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_patch_nvfp4_tensor_header");
+        if (patch_fn != nullptr) {
+            patch_fn(weight);
+        }
+    };
+
+    for (int il = 0; il < n_layer_all; ++il) {
+        auto & layer = layers[il];
+        patch_nvfp4_tensor_header(layer.wq);
+        patch_nvfp4_tensor_header(layer.wk);
+        patch_nvfp4_tensor_header(layer.wv);
+        patch_nvfp4_tensor_header(layer.wo);
+        patch_nvfp4_tensor_header(layer.wqkv);
+        patch_nvfp4_tensor_header(layer.wqkv_gate);
+        patch_nvfp4_tensor_header(layer.ffn_gate);
+        patch_nvfp4_tensor_header(layer.ffn_down);
+        patch_nvfp4_tensor_header(layer.ffn_up);
+        patch_nvfp4_tensor_header(layer.ffn_gate_exps);
+        patch_nvfp4_tensor_header(layer.ffn_down_exps);
+        patch_nvfp4_tensor_header(layer.ffn_up_exps);
+        patch_nvfp4_tensor_header(layer.ffn_gate_shexp);
+        patch_nvfp4_tensor_header(layer.ffn_down_shexp);
+        patch_nvfp4_tensor_header(layer.ffn_up_shexp);
+        patch_nvfp4_tensor_header(layer.ssm_in);
+        patch_nvfp4_tensor_header(layer.ssm_out);
+        patch_nvfp4_tensor_header(layer.ssm_alpha);
+        patch_nvfp4_tensor_header(layer.ssm_beta);
+        patch_nvfp4_tensor_header(layer.nextn.eh_proj);
+        patch_nvfp4_tensor_header(layer.nextn.shared_head_head);
+    }
+    patch_nvfp4_tensor_header(output);
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
