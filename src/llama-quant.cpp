@@ -732,8 +732,8 @@ static bool tensor_name_is_mtp(const llama_model & model, const std::string & te
         return true;
     }
 
-    const uint32_t n_nextn = model.hparams.nextn_predict_layers;
-    if (n_nextn == 0 || model.hparams.n_layer <= n_nextn) {
+    const uint32_t n_nextn = model.hparams.n_layer_nextn;
+    if (n_nextn == 0 || model.hparams.n_layer_all <= n_nextn) {
         return false;
     }
 
@@ -742,8 +742,8 @@ static bool tensor_name_is_mtp(const llama_model & model, const std::string & te
         return false;
     }
 
-    const uint32_t n_main = model.hparams.n_layer - n_nextn;
-    return (uint32_t) il >= n_main && (uint32_t) il < model.hparams.n_layer;
+    const uint32_t n_main = model.hparams.n_layer();
+    return (uint32_t) il >= n_main && (uint32_t) il < model.hparams.n_layer_all;
 }
 
 static bool llama_tensor_has_aux_scale_slot(const std::string & tensor_name) {
@@ -3296,7 +3296,7 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
             qs.has_tied_embeddings = false;
         }
     }
-    qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer;
+    qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer();
 }
 
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
@@ -4638,7 +4638,7 @@ llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * des
     model->hparams.n_embd             = desc->n_embd;
     model->hparams.n_embd_head_k_full = desc->n_embd_head_k;
     model->hparams.n_embd_head_v_full = desc->n_embd_head_v;
-    model->hparams.n_layer            = desc->n_layer;
+    model->hparams.n_layer_all        = desc->n_layer;
     model->hparams.n_expert           = desc->n_expert;
 
     for (uint32_t i = 0; i < desc->n_layer; i++) {

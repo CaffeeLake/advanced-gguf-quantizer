@@ -609,12 +609,16 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool fp8_acts = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
-        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
-	        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
-	        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
-	        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-	        const uint32_t physical_rows_x, const uint32_t ids_stride, const bool native_mxfp6, const bool native_fp8) {
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t physical_rows_x, const uint32_t ids_stride, const bool native_mxfp6, const bool native_fp8) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     constexpr int qk  = type == GGML_TYPE_NVFP4 ? QK_NVFP4 : ggml_cuda_type_traits<type>::qk;
@@ -878,13 +882,17 @@ static __global__ void mul_mat_vec_q(
 template <ggml_type type, int c_rows_per_block, bool fp8_acts = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
-        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
-        float * __restrict__ dst,
-	        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
-	        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
-	        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-	        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t physical_rows_x,
-            const bool native_mxfp6, const bool native_fp8) {
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t physical_rows_x,
+        const bool native_mxfp6, const bool native_fp8) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -904,6 +912,7 @@ static __global__ void mul_mat_vec_q_moe(
         return;
     }
 
+    ggml_cuda_pdl_sync();
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
@@ -955,6 +964,8 @@ static __global__ void mul_mat_vec_q_moe(
 	            }
 	        }
 	    }
+
+    ggml_cuda_pdl_lc();
 
     // Warp-level reduction only - no shared memory needed
 #pragma unroll
@@ -1040,22 +1051,23 @@ static void mul_mat_vec_q_moe_launch(
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
     const dim3 block_dims(warp_size, ncols_dst);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-	    if (fp8_acts) {
-	        mul_mat_vec_q_moe<type, rows_per_block, true><<<block_nums, block_dims, 0, stream>>>(
-	            vx, vy, ids, dst,
-	            ncols_x, nchannels_y, nrows_x,
-	            stride_row_x, stride_col_y, stride_col_dst,
-	            stride_channel_x, stride_channel_y, stride_channel_dst,
-	            ncols_dst, ids_stride, physical_rows_x, native_mxfp6, native_fp8);
-	    } else {
-	        mul_mat_vec_q_moe<type, rows_per_block, false><<<block_nums, block_dims, 0, stream>>>(
-	            vx, vy, ids, dst,
-	            ncols_x, nchannels_y, nrows_x,
-	            stride_row_x, stride_col_y, stride_col_dst,
-	            stride_channel_x, stride_channel_y, stride_channel_dst,
-	            ncols_dst, ids_stride, physical_rows_x, native_mxfp6, native_fp8);
-	    }
+    if (fp8_acts) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+            vx, vy, ids, dst,
+            ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride, physical_rows_x, native_mxfp6, native_fp8);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
+            vx, vy, ids, dst,
+            ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride, physical_rows_x, native_mxfp6, native_fp8);
+    }
 }
 
 template <ggml_type type>
